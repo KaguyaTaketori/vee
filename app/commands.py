@@ -4,6 +4,7 @@ from telegram.ext import CallbackContext
 from config import ADMIN_IDS, get_allowed_users, save_allowed_users
 from core.logger import log_user, get_user_stats
 from core.history import get_user_history, get_all_users_count, get_total_downloads
+from core.ratelimit import rate_limiter, save_rate_limit
 
 
 async def start_command(update: Update, context: CallbackContext):
@@ -37,7 +38,10 @@ async def help_command(update: Update, context: CallbackContext):
             "/block <user_id> - Block a user\n"
             "/users - List allowed users\n"
             "/stats - Bot usage stats\n"
-            "/broadcast <message> - Broadcast to all users"
+            "/broadcast <message> - Broadcast to all users\n"
+            "/userhistory <user_id> - View user history\n"
+            "/rateinfo - View rate limit info\n"
+            "/setrate <max> [on/off] - Set rate limit"
         )
     else:
         await update.message.reply_text(
@@ -173,3 +177,88 @@ async def broadcast_command(update: Update, context: CallbackContext):
             failed += 1
     
     await update.message.reply_text(f"Broadcast sent to {success} users. Failed: {failed}")
+
+
+async def userhistory_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /userhistory <user_id>")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    
+    history = get_user_history(target_id, limit=20)
+    
+    if not history:
+        await update.message.reply_text(f"No history for user {target_id}.")
+        return
+    
+    msg = f"Download history for user {target_id}:\n\n"
+    from datetime import datetime
+    for item in history:
+        dt = datetime.fromtimestamp(item["timestamp"])
+        status = "✅" if item.get("status") == "success" else "❌"
+        size = ""
+        if item.get("file_size"):
+            size = f" ({item['file_size'] // (1024*1024)}MB)"
+        msg += f"{status} {item['type']}{size}\n"
+        msg += f"   {item.get('title', 'N/A')[:40]}...\n"
+        msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    await update.message.reply_text(msg)
+
+
+async def rateinfo_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    status = rate_limiter.get_status()
+    status_text = "Enabled" if status["enabled"] else "Disabled"
+    msg = f"Rate Limit Status:\n"
+    msg += f"- Status: {status_text}\n"
+    msg += f"- Max downloads/hour: {status['max_downloads_per_hour']}\n"
+    msg += f"- Active users tracked: {status['active_users']}"
+    await update.message.reply_text(msg)
+
+
+async def setrate_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /setrate <max_per_hour> [on/off]")
+        return
+    
+    try:
+        max_per_hour = int(context.args[0])
+        if max_per_hour < 1 or max_per_hour > 100:
+            await update.message.reply_text("Value must be between 1-100")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid number.")
+        return
+    
+    enabled = True
+    if len(context.args) > 1:
+        enabled = context.args[1].lower() in ["on", "true", "1"]
+    
+    save_rate_limit(max_per_hour, enabled)
+    rate_limiter.reload()
+    
+    status = "enabled" if enabled else "disabled"
+    await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
