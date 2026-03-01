@@ -19,6 +19,8 @@ ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip
 ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "/home/ubuntu/vee/allowed_users.txt")
 
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
+TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
+CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
 
 from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
 
@@ -59,16 +61,29 @@ def get_user_display_name(user_id: int) -> str:
     return str(user_id)
 
 
-def cleanup_temp_files(max_age_hours: int = 24):
+def get_config() -> dict:
+    return {
+        "max_file_size": MAX_FILE_SIZE,
+        "temp_dir": TEMP_DIR,
+        "temp_file_max_age_hours": TEMP_FILE_MAX_AGE_HOURS,
+        "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
+    }
+
+
+def cleanup_temp_files(max_age_hours: int = None):
     import time
+    max_age_hours = max_age_hours or TEMP_FILE_MAX_AGE_HOURS
     if not os.path.exists(TEMP_DIR):
         return
     cutoff = time.time() - (max_age_hours * 3600)
-    for fname in os.listdir(TEMP_DIR):
-        if fname.startswith("yt_dlp_"):
-            fpath = os.path.join(TEMP_DIR, fname)
-            if os.path.getmtime(fpath) < cutoff:
-                try:
-                    os.remove(fpath)
-                except OSError:
-                    pass
+    try:
+        for fname in os.listdir(TEMP_DIR):
+            if fname.startswith("yt_dlp_"):
+                fpath = os.path.join(TEMP_DIR, fname)
+                if os.path.getmtime(fpath) < cutoff:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+    except OSError:
+        pass

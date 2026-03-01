@@ -4,11 +4,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue
 from telegram.request import HTTPXRequest
 
-from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS
 from app.commands import (
     start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
-    userhistory_command, rateinfo_command, setrate_command
+    userhistory_command, rateinfo_command, setrate_command,
+    cleanup_command, status_command
 )
 from app.callbacks import handle_link, handle_callback
 
@@ -67,11 +68,14 @@ def main():
         app.add_handler(CommandHandler("userhistory", userhistory_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("rateinfo", rateinfo_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("setrate", setrate_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cleanup", cleanup_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("status", status_command, filters=AdminFilter()))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    app.job_queue.run_repeating(cleanup_job, interval=3600, first=60)
+    if CLEANUP_INTERVAL_HOURS > 0:
+        app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60)
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

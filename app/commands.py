@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name
+from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, get_config, cleanup_temp_files, TEMP_DIR
 from core.logger import log_user, get_user_stats
 from core.history import get_user_history, get_all_users_count, get_total_downloads
 from core.ratelimit import rate_limiter, save_rate_limit
@@ -268,3 +268,51 @@ async def setrate_command(update: Update, context: CallbackContext):
     
     status = "enabled" if enabled else "disabled"
     await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
+
+
+async def cleanup_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    cleanup_temp_files()
+    await update.message.reply_text("Temp files cleaned up.")
+
+
+async def status_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    import os
+    import psutil
+    
+    config = get_config()
+    rate_status = rate_limiter.get_status()
+    
+    temp_files = 0
+    temp_size = 0
+    if os.path.exists(config["temp_dir"]):
+        for fname in os.listdir(config["temp_dir"]):
+            if fname.startswith("yt_dlp_"):
+                temp_files += 1
+                try:
+                    temp_size += os.path.getsize(os.path.join(config["temp_dir"], fname))
+                except:
+                    pass
+    
+    msg = "📊 Bot Status\n\n"
+    msg += f"CPU: {psutil.cpu_percent()}%\n"
+    msg += f"Memory: {psutil.virtual_memory().percent}%\n\n"
+    msg += f"Temp files: {temp_files}\n"
+    msg += f"Temp size: {temp_size // (1024*1024)}MB\n\n"
+    msg += f"Rate limit: {rate_status['max_downloads_per_hour']}/hour\n"
+    msg += f"Rate enabled: {rate_status['enabled']}\n"
+    msg += f"Cleanup interval: {config['cleanup_interval_hours']}h\n"
+    msg += f"Temp file max age: {config['temp_file_max_age_hours']}h"
+    
+    await update.message.reply_text(msg)
