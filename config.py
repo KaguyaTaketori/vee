@@ -23,7 +23,7 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
 TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
 
-CACHE_TTL = 60
+CACHE_TTL = 0  # Disabled for low memory
 
 _allowed_users_cache = {"data": None, "time": 0}
 _users_db_cache = {"data": None, "time": 0}

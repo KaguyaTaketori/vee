@@ -2,7 +2,7 @@ import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-download_executor = ThreadPoolExecutor(max_workers=3)
+download_executor = ThreadPoolExecutor(max_workers=1)  # Reduced for low RAM
 
 
 def _format_size(bytes_val):
