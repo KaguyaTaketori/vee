@@ -4,7 +4,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram.request import HTTPXRequest
 
 from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS
-from app.commands import start_command, help_command, stats_command, allow_command, block_command, users_command
+from app.commands import (
+    start_command, help_command, stats_command, history_command,
+    allow_command, block_command, users_command, broadcast_command
+)
 from app.callbacks import handle_link, handle_callback
 
 logging.basicConfig(
@@ -46,12 +49,14 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("history", history_command))
     
     if ADMIN_IDS:
         app.add_handler(CommandHandler("stats", stats_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("allow", allow_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("block", block_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("users", users_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("broadcast", broadcast_command, filters=AdminFilter()))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))

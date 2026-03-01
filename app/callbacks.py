@@ -9,6 +9,8 @@ from telegram.ext import CallbackContext
 from config import MAX_FILE_SIZE, get_allowed_users
 from core.downloader import get_formats, download_video, download_audio, get_thumbnail
 from core.logger import log_user, log_download
+from core.history import add_history
+from core.ratelimit import rate_limiter
 from app.download import _make_progress_hook, download_executor
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,11 @@ async def handle_link(update: Update, context: CallbackContext):
     allowed = get_allowed_users()
     if allowed and user_id not in allowed:
         await update.message.reply_text("You are not authorized to use this bot.")
+        return
+    
+    allowed, reason = rate_limiter.check_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(reason)
         return
     
     url = update.message.text.strip()
@@ -215,9 +222,11 @@ async def send_video_with_format(query, url, processing_msg, format_id):
             await query.message.reply_video(video=f, caption=caption)
         await processing_msg.delete()
         log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
+        add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success")
     except Exception as e:
         await processing_msg.edit_text(f"Upload failed: {str(e)}")
         log_download(query.from_user, "video_downloaded", url, f"upload_failed: {e}", file_size, format_id)
+        add_history(query.from_user.id, url, "video", file_size, info.get("title"), "failed")
     
     if os.path.exists(filename):
         os.remove(filename)
@@ -246,6 +255,7 @@ async def send_audio(query, url, processing_msg):
     if not os.path.exists(filename):
         await processing_msg.edit_text("Download failed.")
         log_download(query.from_user, "audio_downloaded", url, "file_not_found")
+        add_history(query.from_user.id, url, "audio", None, info.get("title"), "failed")
         return
 
     file_size = os.path.getsize(filename)
@@ -257,9 +267,11 @@ async def send_audio(query, url, processing_msg):
             await query.message.reply_audio(audio=f, title=title)
         await processing_msg.delete()
         log_download(query.from_user, "audio_downloaded", url, "success", file_size)
+        add_history(query.from_user.id, url, "audio", file_size, title, "success")
     except Exception as e:
         await processing_msg.edit_text(f"Upload failed: {str(e)}")
         log_download(query.from_user, "audio_downloaded", url, f"upload_failed: {e}", file_size)
+        add_history(query.from_user.id, url, "audio", file_size, title, "failed")
     
     if os.path.exists(filename):
         os.remove(filename)
