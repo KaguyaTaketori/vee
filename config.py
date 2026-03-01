@@ -20,6 +20,13 @@ ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "/home/ubuntu/vee/allowed_u
 
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
 
+from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
+
+
+def track_user(user):
+    if user:
+        _update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name)
+
 
 def get_allowed_users():
     users = set()
@@ -36,6 +43,20 @@ def save_allowed_users(users):
     with open(ALLOWED_USERS_FILE, "w") as f:
         for uid in sorted(users):
             f.write(f"{uid}\n")
+
+
+def get_all_users_info():
+    return _get_all_users()
+
+
+def get_user_display_name(user_id: int) -> str:
+    info = _get_user_info(user_id)
+    if info:
+        if info.get("username"):
+            return f"@{info['username']}"
+        if info.get("first_name"):
+            return info["first_name"]
+    return str(user_id)
 
 
 def cleanup_temp_files(max_age_hours: int = 24):

@@ -6,10 +6,10 @@ from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
-from config import MAX_FILE_SIZE, get_allowed_users, ADMIN_IDS
+from config import MAX_FILE_SIZE, get_allowed_users, ADMIN_IDS, track_user
 from core.downloader import get_formats, download_video, download_audio, get_thumbnail
 from core.logger import log_user, log_download
-from core.history import add_history
+from core.history import add_history, get_user_history
 from core.ratelimit import rate_limiter
 from app.download import _make_progress_hook, download_executor
 
@@ -49,7 +49,10 @@ async def handle_link(update: Update, context: CallbackContext):
     if not update.message:
         return
     
-    user_id = update.message.from_user.id
+    user = update.message.from_user
+    user_id = user.id
+    track_user(user)
+    
     allowed = get_allowed_users()
     if allowed and user_id not in allowed:
         await update.message.reply_text("You are not authorized to use this bot.")

@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from config import ADMIN_IDS, get_allowed_users, save_allowed_users
+from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name
 from core.logger import log_user, get_user_stats
 from core.history import get_user_history, get_all_users_count, get_total_downloads
 from core.ratelimit import rate_limiter, save_rate_limit
@@ -10,6 +10,7 @@ from core.ratelimit import rate_limiter, save_rate_limit
 async def start_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    track_user(update.message.from_user)
     log_user(update.message.from_user, "start")
     user = update.message.from_user
     await update.message.reply_text(
@@ -19,7 +20,7 @@ async def start_command(update: Update, context: CallbackContext):
         "• Videos (up to 2GB with local Bot API)\n"
         "• Thumbnails\n"
         "• Audio (MP3)\n\n"
-        "Just send a link and choose what to download!"
+        "Just send a link to choose what to download!"
     )
 
 
@@ -154,13 +155,20 @@ async def users_command(update: Update, context: CallbackContext):
     if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
-    users = get_allowed_users()
-    if not users:
-        await update.message.reply_text("No allowed users.")
+    users_info = get_all_users_info()
+    allowed = get_allowed_users()
+    
+    if not users_info:
+        await update.message.reply_text("No users yet.")
         return
     
-    msg = "Allowed users:\n" + "\n".join(f"- {uid}" for uid in sorted(users))
-    await update.message.reply_text(msg)
+    msg = "Allowed users:\n\n"
+    for user in sorted(users_info, key=lambda x: x.get("last_seen", 0), reverse=True):
+        if user["id"] in allowed:
+            name = get_user_display_name(user["id"])
+            msg += f"• {name}\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def broadcast_command(update: Update, context: CallbackContext):
@@ -208,7 +216,8 @@ async def userhistory_command(update: Update, context: CallbackContext):
     
     keyboard = []
     for uid in sorted(users):
-        keyboard.append([InlineKeyboardButton(f"User {uid}", callback_data=f"uh_{uid}")])
+        name = get_user_display_name(uid)
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"uh_{uid}")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
