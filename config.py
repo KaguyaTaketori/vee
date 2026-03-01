@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,15 +23,26 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
 TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
 
+CACHE_TTL = 60
+
+_allowed_users_cache = {"data": None, "time": 0}
+_users_db_cache = {"data": None, "time": 0}
+
 from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
 
 
 def track_user(user):
     if user:
         _update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name)
+        global _users_db_cache
+        _users_db_cache = {"data": None, "time": 0}
 
 
 def get_allowed_users():
+    now = time.time()
+    if _allowed_users_cache["data"] and (now - _allowed_users_cache["time"]) < CACHE_TTL:
+        return _allowed_users_cache["data"]
+    
     users = set()
     if os.path.exists(ALLOWED_USERS_FILE):
         with open(ALLOWED_USERS_FILE, "r") as f:
@@ -38,17 +50,28 @@ def get_allowed_users():
                 line = line.strip()
                 if line and line.isdigit():
                     users.add(int(line))
-    return users | ADMIN_IDS
+    
+    result = users | ADMIN_IDS
+    _allowed_users_cache = {"data": result, "time": now}
+    return result
 
 
 def save_allowed_users(users):
     with open(ALLOWED_USERS_FILE, "w") as f:
         for uid in sorted(users):
             f.write(f"{uid}\n")
+    global _allowed_users_cache
+    _allowed_users_cache = {"data": None, "time": 0}
 
 
 def get_all_users_info():
-    return _get_all_users()
+    now = time.time()
+    if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
+        return _users_db_cache["data"]
+    
+    data = _get_all_users()
+    _users_db_cache = {"data": data, "time": now}
+    return data
 
 
 def get_user_display_name(user_id: int) -> str:
