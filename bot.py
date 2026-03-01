@@ -1,9 +1,10 @@
 import logging
+import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue
 from telegram.request import HTTPXRequest
 
-from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files
 from app.commands import (
     start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 class AdminFilter(filters.BaseFilter):
     def filter(self, message):
         return message.from_user.id in ADMIN_IDS
+
+
+async def cleanup_job(context):
+    cleanup_temp_files(max_age_hours=24)
 
 
 def main():
@@ -65,6 +70,8 @@ def main():
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    app.job_queue.run_repeating(cleanup_job, interval=3600, first=60)
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
