@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
-from config import MAX_FILE_SIZE, get_allowed_users
+from config import MAX_FILE_SIZE, get_allowed_users, ADMIN_IDS
 from core.downloader import get_formats, download_video, download_audio, get_thumbnail
 from core.logger import log_user, log_download
 from core.history import add_history
@@ -91,6 +91,30 @@ async def handle_callback(update: Update, context: CallbackContext):
         return
 
     user_id = query.from_user.id
+    
+    if query.data.startswith("uh_"):
+        if ADMIN_IDS and user_id not in ADMIN_IDS:
+            await query.answer("Admin only.", show_alert=True)
+            return
+        target_id = int(query.data.replace("uh_", ""))
+        history = get_user_history(target_id, limit=20)
+        if not history:
+            await query.edit_message_text(f"No history for user {target_id}.")
+            return
+        msg = f"Download history for user {target_id}:\n\n"
+        from datetime import datetime
+        for item in history:
+            dt = datetime.fromtimestamp(item["timestamp"])
+            status = "✅" if item.get("status") == "success" else "❌"
+            size = ""
+            if item.get("file_size"):
+                size = f" ({item['file_size'] // (1024*1024)}MB)"
+            msg += f"{status} {item['type']}{size}\n"
+            msg += f"   {item.get('title', 'N/A')[:40]}\n"
+            msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+        await query.edit_message_text(msg)
+        return
+    
     allowed = get_allowed_users()
     if allowed and user_id not in allowed:
         await query.answer("You are not authorized.", show_alert=True)

@@ -11,14 +11,26 @@ async def start_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     log_user(update.message.from_user, "start")
+    user = update.message.from_user
     await update.message.reply_text(
-        "Welcome! Send me a link from YouTube, TikTok, Instagram, Twitter, or other supported platforms.\n\n"
+        f"Welcome! Your ID: {user.id}\n\n"
+        "Send me a link from YouTube, TikTok, Instagram, Twitter, or other supported platforms.\n\n"
         "I can download:\n"
         "• Videos (up to 2GB with local Bot API)\n"
         "• Thumbnails\n"
         "• Audio (MP3)\n\n"
         "Just send a link and choose what to download!"
     )
+
+
+async def myid_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user = update.message.from_user
+    msg = f"Your Telegram ID: `{user.id}`\n"
+    msg += f"Username: @{user.username or 'N/A'}\n"
+    msg += f"Name: {user.first_name} {user.last_name or ''}"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: CallbackContext):
@@ -163,7 +175,7 @@ async def broadcast_command(update: Update, context: CallbackContext):
         return
     
     message = " ".join(context.args)
-    users = get_allowed_users()
+    users = get_allowed_users() - ADMIN_IDS
     
     bot = context.bot
     success = 0
@@ -186,35 +198,20 @@ async def userhistory_command(update: Update, context: CallbackContext):
     if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
-    if not context.args:
-        await update.message.reply_text("Usage: /userhistory <user_id>")
+    users = get_allowed_users() - ADMIN_IDS
+    
+    if not users:
+        await update.message.reply_text("No users to show.")
         return
     
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     
-    history = get_user_history(target_id, limit=20)
+    keyboard = []
+    for uid in sorted(users):
+        keyboard.append([InlineKeyboardButton(f"User {uid}", callback_data=f"uh_{uid}")])
     
-    if not history:
-        await update.message.reply_text(f"No history for user {target_id}.")
-        return
-    
-    msg = f"Download history for user {target_id}:\n\n"
-    from datetime import datetime
-    for item in history:
-        dt = datetime.fromtimestamp(item["timestamp"])
-        status = "✅" if item.get("status") == "success" else "❌"
-        size = ""
-        if item.get("file_size"):
-            size = f" ({item['file_size'] // (1024*1024)}MB)"
-        msg += f"{status} {item['type']}{size}\n"
-        msg += f"   {item.get('title', 'N/A')[:40]}...\n"
-        msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
-    
-    await update.message.reply_text(msg)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
 
 
 async def rateinfo_command(update: Update, context: CallbackContext):

@@ -5,7 +5,7 @@ from telegram.request import HTTPXRequest
 
 from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS
 from app.commands import (
-    start_command, help_command, stats_command, history_command,
+    start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
     userhistory_command, rateinfo_command, setrate_command
 )
@@ -51,6 +51,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("myid", myid_command))
     
     if ADMIN_IDS:
         app.add_handler(CommandHandler("stats", stats_command, filters=AdminFilter()))
