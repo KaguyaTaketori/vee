@@ -24,3 +24,5 @@ build/
 *.swo
 *~
 .DS_Store
+# Telegram chat attachments (chat_id:token folders)
+[0-9]*:*/
