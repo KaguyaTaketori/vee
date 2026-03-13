@@ -211,3 +211,4 @@ def clear_file_id_by_url(url: str):
             _cache["data"] = history
             _cache["dirty"] = True
             _cache["time"] = time.time()
+        _persist_history()

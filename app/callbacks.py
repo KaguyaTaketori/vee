@@ -215,25 +215,31 @@ async def show_quality_options(query, url):
         pass
     
     formats, info = await get_formats(url)
-    logger.error(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:30]]}")
+    logger.error(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")
 
     resolutions = {}
     for f in formats:
         height = f.get("height")
         filesize = f.get("filesize") or f.get("filesize_approx", 0)
+        acodec = f.get("acodec", "none")
+        has_audio = acodec and acodec != "none"
         if height and height in [2160, 1440, 1080, 720, 480, 360, 240]:
             if height not in resolutions:
-                resolutions[height] = f.get("format_id")
+                resolutions[height] = (f.get("format_id"), has_audio)
             elif filesize and filesize < MAX_FILE_SIZE:
-                resolutions[height] = f.get("format_id")
+                current = resolutions.get(height)
+                if current and not current[1] and has_audio:
+                    resolutions[height] = (f.get("format_id"), has_audio)
 
     keyboard = []
     priority = [1080, 720, 480, 360, 240, 2160, 1440]
     
     for height in priority:
         if height in resolutions:
+            format_data = resolutions[height]
+            format_id = format_data[0] if isinstance(format_data, tuple) else format_data
             label = f"{height}p HD" if height >= 720 else f"{height}p"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"quality_{resolutions[height]}")])
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"quality_{format_id}")])
     
     keyboard.append([InlineKeyboardButton("⭐ Best Quality (Auto)", callback_data="quality_best")])
     
@@ -247,17 +253,17 @@ async def show_quality_options(query, url):
 
 
 async def send_video_with_format(query, url, processing_msg, format_id, context):
+    """Handle video download with format selection - uses Strategy pattern."""
+    from core.strategies import VideoStrategy
+    
     user_id = query.from_user.id
     cached_file = context.user_data.get(f"cached_file_{user_id}")
     
     if cached_file and os.path.exists(cached_file):
         logger.info(f"Using cached file for {url}: {cached_file}")
         filename = cached_file
-        try:
-            formats, info = await get_formats(url)
-            title = info.get("title") if formats else "Video"
-        except:
-            title = "Video"
+        title = os.path.splitext(os.path.basename(filename))[0]
+        info = {"title": title}
     else:
         try:
             await processing_msg.edit_text(t("downloading", user_id))
@@ -265,6 +271,7 @@ async def send_video_with_format(query, url, processing_msg, format_id, context)
             available_ids = [f.get("format_id") for f in formats]
             logger.error(f"Requested format: {format_id}, Available: {available_ids[:20]}")
             
+            from core.downloader import download_video
             progress_hook = _make_progress_hook(processing_msg)
             filename, info = await download_video(url, format_id, progress_hook)
         except Exception as e:
@@ -274,7 +281,7 @@ async def send_video_with_format(query, url, processing_msg, format_id, context)
         if not os.path.exists(filename):
             await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
             return
-
+    
     file_size = os.path.getsize(filename)
     if file_size > MAX_FILE_SIZE:
         await processing_msg.edit_text(
@@ -316,6 +323,17 @@ async def send_video_with_format(query, url, processing_msg, format_id, context)
 
 
 async def send_audio(query, url, processing_msg, context):
+    """Handle audio download - now delegates to Strategy pattern."""
+    from core.strategies import StrategyFactory
+    
+    strategy = StrategyFactory.get("download_audio")
+    if strategy:
+        asyncio.create_task(strategy.execute(query, url, processing_msg, context))
+    else:
+        await _send_audio_legacy(query, url, processing_msg, context)
+
+
+async def _send_audio_legacy(query, url, processing_msg, context):
     user_id = query.from_user.id
     cached_file = context.user_data.get(f"cached_file_{user_id}")
     

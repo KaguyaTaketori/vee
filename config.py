@@ -16,6 +16,9 @@ BOT_API_URL = os.getenv("BOT_API_URL", "http://127.0.0.1:8082/bot")
 LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "")
+COOKIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
+if not os.path.exists(COOKIES_DIR):
+    os.makedirs(COOKIES_DIR)
 COOKIE_REFRESH_CMD = os.getenv("COOKIE_REFRESH_CMD", "")
 COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", 12))
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
@@ -25,7 +28,7 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
 TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
 
-USE_ARIA2 = os.getenv("USE_ARIA2", "true").lower() == "true"
+USE_ARIA2 = os.getenv("USE_ARIA2", "false").lower() == "true"
 ARIA2_CONNECTIONS = int(os.getenv("ARIA2_CONNECTIONS", "16"))
 
 MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", 500 * 1024 * 1024))

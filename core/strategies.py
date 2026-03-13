@@ -217,20 +217,52 @@ class ThumbnailStrategy(DownloadStrategy):
         return thumbnail_url, info
 
 
-class StrategyFactory:
-    """Factory for creating download strategies."""
+class VideoFormatStrategy(VideoStrategy):
+    """Video strategy with specific format selection."""
     
-    _strategies = {
-        "download_video": VideoStrategy(),
-        "download_audio": AudioStrategy(),
-        "download_thumbnail": ThumbnailStrategy(),
-        "spotify": SpotifyStrategy(),
+    def __init__(self, format_id: str = "best"):
+        self._format_id = format_id
+        super().__init__()
+    
+    @property
+    def download_type(self) -> str:
+        return f"video_{self._format_id}"
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_video
+        return await download_video(url, self._format_id, progress_hook)
+
+
+class StrategyFactory:
+    """Factory for creating download strategies with lazy loading."""
+    
+    _strategies: dict[str, DownloadStrategy] = {}
+    _strategy_classes = {
+        "download_video": VideoStrategy,
+        "download_audio": AudioStrategy,
+        "download_thumbnail": ThumbnailStrategy,
+        "spotify": SpotifyStrategy,
     }
     
     @classmethod
     def get(cls, key: str) -> DownloadStrategy | None:
+        if key not in cls._strategies:
+            if key in cls._strategy_classes:
+                cls._strategies[key] = cls._strategy_classes[key]()
+            elif key.startswith("video_"):
+                format_id = key.replace("video_", "")
+                cls._strategies[key] = VideoFormatStrategy(format_id)
+            else:
+                return None
         return cls._strategies.get(key)
     
     @classmethod
-    def register(cls, key: str, strategy: DownloadStrategy):
-        cls._strategies[key] = strategy
+    def register(cls, key: str, strategy_class: type[DownloadStrategy]):
+        cls._strategy_classes[key] = strategy_class
+        if key in cls._strategies:
+            del cls._strategies[key]
+    
+    @classmethod
+    def clear_cache(cls):
+        """Clear cached strategy instances (useful for testing)."""
+        cls._strategies.clear()

@@ -1,6 +1,6 @@
 import logging
-import asyncio
-from telegram import Update
+import os
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
 from telegram.request import HTTPXRequest
 
@@ -15,6 +15,40 @@ from app.commands import (
 from app.callbacks import handle_link, handle_callback
 
 
+async def set_bot_commands(app: Application):
+    bot = app.bot
+    
+    user_commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show available commands"),
+        BotCommand("history", "View your download history"),
+        BotCommand("myid", "Get your user ID"),
+        BotCommand("lang", "Change language"),
+    ]
+    
+    admin_commands = [
+        BotCommand("stats", "Show bot statistics"),
+        BotCommand("allow", "Allow a user (admin)"),
+        BotCommand("block", "Block a user (admin)"),
+        BotCommand("users", "List allowed users"),
+        BotCommand("broadcast", "Broadcast message"),
+        BotCommand("userhistory", "View user history"),
+        BotCommand("rateinfo", "Show rate limit info"),
+        BotCommand("setrate", "Set rate limit"),
+        BotCommand("cleanup", "Clean temp files"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("queue", "Show download queue"),
+        BotCommand("storage", "Show storage info"),
+        BotCommand("failed", "Show failed downloads"),
+        BotCommand("cookie", "Update cookies"),
+        BotCommand("refresh", "Clear cached file"),
+    ]
+    
+    await bot.set_my_commands(user_commands)
+    if ADMIN_IDS:
+        await bot.set_my_commands(user_commands + admin_commands, scope={"type": "chat", "chat_id": list(ADMIN_IDS)[0]})
+
+
 class CookieFilter(filters.BaseFilter):
     def filter(self, message):
         if not message.document:
@@ -25,7 +59,7 @@ class CookieFilter(filters.BaseFilter):
 
 
 async def handle_cookie_file(update: Update, context: CallbackContext):
-    from config import COOKIE_FILE
+    from config import COOKIE_FILE, COOKIES_DIR
     document = update.message.document
     if not document:
         return
@@ -34,12 +68,29 @@ async def handle_cookie_file(update: Update, context: CallbackContext):
         await update.message.reply_text("Please send a .txt file (cookies.txt)")
         return
     
-    try:
-        file = await document.get_file()
-        await file.download_to_drive(custom_path=COOKIE_FILE)
-        await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
-    except Exception as e:
-        await update.message.reply_text(f"Error saving cookie file: {e}")
+    import re
+    filename = document.file_name
+    match = re.match(r'([^_]+)_cookies\.txt', filename)
+    
+    if match:
+        site_domain = match.group(1)
+        site_cookie_file = os.path.join(COOKIES_DIR, f"{site_domain}_cookies.txt")
+        try:
+            file = await document.get_file()
+            await file.download_to_drive(custom_path=site_cookie_file)
+            await update.message.reply_text(f"Cookies saved for {site_domain}!")
+        except Exception as e:
+            await update.message.reply_text(f"Error saving cookie file: {e}")
+    else:
+        if COOKIE_FILE:
+            try:
+                file = await document.get_file()
+                await file.download_to_drive(custom_path=COOKIE_FILE)
+                await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
+            except Exception as e:
+                await update.message.reply_text(f"Error saving cookie file: {e}")
+        else:
+            await update.message.reply_text("Invalid filename. Use format: domain_cookies.txt (e.g., www.youtube.com_cookies.txt)")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -140,11 +191,16 @@ def main():
     if ADMIN_IDS:
         app.job_queue.run_repeating(storage_alert_job, interval=3600, first=300)
 
+    async def post_init_callback(app: Application):
+        await set_bot_commands(app)
+
+    app.post_init = post_init_callback
+    
     async def post_shutdown(context):
         persist_all_data()
 
     app.post_shutdown = post_shutdown
-
+    
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

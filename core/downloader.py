@@ -5,11 +5,71 @@ import subprocess
 import time
 import yt_dlp
 import httpx
-from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS
+from functools import lru_cache
+from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS, COOKIES_DIR
 
 logger = logging.getLogger(__name__)
 
 _cookie_last_refresh = 0
+
+
+class YtDlpHelper:
+    """Helper class to reduce duplicate yt-dlp configuration code."""
+    
+    def __init__(self, url: str = None):
+        self.url = url
+        self.opts = self._build_opts()
+    
+    def _build_opts(self):
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extractor_retries": 3,
+            "fragment_retries": 3,
+            "js_runtimes": {"node": {}},
+        }
+        if self.url:
+            cookie_file = self._get_cookie_file(self.url)
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
+            opts = self._add_extractor_headers(self.url, opts)
+        return opts
+    
+    def _get_cookie_file(self, url: str) -> str:
+        if "youtube.com" in url:
+            site_cookie = os.path.join(COOKIES_DIR, "www.youtube.com_cookies.txt")
+            if os.path.exists(site_cookie):
+                return site_cookie
+        elif "bilibili.com" in url or "b23.tv" in url:
+            site_cookie = os.path.join(COOKIES_DIR, "www.bilibili.com_cookies.txt")
+            if os.path.exists(site_cookie):
+                return site_cookie
+        
+        if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+            return COOKIE_FILE
+        return ""
+    
+    def _add_extractor_headers(self, url, opts):
+        if "bilibili.com" in url:
+            opts["http_headers"] = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            }
+        return opts
+    
+    def get_opts(self):
+        return self.opts
+    
+    def merge_opts(self, **kwargs):
+        self.opts.update(kwargs)
+        return self.opts
+    
+    @staticmethod
+    def prepare_url(url: str) -> str:
+        """Common URL preprocessing: resolve short URLs and refresh cookies."""
+        refresh_cookies()
+        return resolve_short_url(url)
 
 
 def resolve_short_url(url: str) -> str:
@@ -88,31 +148,6 @@ def refresh_cookies():
         return False
 
 
-def _get_base_opts():
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extractor_retries": 3,
-        "fragment_retries": 3,
-        "js_runtimes": {"node": {}},
-    }
-    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
-        opts["cookiefile"] = COOKIE_FILE
-    
-    return opts
-
-
-def _add_extractor_headers(url, opts):
-    """Add extractor-specific headers for sites like Bilibili."""
-    if "bilibili.com" in url:
-        opts["http_headers"] = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.bilibili.com/",
-            "Origin": "https://www.bilibili.com",
-        }
-    return opts
-
-
 def _use_intl_api(url):
     """Convert Bilibili URL to use international API."""
     if "bilibili.com" in url and "b23.tv" not in url:
@@ -120,14 +155,33 @@ def _use_intl_api(url):
     return url
 
 
+@lru_cache(maxsize=32)
+def _cached_get_formats(url: str):
+    """Cached version of format extraction - useful when same URL is queried multiple times."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(get_formats(url))
+        return result
+    finally:
+        loop.close()
+
+
+async def get_formats_cached(url):
+    """Get formats with caching for improved performance."""
+    try:
+        return _cached_get_formats(url)
+    except Exception:
+        return await get_formats(url)
+
+
 async def get_formats(url):
-    refresh_cookies()
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     
     loop = asyncio.get_event_loop()
     def _get():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
         ydl_opts['logger'] = logging.getLogger('yt_dlp')
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -138,10 +192,11 @@ async def get_formats(url):
 
 
 async def download_video(url, format_id, progress_hook=None):
-    refresh_cookies()
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     
-    if USE_ARIA2 and is_aria2_available():
+    needs_merging = format_id == "best" or "+" in str(format_id)
+    
+    if USE_ARIA2 and is_aria2_available() and format_id == "best" and not needs_merging:
         try:
             return await download_video_aria2(url, format_id, progress_hook)
         except Exception as e:
@@ -149,21 +204,44 @@ async def download_video(url, format_id, progress_hook=None):
     
     loop = asyncio.get_event_loop()
     def _download():
-        ydl_opts = _get_base_opts()
-        ydl_opts.update({
-            "format": "bestvideo+bestaudio/best" if format_id == "best" else f"{format_id}+bestaudio/best",
-            "outtmpl": get_temp_template(),
-            "merge_output_format": "mp4",
-            "progress_hooks": [progress_hook] if progress_hook else None,
-        })
-        
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
         
         if "twitter.com" in url or "x.com" in url:
             ydl_opts["extractor_args"] = {
                 "twitter": {"lang": "en"}
             }
-
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [])
+            
+            selected_format = None
+            if format_id != "best":
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        selected_format = f
+                        break
+            
+            acodec = selected_format.get("acodec") if selected_format else None
+            has_audio = acodec not in (None, "none") if acodec else False
+            
+            logger.error(f"Format {format_id} selected: acodec={acodec}, has_audio={has_audio}")
+            
+            if has_audio:
+                ydl_opts["format"] = format_id
+                ydl_opts.pop("merge_output_format", None)
+            elif format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+            else:
+                ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+        
+        ydl_opts["outtmpl"] = get_temp_template()
+        if progress_hook:
+            ydl_opts["progress_hooks"] = [progress_hook]
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
@@ -172,13 +250,12 @@ async def download_video(url, format_id, progress_hook=None):
 
 
 async def download_audio(url, progress_hook=None):
-    refresh_cookies()
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     
     loop = asyncio.get_event_loop()
     def _download():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
         ydl_opts.update({
             "format": "bestaudio/best",
             "outtmpl": get_temp_template(),
@@ -198,12 +275,11 @@ async def download_audio(url, progress_hook=None):
 
 
 async def get_thumbnail(url):
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     loop = asyncio.get_event_loop()
     def _get():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             thumbnail_url = info.get("thumbnail")
         return thumbnail_url, info
@@ -211,12 +287,11 @@ async def get_thumbnail(url):
 
 
 async def get_images(url):
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     loop = asyncio.get_event_loop()
     def _get():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             images = info.get("thumbnail") or []
             if isinstance(images, str):
@@ -273,13 +348,12 @@ async def download_with_aria2(url, filename, progress_hook=None, connections=16)
 
 
 async def get_direct_url(url, format_id=None):
-    refresh_cookies()
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     
     loop = asyncio.get_event_loop()
     def _get():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
         if format_id:
             ydl_opts["format"] = f"{format_id}+bestaudio/best"
         
@@ -299,8 +373,7 @@ async def get_direct_url(url, format_id=None):
 
 
 async def download_video_aria2(url, format_id, progress_hook=None):
-    refresh_cookies()
-    url = resolve_short_url(url)
+    url = YtDlpHelper.prepare_url(url)
     
     if not is_aria2_available():
         raise RuntimeError("aria2c is not installed")
@@ -308,20 +381,17 @@ async def download_video_aria2(url, format_id, progress_hook=None):
     loop = asyncio.get_event_loop()
     
     def _get_info():
-        ydl_opts = _get_base_opts()
-        ydl_opts = _add_extractor_headers(url, ydl_opts)
-        if format_id == "best":
-            ydl_opts["format"] = "bestvideo+bestaudio/best"
-        else:
-            ydl_opts["format"] = f"{format_id}+bestaudio/best"
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
             formats = info.get("formats") or []
+            
             target_format = None
             
             if format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
                 for f in reversed(formats):
                     if f.get("url") and f.get("ext") in ("mp4", "m4a", "webm"):
                         target_format = f
@@ -331,6 +401,17 @@ async def download_video_aria2(url, format_id, progress_hook=None):
                     if str(f.get("format_id")) == str(format_id):
                         target_format = f
                         break
+                
+                if target_format:
+                    acodec = target_format.get("acodec")
+                    has_audio = acodec not in (None, "none") if acodec else False
+                    logger.error(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
+                    if has_audio:
+                        ydl_opts["format"] = format_id
+                    else:
+                        ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                else:
+                    ydl_opts["format"] = f"{format_id}+bestaudio/best"
             
             if not target_format and formats:
                 target_format = formats[-1]

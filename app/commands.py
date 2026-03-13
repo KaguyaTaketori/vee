@@ -428,8 +428,11 @@ async def cookie_command(update: Update, context: CallbackContext):
     await update.message.reply_text(
         "Send me your cookies.txt file to update the bot's cookies.\n\n"
         "To generate cookies:\n"
-        "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n"
-        "2. Send the file here"
+        "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n\n"
+        "For site-specific cookies, use filename format:\n"
+        "• `www.youtube.com_cookies.txt` for YouTube\n"
+        "• `www.bilibili.com_cookies.txt` for Bilibili\n\n"
+        "The bot will automatically use the appropriate cookie file based on the URL being downloaded."
     )
 
 
