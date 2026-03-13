@@ -1,12 +1,20 @@
 import os
 import json
 import time
+import fcntl
+import threading
 
 
 USERS_FILE = "/home/ubuntu/vee/users_db.json"
+LOCK_FILE = "/home/ubuntu/vee/users_db.lock"
+
+_cache = {"data": {}, "dirty": False, "time": 0}
+_cache_lock = threading.Lock()
+_persist_interval = 30
+_last_persist = 0
 
 
-def load_users() -> dict:
+def _load_users_unsafe() -> dict:
     if not os.path.exists(USERS_FILE):
         return {}
     try:
@@ -16,18 +24,49 @@ def load_users() -> dict:
         return {}
 
 
-def save_users(users: dict):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+def _load_users() -> dict:
+    global _cache, _last_persist
+    with _cache_lock:
+        now = time.time()
+        if _cache["data"] is None or now - _cache["time"] > 5:
+            _cache["data"] = _load_users_unsafe()
+            _cache["time"] = now
+        return _cache["data"].copy()
+
+
+def _save_users_unsafe(users: dict):
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(USERS_FILE, "w") as f:
+                json.dump(users, f, indent=2)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _persist_users():
+    global _cache, _last_persist
+    with _cache_lock:
+        if _cache["dirty"]:
+            _save_users_unsafe(_cache["data"])
+            _cache["dirty"] = False
+            _last_persist = time.time()
+
+
+def _schedule_persist():
+    global _cache
+    with _cache_lock:
+        _cache["dirty"] = True
 
 
 def get_user_info(user_id: int) -> dict:
-    users = load_users()
-    return users.get(str(user_id), {})
+    users = _load_users()
+    return users.get(str(user_id), {}).copy()
 
 
 def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    users = load_users()
+    global _cache
+    users = _load_users()
     str_id = str(user_id)
     
     if str_id not in users:
@@ -42,11 +81,14 @@ def update_user(user_id: int, username: str = None, first_name: str = None, last
     
     users[str_id]["last_seen"] = time.time()
     
-    save_users(users)
+    with _cache_lock:
+        _cache["data"] = users
+        _cache["dirty"] = True
+        _cache["time"] = time.time()
 
 
 def get_all_users() -> list:
-    users = load_users()
+    users = _load_users()
     return [
         {
             "id": int(uid),
@@ -71,3 +113,7 @@ def format_user_display(user: dict) -> str:
     
     name = " ".join(parts) if parts else f"User {user['id']}"
     return f"{name} (`{user['id']}`)"
+
+
+def force_persist():
+    _persist_users()

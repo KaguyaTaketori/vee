@@ -1,10 +1,13 @@
+import os
+import psutil
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, get_config, cleanup_temp_files, TEMP_DIR
+from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, get_config, cleanup_temp_files, TEMP_DIR, BOT_FILE_PREFIX
 from core.logger import log_user, get_user_stats
-from core.history import get_user_history, get_all_users_count, get_total_downloads
+from core.history import get_user_history, get_all_users_count, get_total_downloads, get_failed_downloads
 from core.ratelimit import rate_limiter, save_rate_limit
+from core.i18n import t, set_user_lang, LANGUAGES
 
 
 async def start_command(update: Update, context: CallbackContext):
@@ -13,25 +16,14 @@ async def start_command(update: Update, context: CallbackContext):
     track_user(update.message.from_user)
     log_user(update.message.from_user, "start")
     user = update.message.from_user
-    await update.message.reply_text(
-        f"Welcome! Your ID: {user.id}\n\n"
-        "Send me a link from YouTube, TikTok, Instagram, Twitter, or other supported platforms.\n\n"
-        "I can download:\n"
-        "• Videos (up to 2GB with local Bot API)\n"
-        "• Thumbnails\n"
-        "• Audio (MP3)\n\n"
-        "Just send a link to choose what to download!"
-    )
+    await update.message.reply_text(t("welcome", user.id))
 
 
 async def myid_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     user = update.message.from_user
-    msg = f"Your Telegram ID: `{user.id}`\n"
-    msg += f"Username: @{user.username or 'N/A'}\n"
-    msg += f"Name: {user.first_name} {user.last_name or ''}"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(t("your_id", user.id, username=user.username or "N/A", name=f"{user.first_name} {user.last_name or ''}"), parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: CallbackContext):
@@ -41,29 +33,9 @@ async def help_command(update: Update, context: CallbackContext):
     is_admin = user_id in ADMIN_IDS if ADMIN_IDS else False
     
     if is_admin:
-        await update.message.reply_text(
-            "Available commands:\n"
-            "/start - Start the bot\n"
-            "/help - Show this help\n"
-            "/history - Your download history\n\n"
-            "Admin commands:\n"
-            "/allow <user_id> - Allow a user\n"
-            "/block <user_id> - Block a user\n"
-            "/users - List allowed users\n"
-            "/stats - Bot usage stats\n"
-            "/broadcast <message> - Broadcast to all users\n"
-            "/userhistory <user_id> - View user history\n"
-            "/rateinfo - View rate limit info\n"
-            "/setrate <max> [on/off] - Set rate limit"
-        )
+        await update.message.reply_text(t("admin_commands", user_id))
     else:
-        await update.message.reply_text(
-            "Available commands:\n"
-            "/start - Start the bot\n"
-            "/help - Show this help\n"
-            "/history - Your download history\n\n"
-            "Just send a link to download!"
-        )
+        await update.message.reply_text(t("available_commands", user_id))
 
 
 async def stats_command(update: Update, context: CallbackContext):
@@ -298,21 +270,190 @@ async def status_command(update: Update, context: CallbackContext):
     temp_size = 0
     if os.path.exists(config["temp_dir"]):
         for fname in os.listdir(config["temp_dir"]):
-            if fname.startswith("yt_dlp_"):
-                temp_files += 1
-                try:
-                    temp_size += os.path.getsize(os.path.join(config["temp_dir"], fname))
-                except:
-                    pass
+            if fname.startswith(BOT_FILE_PREFIX):
+                fpath = os.path.join(config["temp_dir"], fname)
+                if os.path.isfile(fpath):
+                    temp_files += 1
+                    try:
+                        temp_size += os.path.getsize(fpath)
+                    except:
+                        pass
     
     msg = "📊 Bot Status\n\n"
     msg += f"CPU: {psutil.cpu_percent()}%\n"
-    msg += f"Memory: {psutil.virtual_memory().percent}%\n\n"
+    mem = psutil.virtual_memory()
+    msg += f"Memory: {mem.percent}% ({mem.available // (1024*1024)}MB available)\n\n"
     msg += f"Temp files: {temp_files}\n"
     msg += f"Temp size: {temp_size // (1024*1024)}MB\n\n"
     msg += f"Rate limit: {rate_status['max_downloads_per_hour']}/hour\n"
     msg += f"Rate enabled: {rate_status['enabled']}\n"
     msg += f"Cleanup interval: {config['cleanup_interval_hours']}h\n"
-    msg += f"Temp file max age: {config['temp_file_max_age_hours']}h"
+    msg += f"Temp file max age: {config['temp_file_max_age_hours']}h\n"
+    msg += f"Max cache size: {config.get('max_cache_size', 500*1024*1024) // (1024*1024)}MB"
     
     await update.message.reply_text(msg)
+
+
+async def queue_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    from core.queue import download_queue
+    
+    active = download_queue.active_tasks
+    queued = download_queue.queue.qsize()
+    
+    msg = "📥 Download Queue\n\n"
+    msg += f"Active downloads: {len(active)}\n"
+    msg += f"Queued: {queued}\n\n"
+    
+    if active:
+        msg += "Active:\n"
+        for tid, task in list(active.items())[:10]:
+            user_name = get_user_display_name(task.user_id)
+            status_emoji = {
+                "downloading": "⬇️",
+                "processing": "⚙️",
+                "uploading": "📤",
+            }.get(task.status.value, "⏳")
+            msg += f"{status_emoji} {task.download_type} - {user_name}\n"
+    
+    await update.message.reply_text(msg)
+
+
+async def storage_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    config = get_config()
+    temp_dir = config["temp_dir"]
+    
+    disk = psutil.disk_usage("/")
+    total, used, free = disk.total, disk.used, disk.free
+    temp_files = 0
+    temp_size = 0
+    oldest_file = None
+    oldest_time = None
+    
+    if os.path.exists(temp_dir):
+        for fname in os.listdir(temp_dir):
+            fpath = os.path.join(temp_dir, fname)
+            if os.path.isfile(fpath):
+                temp_files += 1
+                try:
+                    temp_size += os.path.getsize(fpath)
+                except:
+                    pass
+                mtime = os.path.getmtime(fpath)
+                if oldest_time is None or mtime < oldest_time:
+                    oldest_time = mtime
+                    oldest_file = fname
+    
+    disk_percent = (used / total) * 100
+    alert = ""
+    if disk_percent > 90:
+        alert = "\n⚠️ WARNING: Disk usage above 90%!"
+    elif disk_percent > 80:
+        alert = "\n⚠️ CAUTION: Disk usage above 80%"
+    
+    msg = f"💾 Storage Status{alert}\n\n"
+    msg += f"Total disk: {_format_bytes(total)}\n"
+    msg += f"Used: {_format_bytes(used)} ({disk_percent:.1f}%)\n"
+    msg += f"Free: {_format_bytes(free)}\n\n"
+    msg += f"Temp directory ({temp_dir}):\n"
+    msg += f"Files: {temp_files}\n"
+    msg += f"Size: {_format_bytes(temp_size)}\n"
+    if oldest_file:
+        from datetime import datetime
+        msg += f"Oldest: {oldest_file}\n"
+        msg += f"   {datetime.fromtimestamp(oldest_time).strftime('%Y-%m-%d %H:%M')}"
+    
+    await update.message.reply_text(msg)
+
+
+async def failed_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /failed [user_id]")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    
+    history = get_user_history(target_id, limit=50)
+    failed = [h for h in history if h.get("status") == "failed"]
+    
+    if not failed:
+        await update.message.reply_text(f"No failed downloads for user {target_id}.")
+        return
+    
+    msg = f"❌ Failed downloads for user {target_id}:\n\n"
+    for item in failed[:20]:
+        from datetime import datetime
+        dt = datetime.fromtimestamp(item["timestamp"])
+        msg += f"• {item['type']} - {item.get('title', 'N/A')[:30]}\n"
+        if item.get("error"):
+            msg += f"  Error: {item['error'][:50]}\n"
+        msg += f"  {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    await update.message.reply_text(msg)
+
+
+def _format_bytes(bytes_val):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f}{unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f}PB"
+
+
+async def lang_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    
+    if not context.args:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = []
+        for code, name in LANGUAGES.items():
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"lang_{code}")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(t("select_language", user_id), reply_markup=reply_markup)
+        return
+    
+    lang_code = context.args[0].lower()
+    if lang_code not in LANGUAGES:
+        await update.message.reply_text("Invalid language. Use: en, zh, or ja")
+        return
+    
+    set_user_lang(user_id, lang_code)
+    await update.message.reply_text(t("language_changed", user_id))
+
+
+async def cookie_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text(
+        "Send me your cookies.txt file to update the bot's cookies.\n\n"
+        "To generate cookies:\n"
+        "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n"
+        "2. Send the file here"
+    )

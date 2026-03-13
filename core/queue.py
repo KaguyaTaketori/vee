@@ -1,6 +1,6 @@
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable, Any
 from telegram import Bot
@@ -21,32 +21,29 @@ class DownloadTask:
     task_id: str
     user_id: int
     url: str
-    download_type: str  # video, audio, thumbnail
+    download_type: str
     format_id: Optional[str] = None
     status: DownloadStatus = DownloadStatus.QUEUED
     progress: float = 0.0
-    created_at: float = None
+    created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     error: Optional[str] = None
     file_path: Optional[str] = None
     file_size: Optional[int] = None
 
-    def __post_init__(self):
-        if self.created_at is None:
-            self.created_at = time.time()
-
 
 class DownloadQueue:
-    def __init__(self, max_concurrent: int = 3):
+    def __init__(self, max_concurrent: int = 3, max_completed_tasks: int = 100):
         self.max_concurrent = max_concurrent
+        self.max_completed_tasks = max_completed_tasks
         self.queue: asyncio.Queue = asyncio.Queue()
         self.active_tasks: dict[str, DownloadTask] = {}
         self.completed_tasks: dict[str, DownloadTask] = {}
         self.user_downloads: dict[int, set[str]] = {}
         self._workers: list[asyncio.Task] = []
         self._running = False
-        self._cancel_event: asyncio.Event = None
+        self._cancel_event: Optional[asyncio.Event] = None
 
     async def start(self):
         self._running = True
@@ -58,7 +55,8 @@ class DownloadQueue:
 
     async def stop(self):
         self._running = False
-        self._cancel_event = None
+        if self._cancel_event:
+            self._cancel_event.set()
         for worker in self._workers:
             worker.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
@@ -104,6 +102,7 @@ class DownloadQueue:
             task.completed_at = time.time()
             self.completed_tasks[task_id] = task
             del self.active_tasks[task_id]
+            self._cleanup_completed()
             return True
         return False
 
@@ -113,6 +112,7 @@ class DownloadQueue:
         self.completed_tasks[task.task_id] = task
         if task.task_id in self.active_tasks:
             del self.active_tasks[task.task_id]
+        self._cleanup_completed()
 
     def fail_task(self, task: DownloadTask, error: str):
         task.status = DownloadStatus.FAILED
@@ -121,6 +121,19 @@ class DownloadQueue:
         self.completed_tasks[task.task_id] = task
         if task.task_id in self.active_tasks:
             del self.active_tasks[task.task_id]
+        self._cleanup_completed()
+
+    def _cleanup_completed(self):
+        if len(self.completed_tasks) > self.max_completed_tasks:
+            sorted_tasks = sorted(
+                self.completed_tasks.items(),
+                key=lambda x: x[1].completed_at or 0
+            )
+            to_remove = sorted_tasks[:len(sorted_tasks) - self.max_completed_tasks]
+            for task_id, _ in to_remove:
+                del self.completed_tasks[task_id]
+                for user_tasks in self.user_downloads.values():
+                    user_tasks.discard(task_id)
 
 
-download_queue = DownloadQueue(max_workers=3)
+download_queue = DownloadQueue(max_concurrent=3)

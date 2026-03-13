@@ -1,17 +1,45 @@
 import logging
 import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
 from telegram.request import HTTPXRequest
 
-from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS, persist_all_data
 from app.commands import (
     start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
     userhistory_command, rateinfo_command, setrate_command,
-    cleanup_command, status_command
+    cleanup_command, status_command, queue_command, storage_command, failed_command,
+    lang_command, cookie_command
 )
 from app.callbacks import handle_link, handle_callback
+
+
+class CookieFilter(filters.BaseFilter):
+    def filter(self, message):
+        if not message.document:
+            return False
+        if not ADMIN_IDS:
+            return False
+        return message.from_user.id in ADMIN_IDS
+
+
+async def handle_cookie_file(update: Update, context: CallbackContext):
+    from config import COOKIE_FILE
+    document = update.message.document
+    if not document:
+        return
+    
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("Please send a .txt file (cookies.txt)")
+        return
+    
+    try:
+        file = await document.get_file()
+        await file.download_to_drive(custom_path=COOKIE_FILE)
+        await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
+    except Exception as e:
+        await update.message.reply_text(f"Error saving cookie file: {e}")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,6 +57,29 @@ async def cleanup_job(context):
     cleanup_temp_files(max_age_hours=24)
 
 
+async def persist_job(context):
+    persist_all_data()
+
+
+async def storage_alert_job(context):
+    import psutil
+    from config import ADMIN_IDS
+    
+    if not ADMIN_IDS:
+        return
+    
+    disk = psutil.disk_usage("/")
+    total, used, free, percent = disk.total, disk.used, disk.free, disk.percent
+    
+    if percent > 90:
+        msg = f"⚠️ CRITICAL: Disk usage at {percent:.1f}%"
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=msg)
+            except:
+                pass
+
+
 def main():
     request = HTTPXRequest(
         write_timeout=600,
@@ -38,8 +89,8 @@ def main():
     )
     
     if LOCAL_MODE:
-        from telegram import Bot
-        bot = Bot(
+        from telegram.ext import ExtBot
+        bot = ExtBot(
             token=TOKEN,
             local_mode=LOCAL_MODE,
             base_url=BOT_API_URL,
@@ -58,6 +109,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("lang", lang_command))
     
     if ADMIN_IDS:
         app.add_handler(CommandHandler("stats", stats_command, filters=AdminFilter()))
@@ -70,12 +122,27 @@ def main():
         app.add_handler(CommandHandler("setrate", setrate_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("cleanup", cleanup_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("status", status_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("queue", queue_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("storage", storage_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("failed", failed_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cookie", cookie_command, filters=AdminFilter()))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
 
     if CLEANUP_INTERVAL_HOURS > 0:
         app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60)
+
+    app.job_queue.run_repeating(persist_job, interval=60, first=30)
+    
+    if ADMIN_IDS:
+        app.job_queue.run_repeating(storage_alert_job, interval=3600, first=300)
+
+    async def post_shutdown(context):
+        persist_all_data()
+
+    app.post_shutdown = post_shutdown
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
