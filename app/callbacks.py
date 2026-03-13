@@ -95,13 +95,22 @@ async def handle_link(update: Update, context: CallbackContext):
     context.user_data[f"cached_file_{user_id}"] = cached_file_path
 
     cached_msg = f"\n\n{t('cached_file_used', user_id)}" if cached_file_path else ""
-    keyboard = [
-        [
-            InlineKeyboardButton(t("video", user_id), callback_data="download_video"),
-            InlineKeyboardButton(t("audio", user_id), callback_data="download_audio"),
-        ],
-        [InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail")],
-    ]
+    
+    is_spotify = is_spotify_url(url)
+    
+    if is_spotify:
+        keyboard = [
+            [InlineKeyboardButton("🎵 Download MP3 (320k)", callback_data="download_audio")],
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton(t("video", user_id), callback_data="download_video"),
+                InlineKeyboardButton(t("audio", user_id), callback_data="download_audio"),
+            ],
+            [InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail")],
+        ]
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
@@ -128,6 +137,7 @@ async def handle_callback(update: Update, context: CallbackContext):
         return
     
     if query.data.startswith("uh_"):
+        from config import ADMIN_IDS
         if ADMIN_IDS and user_id not in ADMIN_IDS:
             await query.answer("Admin only.", show_alert=True)
             return
@@ -175,18 +185,16 @@ async def handle_callback(update: Update, context: CallbackContext):
             except Exception:
                 processing_msg = query.message
             asyncio.create_task(send_video_with_format(query, url, processing_msg, format_id, context))
-        elif query.data == "download_audio":
-            try:
-                processing_msg = await query.edit_message_text("Processing... Please wait.")
-            except Exception:
-                processing_msg = query.message
-            asyncio.create_task(send_audio(query, url, processing_msg, context))
-        elif query.data == "download_thumbnail":
-            try:
-                processing_msg = await query.edit_message_text("Processing... Please wait.")
-            except Exception:
-                processing_msg = query.message
-            asyncio.create_task(send_thumbnail(query, url, processing_msg))
+        elif query.data in ("download_audio", "download_thumbnail"):
+            from core.strategies import StrategyFactory
+            strategy_key = "spotify" if (query.data == "download_audio" and is_spotify_url(url)) else query.data
+            strategy = StrategyFactory.get(strategy_key)
+            if strategy:
+                try:
+                    processing_msg = await query.edit_message_text("Processing... Please wait.")
+                except Exception:
+                    processing_msg = query.message
+                asyncio.create_task(strategy.execute(query, url, processing_msg, context))
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error: {e}")
@@ -380,3 +388,53 @@ async def send_thumbnail(query, url, processing_msg):
     await processing_msg.edit_text(t("fetching_thumbnail", user_id))
     await query.message.reply_photo(photo=thumbnail_url, caption=caption)
     await processing_msg.delete()
+
+
+async def _download_spotify(query, url, processing_msg):
+    """Handle Spotify download."""
+    user_id = query.from_user.id
+    
+    try:
+        await processing_msg.edit_text("🎵 Downloading from Spotify via YouTube...")
+        
+        filename, info = await download_spotify(url)
+        
+        if not os.path.exists(filename):
+            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+            return
+        
+        file_size = os.path.getsize(filename)
+        
+        if file_size > MAX_FILE_SIZE:
+            await processing_msg.edit_text(
+                t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
+            )
+            os.remove(filename)
+            return
+        
+        title = info.get("title")
+        caption = f"🎵 {title}" if title else None
+        
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        existing_file_id = get_file_id_by_url(url)
+        
+        if existing_file_id:
+            logger.info(f"Using file_id for {url}: {existing_file_id}")
+            await query.message.reply_audio(audio=existing_file_id, caption=caption)
+            msg = await query.message.reply_text("✅ Sent via file ID")
+            await processing_msg.delete()
+        else:
+            with open(filename, "rb") as f:
+                sent_msg = await query.message.reply_audio(audio=f, title=title)
+            
+            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
+            await processing_msg.delete()
+            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
+        
+        if os.path.exists(filename):
+            os.remove(filename)
+            
+    except Exception as e:
+        logger.error(f"Spotify download error: {e}")
+        await processing_msg.edit_text(f"Error: {str(e)[:200]}")

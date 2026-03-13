@@ -191,3 +191,23 @@ def get_file_id_by_url(url: str, max_age_hours: int = 168) -> Optional[str]:
                     if entry.get("status") == "success" and entry.get("file_id"):
                         return entry["file_id"]
     return None
+
+
+def clear_file_id_by_url(url: str):
+    """Remove file_id from history entries for a URL, forcing re-download."""
+    global _cache
+    history = _load_history()
+    modified = False
+    
+    for user_entries in history.values():
+        for entry in user_entries:
+            if entry.get("url") == url:
+                if "file_id" in entry:
+                    del entry["file_id"]
+                    modified = True
+    
+    if modified:
+        with _cache_lock:
+            _cache["data"] = history
+            _cache["dirty"] = True
+            _cache["time"] = time.time()

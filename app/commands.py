@@ -41,8 +41,9 @@ async def help_command(update: Update, context: CallbackContext):
 async def stats_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    from core.utils import check_admin
     user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
+    if not check_admin(user_id):
         return
     stats = get_user_stats()
     users_count = get_all_users_count()
@@ -75,8 +76,9 @@ async def history_command(update: Update, context: CallbackContext):
 async def allow_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    from core.utils import check_admin
     user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
+    if not check_admin(user_id):
         return
     
     if not context.args:
@@ -99,8 +101,9 @@ async def allow_command(update: Update, context: CallbackContext):
 async def block_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    from core.utils import check_admin
     user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
+    if not check_admin(user_id):
         return
     
     if not context.args:
@@ -256,28 +259,17 @@ async def cleanup_command(update: Update, context: CallbackContext):
 async def status_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    from core.utils import check_admin, scan_temp_files
     user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
+    if not check_admin(user_id):
         return
     
-    import os
     import psutil
     
     config = get_config()
     rate_status = rate_limiter.get_status()
     
-    temp_files = 0
-    temp_size = 0
-    if os.path.exists(config["temp_dir"]):
-        for fname in os.listdir(config["temp_dir"]):
-            if fname.startswith(BOT_FILE_PREFIX):
-                fpath = os.path.join(config["temp_dir"], fname)
-                if os.path.isfile(fpath):
-                    temp_files += 1
-                    try:
-                        temp_size += os.path.getsize(fpath)
-                    except:
-                        pass
+    temp_files, temp_size, _, _ = scan_temp_files(config["temp_dir"])
     
     msg = "📊 Bot Status\n\n"
     msg += f"CPU: {psutil.cpu_percent()}%\n"
@@ -327,8 +319,9 @@ async def queue_command(update: Update, context: CallbackContext):
 async def storage_command(update: Update, context: CallbackContext):
     if not update.message:
         return
+    from core.utils import check_admin, scan_temp_files, format_bytes
     user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
+    if not check_admin(user_id):
         return
     
     config = get_config()
@@ -336,24 +329,7 @@ async def storage_command(update: Update, context: CallbackContext):
     
     disk = psutil.disk_usage("/")
     total, used, free = disk.total, disk.used, disk.free
-    temp_files = 0
-    temp_size = 0
-    oldest_file = None
-    oldest_time = None
-    
-    if os.path.exists(temp_dir):
-        for fname in os.listdir(temp_dir):
-            fpath = os.path.join(temp_dir, fname)
-            if os.path.isfile(fpath):
-                temp_files += 1
-                try:
-                    temp_size += os.path.getsize(fpath)
-                except:
-                    pass
-                mtime = os.path.getmtime(fpath)
-                if oldest_time is None or mtime < oldest_time:
-                    oldest_time = mtime
-                    oldest_file = fname
+    temp_files, temp_size, oldest_file, oldest_time = scan_temp_files(temp_dir)
     
     disk_percent = (used / total) * 100
     alert = ""
@@ -363,12 +339,12 @@ async def storage_command(update: Update, context: CallbackContext):
         alert = "\n⚠️ CAUTION: Disk usage above 80%"
     
     msg = f"💾 Storage Status{alert}\n\n"
-    msg += f"Total disk: {_format_bytes(total)}\n"
-    msg += f"Used: {_format_bytes(used)} ({disk_percent:.1f}%)\n"
-    msg += f"Free: {_format_bytes(free)}\n\n"
+    msg += f"Total disk: {format_bytes(total)}\n"
+    msg += f"Used: {format_bytes(used)} ({disk_percent:.1f}%)\n"
+    msg += f"Free: {format_bytes(free)}\n\n"
     msg += f"Temp directory ({temp_dir}):\n"
     msg += f"Files: {temp_files}\n"
-    msg += f"Size: {_format_bytes(temp_size)}\n"
+    msg += f"Size: {format_bytes(temp_size)}\n"
     if oldest_file:
         from datetime import datetime
         msg += f"Oldest: {oldest_file}\n"
@@ -414,11 +390,9 @@ async def failed_command(update: Update, context: CallbackContext):
 
 
 def _format_bytes(bytes_val):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024:
-            return f"{bytes_val:.1f}{unit}"
-        bytes_val /= 1024
-    return f"{bytes_val:.1f}PB"
+    """Deprecated: Use core.utils.format_bytes instead."""
+    from core.utils import format_bytes
+    return format_bytes(bytes_val)
 
 
 async def lang_command(update: Update, context: CallbackContext):
@@ -457,3 +431,22 @@ async def cookie_command(update: Update, context: CallbackContext):
         "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n"
         "2. Send the file here"
     )
+
+
+async def refresh_command(update: Update, context: CallbackContext):
+    """Force re-download by clearing cached file_id for a URL."""
+    if not update.message:
+        return
+    from core.utils import check_admin
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /refresh <url>\n\nClears cached file ID so the video will be re-downloaded.")
+        return
+    
+    url = " ".join(context.args)
+    from core.history import clear_file_id_by_url
+    clear_file_id_by_url(url)
+    await update.message.reply_text(f"✅ Cleared cached file ID for:\n{url}\n\nThe next download will fetch a fresh file.")

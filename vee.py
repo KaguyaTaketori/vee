@@ -10,7 +10,7 @@ from app.commands import (
     allow_command, block_command, users_command, broadcast_command,
     userhistory_command, rateinfo_command, setrate_command,
     cleanup_command, status_command, queue_command, storage_command, failed_command,
-    lang_command, cookie_command
+    lang_command, cookie_command, refresh_command
 )
 from app.callbacks import handle_link, handle_callback
 
@@ -126,6 +126,7 @@ def main():
         app.add_handler(CommandHandler("storage", storage_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("failed", failed_command, filters=AdminFilter()))
         app.add_handler(CommandHandler("cookie", cookie_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("refresh", refresh_command, filters=AdminFilter()))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
