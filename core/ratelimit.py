@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-RATE_LIMIT_FILE = "/home/ubuntu/vee/rate_limit.json"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RATE_LIMIT_FILE = os.path.join(BASE_DIR, "rate_limit.json")
 
 
 def load_rate_limit() -> dict:

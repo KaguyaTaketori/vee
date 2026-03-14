@@ -1,7 +1,8 @@
 import os
 from datetime import datetime
 
-LOG_FILE = "/home/ubuntu/vee/bot_users.log"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_FILE = os.path.join(BASE_DIR, "bot_users.log")
 
 def log_user(user, action, extra=None):
     if not user:

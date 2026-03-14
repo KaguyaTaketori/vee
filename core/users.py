@@ -5,8 +5,9 @@ import fcntl
 import threading
 
 
-USERS_FILE = "/home/ubuntu/vee/users_db.json"
-LOCK_FILE = "/home/ubuntu/vee/users_db.lock"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+USERS_FILE = os.path.join(BASE_DIR, "users_db.json")
+LOCK_FILE = os.path.join(BASE_DIR, "users_db.lock")
 
 _cache = {"data": {}, "dirty": False, "time": 0}
 _cache_lock = threading.Lock()

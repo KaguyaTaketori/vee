@@ -3,6 +3,8 @@ import sys
 import time
 from dotenv import load_dotenv
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -22,7 +24,7 @@ if not os.path.exists(COOKIES_DIR):
 COOKIE_REFRESH_CMD = os.getenv("COOKIE_REFRESH_CMD", "")
 COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", 12))
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
-ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "/home/ubuntu/vee/allowed_users.txt")
+ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", os.path.join(BASE_DIR, "allowed_users.txt"))
 
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
 TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))

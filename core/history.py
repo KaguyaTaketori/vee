@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import Optional
 
 
-HISTORY_FILE = "/home/ubuntu/vee/download_history.json"
-LOCK_FILE = "/home/ubuntu/vee/history.lock"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HISTORY_FILE = os.path.join(BASE_DIR, "download_history.json")
+LOCK_FILE = os.path.join(BASE_DIR, "history.lock")
 MAX_ENTRIES_PER_USER = 100
 MAX_TOTAL_ENTRIES = 5000
 
