@@ -14,6 +14,7 @@ from core.logger import log_user, log_download
 from core.history import check_recent_download, get_file_id_by_url, add_history, get_user_history
 from core.i18n import t
 from core.downloader import get_formats, download_video, download_audio, get_thumbnail, download_spotify, is_spotify_url
+from core.telegram_uploader import upload_video, upload_audio, upload_photo
 from app.download import _make_progress_hook
 
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
@@ -181,7 +182,7 @@ async def handle_callback(update: Update, context: CallbackContext):
         elif query.data.startswith("quality_"):
             format_id = query.data.replace("quality_", "")
             try:
-                processing_msg = await query.edit_message_text("Processing... Please wait.")
+                processing_msg = await query.edit_message_text(t("processing_please_wait", user_id))
             except Exception:
                 processing_msg = query.message
             asyncio.create_task(send_video_with_format(query, url, processing_msg, format_id, context))
@@ -191,7 +192,7 @@ async def handle_callback(update: Update, context: CallbackContext):
             strategy = StrategyFactory.get(strategy_key)
             if strategy:
                 try:
-                    processing_msg = await query.edit_message_text("Processing... Please wait.")
+                    processing_msg = await query.edit_message_text(t("processing_please_wait", user_id))
                 except Exception:
                     processing_msg = query.message
                 asyncio.create_task(strategy.execute(query, url, processing_msg, context))
@@ -301,19 +302,21 @@ async def send_video_with_format(query, url, processing_msg, format_id, context)
         if existing_file_id:
             logger.info(f"Using file_id for {url}: {existing_file_id}")
             await query.message.reply_video(video=existing_file_id, caption=caption)
-            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            msg = await query.message.reply_text(t("sent_via_file_id_no_reupload", user_id))
             await processing_msg.delete()
             log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
             add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, existing_file_id)
         else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_video(video=f, caption=caption)
+            logger.info(f"Starting video upload: {filename}, size: {file_size} bytes")
+            new_file_id = await upload_video(query, filename, caption)
             
-            new_file_id = sent_msg.video.file_id if sent_msg.video else None
             await processing_msg.delete()
             log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
             add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, new_file_id)
     except Exception as e:
+        import traceback
+        logger.error(f"Video upload failed: {type(e).__name__}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
         log_download(query.from_user, "video_downloaded", url, f"upload_failed: {e}", file_size, format_id)
         add_history(query.from_user.id, url, "video", file_size, info.get("title"), "failed")
@@ -367,19 +370,21 @@ async def _send_audio_legacy(query, url, processing_msg, context):
         if existing_file_id:
             logger.info(f"Using file_id for audio {url}: {existing_file_id}")
             await query.message.reply_audio(audio=existing_file_id, title=title)
-            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            msg = await query.message.reply_text(t("sent_via_file_id_no_reupload", user_id))
             await processing_msg.delete()
             log_download(query.from_user, "audio_downloaded", url, "success", file_size)
             add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, existing_file_id)
         else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_audio(audio=f, title=title)
+            logger.info(f"Starting audio upload: {filename}, size: {file_size} bytes")
+            new_file_id = await upload_audio(query, filename, title)
             
-            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
             await processing_msg.delete()
             log_download(query.from_user, "audio_downloaded", url, "success", file_size)
             add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
     except Exception as e:
+        import traceback
+        logger.error(f"Audio upload failed: {type(e).__name__}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
         log_download(query.from_user, "audio_downloaded", url, f"upload_failed: {e}", file_size)
         add_history(query.from_user.id, url, "audio", file_size, title, "failed")
@@ -440,13 +445,11 @@ async def _download_spotify(query, url, processing_msg):
         if existing_file_id:
             logger.info(f"Using file_id for {url}: {existing_file_id}")
             await query.message.reply_audio(audio=existing_file_id, caption=caption)
-            msg = await query.message.reply_text("✅ Sent via file ID")
+            msg = await query.message.reply_text(t("sent_via_file_id", user_id))
             await processing_msg.delete()
         else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_audio(audio=f, title=title)
+            new_file_id = await upload_audio(query, filename, title, caption)
             
-            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
             await processing_msg.delete()
             add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
         

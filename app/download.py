@@ -1,18 +1,9 @@
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
+from core.utils import format_bytes
 
 download_executor = ThreadPoolExecutor(max_workers=10)
-
-
-def _format_size(bytes_val):
-    if bytes_val is None:
-        return "?"
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if bytes_val < 1024:
-            return f"{bytes_val:.1f}{unit}"
-        bytes_val /= 1024
-    return f"{bytes_val:.1f}TB"
 
 
 class ProgressTracker:
@@ -50,8 +41,8 @@ def _make_progress_hook(processing_msg):
                 filled = int(bar_length * downloaded / total)
                 bar = "█" * filled + "░" * (bar_length - filled)
                 
-                speed_str = _format_size(speed) + "/s" if speed else ""
-                text = f"⬇️ Downloading...\n{bar} {percent}%\n{_format_size(downloaded)} / {_format_size(total)}"
+                speed_str = format_bytes(speed) + "/s" if speed else ""
+                text = f"⬇️ Downloading...\n{bar} {percent}%\n{format_bytes(downloaded)} / {format_bytes(total)}"
                 if speed_str:
                     text += f" • {speed_str}"
                 

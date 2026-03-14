@@ -59,10 +59,10 @@ async def history_command(update: Update, context: CallbackContext):
     history = get_user_history(user_id, limit=10)
     
     if not history:
-        await update.message.reply_text("No download history.")
+        await update.message.reply_text(t("no_history", user_id))
         return
     
-    msg = "Your download history:\n\n"
+    msg = t("history_title", user_id) + "\n\n"
     for item in history:
         from datetime import datetime
         dt = datetime.fromtimestamp(item["timestamp"])
@@ -82,20 +82,20 @@ async def allow_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /allow <user_id>")
+        await update.message.reply_text(t("usage_allow", user_id))
         return
     
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID. Must be a number.")
+        await update.message.reply_text(t("invalid_user_id", user_id))
         return
     
     users = get_allowed_users()
     users.add(target_id)
     save_allowed_users(users)
     
-    await update.message.reply_text(f"User {target_id} has been allowed.")
+    await update.message.reply_text(t("user_allowed", user_id=user_id, target_id=target_id))
 
 
 async def block_command(update: Update, context: CallbackContext):
@@ -107,20 +107,20 @@ async def block_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /block <user_id>")
+        await update.message.reply_text(t("usage_block", user_id))
         return
     
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID. Must be a number.")
+        await update.message.reply_text(t("invalid_user_id", user_id))
         return
     
     users = get_allowed_users()
     users.discard(target_id)
     save_allowed_users(users)
     
-    await update.message.reply_text(f"User {target_id} has been blocked.")
+    await update.message.reply_text(t("user_blocked", user_id=user_id, target_id=target_id))
 
 
 async def users_command(update: Update, context: CallbackContext):
@@ -134,10 +134,10 @@ async def users_command(update: Update, context: CallbackContext):
     allowed = get_allowed_users()
     
     if not users_info:
-        await update.message.reply_text("No users yet.")
+        await update.message.reply_text(t("no_users", user_id))
         return
     
-    msg = "Allowed users:\n\n"
+    msg = t("allowed_users", user_id) + "\n\n"
     for user in sorted(users_info, key=lambda x: x.get("last_seen", 0), reverse=True):
         if user["id"] in allowed:
             name = get_user_display_name(user["id"])
@@ -154,7 +154,7 @@ async def broadcast_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
+        await update.message.reply_text(t("usage_broadcast", user_id))
         return
     
     message = " ".join(context.args)
@@ -171,7 +171,7 @@ async def broadcast_command(update: Update, context: CallbackContext):
         except Exception:
             failed += 1
     
-    await update.message.reply_text(f"Broadcast sent to {success} users. Failed: {failed}")
+    await update.message.reply_text(t("broadcast_sent", user_id, success=success, failed=failed))
 
 
 async def userhistory_command(update: Update, context: CallbackContext):
@@ -184,7 +184,7 @@ async def userhistory_command(update: Update, context: CallbackContext):
     users = get_allowed_users() - ADMIN_IDS
     
     if not users:
-        await update.message.reply_text("No users to show.")
+        await update.message.reply_text(t("no_users_to_show", user_id))
         return
     
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -195,7 +195,7 @@ async def userhistory_command(update: Update, context: CallbackContext):
         keyboard.append([InlineKeyboardButton(name, callback_data=f"uh_{uid}")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
+    await update.message.reply_text(t("select_user_history", user_id), reply_markup=reply_markup)
 
 
 async def rateinfo_command(update: Update, context: CallbackContext):
@@ -222,16 +222,16 @@ async def setrate_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /setrate <max_per_hour> [on/off]")
+        await update.message.reply_text(t("usage_setrate", user_id=user_id))
         return
     
     try:
         max_per_hour = int(context.args[0])
         if max_per_hour < 1 or max_per_hour > 100:
-            await update.message.reply_text("Value must be between 1-100")
+            await update.message.reply_text(t("value_range", user_id=user_id))
             return
     except ValueError:
-        await update.message.reply_text("Invalid number.")
+        await update.message.reply_text(t("invalid_number", user_id=user_id))
         return
     
     enabled = True
@@ -242,7 +242,7 @@ async def setrate_command(update: Update, context: CallbackContext):
     rate_limiter.reload()
     
     status = "enabled" if enabled else "disabled"
-    await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
+    await update.message.reply_text(t("rate_limit_updated", user_id=user_id, max=max_per_hour, status=status))
 
 
 async def cleanup_command(update: Update, context: CallbackContext):
@@ -253,7 +253,7 @@ async def cleanup_command(update: Update, context: CallbackContext):
         return
     
     cleanup_temp_files()
-    await update.message.reply_text("Temp files cleaned up.")
+    await update.message.reply_text(t("temp_cleaned", user_id=user_id))
 
 
 async def status_command(update: Update, context: CallbackContext):
@@ -361,23 +361,23 @@ async def failed_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /failed [user_id]")
+        await update.message.reply_text(t("usage_failed", user_id=user_id))
         return
     
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
+        await update.message.reply_text(t("invalid_user_id", user_id=user_id))
         return
     
     history = get_user_history(target_id, limit=50)
     failed = [h for h in history if h.get("status") == "failed"]
     
     if not failed:
-        await update.message.reply_text(f"No failed downloads for user {target_id}.")
+        await update.message.reply_text(t("no_failed", user_id=user_id, target_id=target_id))
         return
     
-    msg = f"❌ Failed downloads for user {target_id}:\n\n"
+    msg = t("failed_title", user_id=user_id, target_id=target_id) + "\n\n"
     for item in failed[:20]:
         from datetime import datetime
         dt = datetime.fromtimestamp(item["timestamp"])
@@ -387,12 +387,6 @@ async def failed_command(update: Update, context: CallbackContext):
         msg += f"  {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
     
     await update.message.reply_text(msg)
-
-
-def _format_bytes(bytes_val):
-    """Deprecated: Use core.utils.format_bytes instead."""
-    from core.utils import format_bytes
-    return format_bytes(bytes_val)
 
 
 async def lang_command(update: Update, context: CallbackContext):
@@ -406,16 +400,16 @@ async def lang_command(update: Update, context: CallbackContext):
         for code, name in LANGUAGES.items():
             keyboard.append([InlineKeyboardButton(name, callback_data=f"lang_{code}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(t("select_language", user_id), reply_markup=reply_markup)
+        await update.message.reply_text(t("select_language", user_id=user_id), reply_markup=reply_markup)
         return
     
     lang_code = context.args[0].lower()
     if lang_code not in LANGUAGES:
-        await update.message.reply_text("Invalid language. Use: en, zh, or ja")
+        await update.message.reply_text(t("invalid_language_option", user_id=user_id))
         return
     
     set_user_lang(user_id, lang_code)
-    await update.message.reply_text(t("language_changed", user_id))
+    await update.message.reply_text(t("language_changed", user_id=user_id))
 
 
 async def cookie_command(update: Update, context: CallbackContext):
@@ -446,10 +440,10 @@ async def refresh_command(update: Update, context: CallbackContext):
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /refresh <url>\n\nClears cached file ID so the video will be re-downloaded.")
+        await update.message.reply_text(t("refresh_usage", user_id=user_id))
         return
     
     url = " ".join(context.args)
     from core.history import clear_file_id_by_url
     clear_file_id_by_url(url)
-    await update.message.reply_text(f"✅ Cleared cached file ID for:\n{url}\n\nThe next download will fetch a fresh file.")
+    await update.message.reply_text(t("file_id_cleared", user_id=user_id, url=url))
