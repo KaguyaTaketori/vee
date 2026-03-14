@@ -55,8 +55,8 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
             if row:
                 existing_lang = row[0]
         
-        set_clauses = ["last_seen = ?"]
-        params = [now]
+        set_clauses = []
+        params = []
         
         if username is not None:
             set_clauses.append("username = ?")
@@ -67,6 +67,9 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
         if last_name is not None:
             set_clauses.append("last_name = ?")
             params.append(last_name)
+        
+        set_clauses.append("last_seen = ?")
+        params.append(now)
         
         if existing_lang is not None:
             set_clauses.append("lang = ?")
@@ -81,7 +84,7 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
             ON CONFLICT(user_id) DO UPDATE SET
                 {', '.join(set_clauses)}
             """,
-            (user_id, username, first_name, last_name, "en", now, now) + tuple(params)
+            (user_id, username, first_name, last_name, existing_lang or "en", now, now) + tuple(params)
         )
         await db.commit()
 

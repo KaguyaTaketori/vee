@@ -68,7 +68,7 @@ async def handle_link(update: Update, context: CallbackContext):
         await update.message.reply_text(t("not_authorized", user_id))
         return
     
-    allowed, reason = rate_limiter.check_limit(user_id)
+    allowed, reason = await rate_limiter.check_limit(user_id)
     if not allowed:
         await update.message.reply_text(t("rate_limit_exceeded", user_id))
         return

@@ -38,7 +38,7 @@ class RateLimiter:
         self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
         self.enabled = config.get("enabled", True)
 
-    async def check_limit_async(self, user_id: int) -> tuple[bool, Optional[str]]:
+    async def check_limit(self, user_id: int) -> tuple[bool, Optional[str]]:
         if not self.enabled:
             return True, None
             
@@ -78,17 +78,7 @@ class RateLimiter:
             
             return True, None
 
-    def check_limit(self, user_id: int) -> tuple[bool, Optional[str]]:
-        if not self.enabled:
-            return True, None
-            
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.run_until_complete(self.check_limit_async(user_id))
-        except RuntimeError:
-            return asyncio.run(self.check_limit_async(user_id))
-
-    async def get_remaining_async(self, user_id: int) -> int:
+    async def get_remaining(self, user_id: int) -> int:
         if not self.enabled:
             return 999
         now = time.time()
@@ -104,31 +94,10 @@ class RateLimiter:
         
         return max(0, self.max_downloads_per_hour - count)
 
-    def get_remaining(self, user_id: int) -> int:
-        if not self.enabled:
-            return 999
-        now = time.time()
-        window = 3600
-        
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.run_until_complete(self.get_remaining_async(user_id))
-        except RuntimeError:
-            return asyncio.run(self.get_remaining_async(user_id))
-
-    async def reset_async(self, user_id: int):
+    async def reset(self, user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM rate_limit WHERE user_id = ?", (user_id,))
             await db.commit()
-
-    def reset(self, user_id: int):
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.run_until_complete(self.reset_async(user_id))
-        except RuntimeError:
-            return asyncio.run(self.reset_async(user_id))
 
     def get_status(self) -> dict:
         return {
