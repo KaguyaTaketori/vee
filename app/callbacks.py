@@ -163,8 +163,8 @@ async def handle_callback(update: Update, context: CallbackContext):
     if not url:
         try:
             await query.edit_message_text(t("session_expired", user_id))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to edit message: {e}")
         return
 
     if query.data == "download_video":
@@ -193,8 +193,8 @@ async def show_quality_options(query, url):
     user_id = query.from_user.id
     try:
         await query.edit_message_text(t("loading_quality", user_id))
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Error editing message: {e}")
     
     formats, info = await get_formats(url)
     logger.error(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")

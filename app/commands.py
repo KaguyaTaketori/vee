@@ -1,13 +1,18 @@
 import os
 import psutil
+import logging
 from telegram import Update
 from telegram.ext import CallbackContext
+from functools import wraps
 
 from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, get_config, cleanup_temp_files, TEMP_DIR, BOT_FILE_PREFIX
 from core.logger import log_user, get_user_stats
 from core.history import get_user_history, get_all_users_count, get_total_downloads, get_failed_downloads
 from core.ratelimit import rate_limiter, save_rate_limit
 from core.i18n import t, set_user_lang, LANGUAGES
+from core.utils import require_admin, check_admin, scan_temp_files, format_bytes
+
+logger = logging.getLogger(__name__)
 
 
 async def start_command(update: Update, context: CallbackContext):
@@ -38,12 +43,9 @@ async def help_command(update: Update, context: CallbackContext):
         await update.message.reply_text(t("available_commands", user_id))
 
 
+@require_admin
 async def stats_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    from core.utils import check_admin
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
         return
     stats = get_user_stats()
     users_count = get_all_users_count()
@@ -73,12 +75,9 @@ async def history_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@require_admin
 async def allow_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    from core.utils import check_admin
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
         return
     
     if not context.args:
@@ -98,12 +97,9 @@ async def allow_command(update: Update, context: CallbackContext):
     await update.message.reply_text(f"User {target_id} has been allowed.")
 
 
+@require_admin
 async def block_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    from core.utils import check_admin
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
         return
     
     if not context.args:
@@ -123,11 +119,9 @@ async def block_command(update: Update, context: CallbackContext):
     await update.message.reply_text(f"User {target_id} has been blocked.")
 
 
+@require_admin
 async def users_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     users_info = get_all_users_info()
@@ -146,11 +140,9 @@ async def users_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+@require_admin
 async def broadcast_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     if not context.args:
@@ -168,17 +160,16 @@ async def broadcast_command(update: Update, context: CallbackContext):
         try:
             await bot.send_message(chat_id=uid, text=message)
             success += 1
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to send broadcast to {uid}: {e}")
             failed += 1
     
     await update.message.reply_text(f"Broadcast sent to {success} users. Failed: {failed}")
 
 
+@require_admin
 async def userhistory_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     users = get_allowed_users() - ADMIN_IDS
@@ -198,11 +189,9 @@ async def userhistory_command(update: Update, context: CallbackContext):
     await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
 
 
+@require_admin
 async def rateinfo_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     status = rate_limiter.get_status()
@@ -214,11 +203,9 @@ async def rateinfo_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@require_admin
 async def setrate_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     if not context.args:
@@ -245,26 +232,19 @@ async def setrate_command(update: Update, context: CallbackContext):
     await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
 
 
+@require_admin
 async def cleanup_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     cleanup_temp_files()
     await update.message.reply_text("Temp files cleaned up.")
 
 
+@require_admin
 async def status_command(update: Update, context: CallbackContext):
     if not update.message:
         return
-    from core.utils import check_admin, scan_temp_files
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
-        return
-    
-    import psutil
     
     config = get_config()
     rate_status = rate_limiter.get_status()
@@ -286,11 +266,9 @@ async def status_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@require_admin
 async def queue_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     from core.queue import download_queue
@@ -316,12 +294,9 @@ async def queue_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@require_admin
 async def storage_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    from core.utils import check_admin, scan_temp_files, format_bytes
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
         return
     
     config = get_config()
@@ -353,11 +328,9 @@ async def storage_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@require_admin
 async def failed_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     if not context.args:
@@ -418,11 +391,9 @@ async def lang_command(update: Update, context: CallbackContext):
     await update.message.reply_text(t("language_changed", user_id))
 
 
+@require_admin
 async def cookie_command(update: Update, context: CallbackContext):
     if not update.message:
-        return
-    user_id = update.message.from_user.id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
         return
     
     await update.message.reply_text(
@@ -436,13 +407,10 @@ async def cookie_command(update: Update, context: CallbackContext):
     )
 
 
+@require_admin
 async def refresh_command(update: Update, context: CallbackContext):
     """Force re-download by clearing cached file_id for a URL."""
     if not update.message:
-        return
-    from core.utils import check_admin
-    user_id = update.message.from_user.id
-    if not check_admin(user_id):
         return
     
     if not context.args:
