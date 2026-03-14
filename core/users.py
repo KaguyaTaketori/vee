@@ -1,73 +1,22 @@
 import os
-import json
 import time
-import fcntl
-import threading
+from core.storage import JsonStore
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 USERS_FILE = os.path.join(BASE_DIR, "users_db.json")
 LOCK_FILE = os.path.join(BASE_DIR, "users_db.lock")
 
-_cache = {"data": {}, "dirty": False, "time": 0}
-_cache_lock = threading.Lock()
-_persist_interval = 30
-_last_persist = 0
-
-
-def _load_users_unsafe() -> dict:
-    if not os.path.exists(USERS_FILE):
-        return {}
-    try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _load_users() -> dict:
-    global _cache, _last_persist
-    with _cache_lock:
-        now = time.time()
-        if _cache["data"] is None or now - _cache["time"] > 5:
-            _cache["data"] = _load_users_unsafe()
-            _cache["time"] = now
-        return _cache["data"].copy()
-
-
-def _save_users_unsafe(users: dict):
-    with open(LOCK_FILE, "w") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            with open(USERS_FILE, "w") as f:
-                json.dump(users, f, indent=2)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _persist_users():
-    global _cache, _last_persist
-    with _cache_lock:
-        if _cache["dirty"]:
-            _save_users_unsafe(_cache["data"])
-            _cache["dirty"] = False
-            _last_persist = time.time()
-
-
-def _schedule_persist():
-    global _cache
-    with _cache_lock:
-        _cache["dirty"] = True
+_users_store = JsonStore(USERS_FILE, LOCK_FILE, cache_ttl=5.0)
 
 
 def get_user_info(user_id: int) -> dict:
-    users = _load_users()
+    users = _users_store.load()
     return users.get(str(user_id), {}).copy()
 
 
 def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    global _cache
-    users = _load_users()
+    users = _users_store.load()
     str_id = str(user_id)
     
     if str_id not in users:
@@ -82,14 +31,11 @@ def update_user(user_id: int, username: str = None, first_name: str = None, last
     
     users[str_id]["last_seen"] = time.time()
     
-    with _cache_lock:
-        _cache["data"] = users
-        _cache["dirty"] = True
-        _cache["time"] = time.time()
+    _users_store.mark_dirty(users)
 
 
 def get_all_users() -> list:
-    users = _load_users()
+    users = _users_store.load()
     return [
         {
             "id": int(uid),
@@ -117,4 +63,4 @@ def format_user_display(user: dict) -> str:
 
 
 def force_persist():
-    _persist_users()
+    _users_store.force_persist()
