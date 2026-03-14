@@ -8,7 +8,8 @@ A powerful Telegram bot for downloading videos, audio, and thumbnails from multi
 - **Multiple Download Types**: Videos (up to 2GB), Audio (MP3), Thumbnails
 - **High-Speed Downloads**: aria2 multi-connection support for faster downloads
 - **User Management**: Allow/block system with rate limiting
-- **Multi-language**: English, Chinese, Japanese support
+- **Download History**: SQLite-based history with recent downloads
+- **Multi-language**: English, Chinese, Japanese, Korean support
 - **Caching**: Automatic file ID caching to avoid re-uploading
 - **Cookie Management**: Auto-refresh cookies for authenticated downloads
 
@@ -76,6 +77,8 @@ Edit `.env` file:
 - `/storage` - Disk usage
 - `/status` - Bot system status
 - `/setrate <max>` - Set rate limit
+- `/failed` - View failed downloads
+- `/clear` - Clear cache or history
 
 ## Architecture
 
@@ -86,13 +89,15 @@ vee/
 │   ├── callbacks.py  # Callback handlers
 │   └── download.py  # Download utilities
 ├── core/             # Core functionality
-│   ├── downloader.py    # Download logic
-│   ├── strategies.py     # Download strategies
-│   ├── services.py      # Service abstraction
-│   ├── file_handler.py  # File operations
-│   ├── history.py       # Download history
+│   ├── downloader.py    # Download logic with yt-dlp
+│   ├── strategies.py     # Download strategy pattern
+│   ├── facades.py       # Service facades
+│   ├── history.py       # Download history (SQLite)
+│   ├── users.py         # User management
 │   ├── ratelimit.py     # Rate limiting
+│   ├── logger.py        # Logging system
 │   └── i18n.py         # Internationalization
+├── locales/          # Translation files
 ├── config.py         # Configuration
 └── vee.py           # Main entry point
 ```
