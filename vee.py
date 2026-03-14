@@ -1,48 +1,101 @@
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
 from telegram.request import HTTPXRequest
 
 from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS, persist_all_data
+from app.commands import (
+    start_command, help_command, stats_command, history_command, myid_command,
+    allow_command, block_command, users_command, broadcast_command,
+    userhistory_command, rateinfo_command, setrate_command,
+    cleanup_command, status_command, queue_command, storage_command, failed_command,
+    lang_command, cookie_command, refresh_command
+)
+from app.callbacks import handle_link, handle_callback
 
-LOG_DIR = "/home/ubuntu/vee"
-LOG_FILE = os.path.join(LOG_DIR, "bot.log")
-LOG_MAX_BYTES = 10 * 1024 * 1024
-LOG_BACKUP_COUNT = 5
 
-def setup_logging():
-    os.makedirs(LOG_DIR, exist_ok=True)
+async def set_bot_commands(app: Application):
+    bot = app.bot
     
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    user_commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show available commands"),
+        BotCommand("history", "View your download history"),
+        BotCommand("myid", "Get your user ID"),
+        BotCommand("lang", "Change language"),
+    ]
     
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    admin_commands = [
+        BotCommand("stats", "Show bot statistics"),
+        BotCommand("allow", "Allow a user (admin)"),
+        BotCommand("block", "Block a user (admin)"),
+        BotCommand("users", "List allowed users"),
+        BotCommand("broadcast", "Broadcast message"),
+        BotCommand("userhistory", "View user history"),
+        BotCommand("rateinfo", "Show rate limit info"),
+        BotCommand("setrate", "Set rate limit"),
+        BotCommand("cleanup", "Clean temp files"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("queue", "Show download queue"),
+        BotCommand("storage", "Show storage info"),
+        BotCommand("failed", "Show failed downloads"),
+        BotCommand("cookie", "Update cookies"),
+        BotCommand("refresh", "Clear cached file"),
+    ]
     
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-    
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    await bot.set_my_commands(user_commands)
+    if ADMIN_IDS:
+        await bot.set_my_commands(user_commands + admin_commands, scope={"type": "chat", "chat_id": list(ADMIN_IDS)[0]})
 
+
+class CookieFilter(filters.BaseFilter):
+    def filter(self, message):
+        if not message.document:
+            return False
+        if not ADMIN_IDS:
+            return False
+        return message.from_user.id in ADMIN_IDS
+
+
+async def handle_cookie_file(update: Update, context: CallbackContext):
+    from config import COOKIE_FILE, COOKIES_DIR
+    document = update.message.document
+    if not document:
+        return
+    
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("Please send a .txt file (cookies.txt)")
+        return
+    
+    import re
+    filename = document.file_name
+    match = re.match(r'([^_]+)_cookies\.txt', filename)
+    
+    if match:
+        site_domain = match.group(1)
+        site_cookie_file = os.path.join(COOKIES_DIR, f"{site_domain}_cookies.txt")
+        try:
+            file = await document.get_file()
+            await file.download_to_drive(custom_path=site_cookie_file)
+            await update.message.reply_text(f"Cookies saved for {site_domain}!")
+        except Exception as e:
+            await update.message.reply_text(f"Error saving cookie file: {e}")
+    else:
+        if COOKIE_FILE:
+            try:
+                file = await document.get_file()
+                await file.download_to_drive(custom_path=COOKIE_FILE)
+                await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
+            except Exception as e:
+                await update.message.reply_text(f"Error saving cookie file: {e}")
+        else:
+            await update.message.reply_text("Invalid filename. Use format: domain_cookies.txt (e.g., www.youtube.com_cookies.txt)")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 
@@ -79,14 +132,11 @@ async def storage_alert_job(context):
 
 
 def main():
-    setup_logging()
-    
     request = HTTPXRequest(
-        write_timeout=1200,
-        connect_timeout=60,
-        read_timeout=1200,
-        pool_timeout=120,
-        connection_pool_size=10
+        write_timeout=600,
+        connect_timeout=30,
+        read_timeout=600,
+        pool_timeout=30
     )
     
     if LOCAL_MODE:
