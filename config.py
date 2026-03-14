@@ -81,32 +81,31 @@ def save_allowed_users(users):
     _allowed_users_cache = {"data": None, "time": 0}
 
 
-def get_all_users_info():
+async def get_all_users_info():
     global _users_db_cache
+    import time
     now = time.time()
     if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
         return _users_db_cache["data"]
     
-    try:
-        loop = asyncio.get_running_loop()
-        data = loop.run_until_complete(_get_all_users())
-    except RuntimeError:
-        data = asyncio.run(_get_all_users())
+    data = await _get_all_users()
     _users_db_cache = {"data": data, "time": now}
     return data
 
 
 def get_user_display_name(user_id: int) -> str:
+    import sqlite3
+    from core.db import DB_PATH
     try:
-        loop = asyncio.get_running_loop()
-        info = loop.run_until_complete(_get_user_info(user_id))
-    except RuntimeError:
-        info = asyncio.run(_get_user_info(user_id))
-    if info:
-        if info.get("username"):
-            return f"@{info['username']}"
-        if info.get("first_name"):
-            return info["first_name"]
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT username, first_name FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                if row[0]: return f"@{row[0]}"
+                if row[1]: return row[1]
+    except Exception:
+        pass
     return str(user_id)
 
 

@@ -124,7 +124,7 @@ async def users_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     
-    users_info = get_all_users_info()
+    users_info = await get_all_users_info()
     allowed = get_allowed_users()
     
     if not users_info:

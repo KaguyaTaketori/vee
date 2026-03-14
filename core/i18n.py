@@ -1,8 +1,9 @@
 import os
 import json
+import sqlite3
 from typing import Optional
 
-from core import users
+from core.db import DB_PATH
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,15 +42,20 @@ def _load_translations(lang: str) -> dict:
 
 
 def get_user_lang(user_id: int) -> str:
-    import asyncio
     try:
-        loop = asyncio.get_running_loop()
-        return loop.run_until_complete(users.get_user_lang(user_id))
-    except RuntimeError:
-        return asyncio.run(users.get_user_lang(user_id))
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception:
+        pass
+    return "en"
 
 
 async def set_user_lang(user_id: int, lang: str):
+    from core import users
     await users.set_user_lang(user_id, lang)
 
 
