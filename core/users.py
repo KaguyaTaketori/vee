@@ -75,8 +75,6 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
             set_clauses.append("lang = ?")
             params.append(existing_lang)
         
-        params.append(user_id)
-        
         await db.execute(
             f"""
             INSERT INTO users (user_id, username, first_name, last_name, lang, added_at, last_seen)
