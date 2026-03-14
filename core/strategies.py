@@ -48,16 +48,16 @@ class DownloadStrategy(ABC):
                     return file_path
         return None
     
-    def _get_file_id_or_upload(self, query, url: str, filename: str, caption: str | None, user_id: int):
+    async def _get_file_id_or_upload(self, query, url: str, filename: str, caption: str | None, user_id: int):
         """Get existing file_id or upload new file. Template method."""
         existing_id = get_file_id_by_url(url)
         
         if existing_id:
             logger.info(f"Using file_id for {url}: {existing_id}")
-            self._send_from_file_id(query, existing_id, caption)
+            await self._send_from_file_id(query, existing_id, caption)
             return existing_id
         
-        return self._upload_new_file(query, filename, caption, url, user_id)
+        return await self._upload_new_file(query, filename, caption, url, user_id)
     
     def _send_from_file_id(self, query, file_id: str, caption: str | None):
         """Override in subclass for type-specific sending."""
@@ -88,6 +88,7 @@ class DownloadStrategy(ABC):
     async def execute(self, query, url: str, processing_msg, context: CallbackContext):
         """Main execution template - orchestrates the download flow."""
         user_id = query.from_user.id
+        from core.i18n import t
         
         cached_file = self._check_cached_file(url, context, user_id)
         
@@ -96,38 +97,53 @@ class DownloadStrategy(ABC):
             title = os.path.splitext(os.path.basename(filename))[0]
             info = {"title": title}
         else:
-            processing_msg.edit_text("Downloading...")
-            progress_hook = _make_progress_hook(processing_msg)
-            filename, info = await self._do_download(url, progress_hook)
+            try:
+                await processing_msg.edit_text(t("downloading", user_id))
+                progress_hook = _make_progress_hook(processing_msg)
+                filename, info = await self._do_download(url, progress_hook)
+            except Exception as e:
+                logger.error(f"Download failed: {type(e).__name__}: {e}")
+                await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+                log_download(query.from_user, f"{self.download_type}_downloaded", url, f"download_failed: {e}")
+                add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
+                return
             
             if not os.path.exists(filename):
-                from core.i18n import t
-                processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+                await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+                log_download(query.from_user, f"{self.download_type}_downloaded", url, "download_failed: File not found")
+                add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
                 return
         
         if not self._validate_file_size(filename, processing_msg, user_id):
             return
         
-        title = info.get("title")
-        caption = self._get_caption(title)
+        title = info.get("title") if info else None
+        caption = self._get_caption(title) if title else None
         
-        processing_msg.edit_text("Uploading...")
+        await processing_msg.edit_text(t("uploading", user_id))
         
         try:
-            file_id = self._get_file_id_or_upload(query, url, filename, caption, user_id)
-            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", os.path.getsize(filename))
-            add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename), title, "success", filename, file_id)
+            file_size = os.path.getsize(filename)
+            logger.info(f"Starting upload: {self.download_type} - file: {filename}, size: {file_size} bytes")
+            
+            file_id = await self._get_file_id_or_upload(query, url, filename, caption, user_id)
+            
+            logger.info(f"Upload completed successfully: file_id={file_id}")
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", file_size)
+            add_history(query.from_user.id, url, self.download_type, file_size, title, "success", filename, file_id)
         except Exception as e:
-            from core.i18n import t
-            processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+            import traceback
+            logger.error(f"Upload failed: {type(e).__name__}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
             log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
             add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename) if os.path.exists(filename) else 0, title, "failed")
         
         self._cleanup_temp_file(filename, cached_file)
     
     @abstractmethod
-    async def _do_download(self, url: str, progress_hook):
-        """Implement actual download logic in subclass."""
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+        """Implement actual download logic in subclass. Returns (filename, info_dict)."""
         pass
 
 
@@ -140,13 +156,16 @@ class VideoStrategy(DownloadStrategy):
     def telegram_method(self) -> str:
         return "video"
     
-    def _send_from_file_id(self, query, file_id: str, caption: str | None):
-        query.message.reply_video(video=file_id, caption=caption)
-        query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_video(video=file_id, caption=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
     
-    def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        logger.info(f"Opening file for upload: {filename}")
         with open(filename, "rb") as f:
-            sent_msg = query.message.reply_video(video=f, caption=caption)
+            logger.info(f"Sending video to Telegram...")
+            sent_msg = await query.message.reply_video(video=f, caption=caption)
+        logger.info(f"Video upload response received")
         return sent_msg.video.file_id if sent_msg.video else None
     
     async def _do_download(self, url: str, progress_hook):
@@ -167,14 +186,17 @@ class AudioStrategy(DownloadStrategy):
     def _get_caption(self, title: str, emoji: str = "🎵") -> str | None:
         return f"{emoji} {title}" if title else None
     
-    def _send_from_file_id(self, query, file_id: str, caption: str | None):
-        query.message.reply_audio(audio=file_id, title=caption)
-        query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_audio(audio=file_id, title=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
     
-    def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
         title = os.path.splitext(os.path.basename(filename))[0]
+        logger.info(f"Opening file for upload: {filename}")
         with open(filename, "rb") as f:
-            sent_msg = query.message.reply_audio(audio=f, title=title)
+            logger.info(f"Sending audio to Telegram...")
+            sent_msg = await query.message.reply_audio(audio=f, title=title)
+        logger.info(f"Audio upload response received")
         return sent_msg.audio.file_id if sent_msg.audio else None
     
     async def _do_download(self, url: str, progress_hook):
@@ -201,12 +223,12 @@ class ThumbnailStrategy(DownloadStrategy):
     def telegram_method(self) -> str:
         return "photo"
     
-    def _send_from_file_id(self, query, file_id: str, caption: str | None):
-        query.message.reply_photo(photo=file_id, caption=caption)
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_photo(photo=file_id, caption=caption)
     
-    def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
         with open(filename, "rb") as f:
-            sent_msg = query.message.reply_photo(photo=f, caption=caption)
+            sent_msg = await query.message.reply_photo(photo=f, caption=caption)
         return sent_msg.photo[-1].file_id if sent_msg.photo else None
     
     async def _do_download(self, url: str, progress_hook):
