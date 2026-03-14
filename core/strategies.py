@@ -34,7 +34,7 @@ class DownloadStrategy(ABC):
         """Build caption from title."""
         return f"{emoji} {title}" if title else None
     
-    def _check_cached_file(self, url: str, context: CallbackContext, user_id: int) -> str | None:
+    async def _check_cached_file(self, url: str, context: CallbackContext, user_id: int) -> str | None:
         """Check for cached file from recent downloads."""
         from core.history import check_recent_download
         
@@ -90,7 +90,7 @@ class DownloadStrategy(ABC):
         user_id = query.from_user.id
         from core.i18n import t
         
-        cached_file = self._check_cached_file(url, context, user_id)
+        cached_file = await self._check_cached_file(url, context, user_id)
         
         if cached_file and os.path.exists(cached_file):
             filename = cached_file
