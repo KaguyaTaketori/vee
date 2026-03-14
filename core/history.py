@@ -34,8 +34,9 @@ async def add_history(user_id: int, url: str, download_type: str, file_size: Opt
             (user_id, user_id, MAX_ENTRIES_PER_USER)
         )
         
-        total_count = await db.execute_fetchone("SELECT COUNT(*) FROM history")
-        total = total_count[0] if total_count else 0
+        async with db.execute("SELECT COUNT(*) FROM history") as cursor:
+            row = await cursor.fetchone()
+            total = row[0] if row else 0
         
         if total > MAX_TOTAL_ENTRIES:
             delete_count = total - MAX_TOTAL_ENTRIES

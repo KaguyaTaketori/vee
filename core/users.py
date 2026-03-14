@@ -106,8 +106,8 @@ def format_user_display(user: dict) -> str:
     if user.get("last_name"):
         parts.append(user["last_name"])
     
-    name = " ".join(parts) if parts else f"User {user['id']}"
-    return f"{name} (`{user['id']}`)"
+    name = " ".join(parts) if parts else f"User {user['user_id']}"
+    return f"{name} (`{user['user_id']}`)"
 
 
 async def force_persist():

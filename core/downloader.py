@@ -198,16 +198,20 @@ def _use_intl_api(url):
     return url
 
 
-@lru_cache(maxsize=32)
-def _cached_get_formats(url: str):
-    """Cached version of format extraction - useful when same URL is queried multiple times."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        result = loop.run_until_complete(get_formats(url))
-        return result
-    finally:
-        loop.close()
+_FORMATS_CACHE = {}
+
+async def get_formats_cached(url):
+    """Get formats with caching for improved performance."""
+    if url in _FORMATS_CACHE:
+        return _FORMATS_CACHE[url]
+    
+    res = await get_formats(url)
+    _FORMATS_CACHE[url] = res
+    
+    if len(_FORMATS_CACHE) > 100:
+        _FORMATS_CACHE.clear()
+        
+    return res
 
 
 async def get_formats_cached(url):
@@ -229,7 +233,7 @@ async def get_formats(url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             formats = info.get("formats") or []
-            logger.error(f"URL: {url}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
+            logger.info(f"URL: {url}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
             return formats, info
     return await loop.run_in_executor(None, _get)
 
@@ -448,7 +452,7 @@ async def download_video_aria2(url, format_id, progress_hook=None):
                 if target_format:
                     acodec = target_format.get("acodec")
                     has_audio = acodec not in (None, "none") if acodec else False
-                    logger.error(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
+                    logger.info(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
                     if has_audio:
                         ydl_opts["format"] = format_id
                     else:

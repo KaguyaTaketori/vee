@@ -153,7 +153,7 @@ async def handle_callback(update: Update, context: CallbackContext):
             size = ""
             if item.get("file_size"):
                 size = f" ({item['file_size'] // (1024*1024)}MB)"
-            msg += f"{status} {item['type']}{size}\n"
+            msg += f"{status} {item['download_type']}{size}\n"
             msg += f"   {item.get('title', 'N/A')[:40]}\n"
             msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
         await query.edit_message_text(msg)
@@ -197,7 +197,7 @@ async def show_quality_options(query, url):
         logger.debug(f"Error editing message: {e}")
     
     formats, info = await get_formats(url)
-    logger.error(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")
+    logger.info(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")
 
     resolutions = {}
     for f in formats:

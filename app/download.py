@@ -21,6 +21,7 @@ class ProgressTracker:
         self.last_text = None
         self.last_update = 0
         self.loop = asyncio.get_event_loop()
+        self.max_total = 0
     
     def update(self, text):
         now = time.time()
@@ -28,9 +29,9 @@ class ProgressTracker:
             self.last_text = text
             self.last_update = now
             try:
-                self.loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self.msg.edit_text(text)
+                asyncio.run_coroutine_threadsafe(
+                    self.msg.edit_text(text), 
+                    self.loop
                 )
             except Exception:
                 pass
@@ -43,11 +44,17 @@ def _make_progress_hook(processing_msg):
             total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
             downloaded = d.get('downloaded_bytes', 0)
             speed = d.get('speed', 0)
+
+            if total > tracker.max_total:
+                tracker.max_total = total
+
+            display_total = tracker.max_total
             
             if total > 0:
-                percent = int(downloaded * 100 / total)
+                percent = min(100, int(downloaded * 100 / display_total))
                 bar_length = 10
-                filled = int(bar_length * downloaded / total)
+                filled = int(bar_length * downloaded / display_total)
+                filled = max(0, min(bar_length, filled))
                 bar = "█" * filled + "░" * (bar_length - filled)
                 
                 speed_str = _format_size(speed) + "/s" if speed else ""

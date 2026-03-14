@@ -89,6 +89,18 @@ class DownloadStrategy(ABC):
         """Main execution template - orchestrates the download flow."""
         user_id = query.from_user.id
         from core.i18n import t
+
+        existing_id = await get_file_id_by_url(url)
+        if existing_id:
+            logger.info(f"Using existing file_id for {url}: {existing_id}")
+            try:
+                await self._send_from_file_id(query, existing_id, caption=None)
+                log_download(query.from_user, f"{self.download_type}_cached_sent", url, "success")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to send via file_id (maybe expired): {e}. Proceeding to download.")
+                from core.history import clear_file_id_by_url
+                await clear_file_id_by_url(url)
         
         cached_file = await self._check_cached_file(url, context, user_id)
         

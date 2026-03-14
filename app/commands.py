@@ -69,7 +69,7 @@ async def history_command(update: Update, context: CallbackContext):
         from datetime import datetime
         dt = datetime.fromtimestamp(item["timestamp"])
         status = "✅" if item.get("status") == "success" else "❌"
-        msg += f"{status} {item['type']} - {item.get('title', 'Unknown')[:30]}...\n"
+        msg += f"{status} {item['download_type']} - {item.get('title', 'Unknown')[:30]}...\n"
         msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
     
     await update.message.reply_text(msg)
@@ -124,18 +124,27 @@ async def users_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     
-    users_info = await get_all_users_info()
     allowed = get_allowed_users()
+    users_info = await get_all_users_info()
     
-    if not users_info:
-        await update.message.reply_text("No users yet.")
+    if not allowed:
+        await update.message.reply_text("No allowed users in the list.")
         return
     
-    msg = "Allowed users:\n\n"
-    for user in sorted(users_info, key=lambda x: x.get("last_seen", 0), reverse=True):
-        if user["id"] in allowed:
-            name = get_user_display_name(user["id"])
-            msg += f"• {name}\n"
+    last_seen_map = {}
+    if users_info:
+        last_seen_map = {u.get("user_id"): u.get("last_seen", 0) for u in users_info}
+    
+    msg = "✅ Allowed users:\n\n"
+    
+    for uid in sorted(allowed, key=lambda x: last_seen_map.get(x, 0), reverse=True):
+        name = get_user_display_name(uid)
+        
+        if name == str(uid):
+            msg += f"• `{uid}` *(Never used bot)*\n"
+        else:
+            safe_name = name.replace('_', '\\_')
+            msg += f"• {safe_name} (`{uid}`)\n"
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -354,7 +363,7 @@ async def failed_command(update: Update, context: CallbackContext):
     for item in failed[:20]:
         from datetime import datetime
         dt = datetime.fromtimestamp(item["timestamp"])
-        msg += f"• {item['type']} - {item.get('title', 'N/A')[:30]}\n"
+        msg += f"• {item['download_type']} - {item.get('title', 'N/A')[:30]}\n"
         if item.get("error"):
             msg += f"  Error: {item['error'][:50]}\n"
         msg += f"  {dt.strftime('%Y-%m-%d %H:%M')}\n\n"

@@ -77,7 +77,7 @@ class DownloadFacade:
             logger.warning(f"Unauthorized user {user_id} attempted to download {url}")
             return False, "unauthorized"
         
-        can_download, rate_limit_msg = rate_limiter.check_limit(user_id)
+        can_download, rate_limit_msg = await rate_limiter.check_limit(user_id)
         if not can_download:
             logger.warning(f"User {user_id} blocked by rate limit: {rate_limit_msg}")
             return False, "rate_limit_exceeded"

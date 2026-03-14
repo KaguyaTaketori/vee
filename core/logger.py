@@ -1,8 +1,43 @@
+import logging
 import os
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_FILE = os.path.join(BASE_DIR, "bot_users.log")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, "bot_users.log")
+
+def setup_logging():
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(console_handler)
+    
+    file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "app.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3
+    )
+    file_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(file_handler)
+    
+    audit_logger = logging.getLogger("audit")
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
+    
+    audit_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5
+    )
+    audit_handler.setFormatter(logging.Formatter(log_format))
+    audit_logger.addHandler(audit_handler)
 
 def log_user(user, action, extra=None):
     if not user:
@@ -13,10 +48,9 @@ def log_user(user, action, extra=None):
     name = f"{user.first_name} {user.last_name or ''}".strip()
     
     extra_info = f" | {extra}" if extra else ""
-    entry = f"{datetime.now()} | ID: {user_id} | @{username} | {name} | {action}{extra_info}\n"
+    entry = f"{datetime.now()} | ID: {user_id} | @{username} | {name} | {action}{extra_info}"
     
-    with open(LOG_FILE, "a") as f:
-        f.write(entry)
+    logging.getLogger("audit").info(entry)
 
 
 def log_download(user, action, url, status, file_size=None, format_id=None):
