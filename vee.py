@@ -4,7 +4,7 @@ from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
 from telegram.request import HTTPXRequest
 
-from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS, persist_all_data
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS
 from app.commands import (
     start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
@@ -15,6 +15,8 @@ from app.commands import (
 from app.callbacks import handle_link, handle_callback
 from core.queue import download_queue
 from core.facades import _execute_download_task
+from core.logger import setup_logging
+from core.db import init_db
 
 
 async def set_bot_commands(app: Application):
@@ -94,10 +96,6 @@ async def handle_cookie_file(update: Update, context: CallbackContext):
         else:
             await update.message.reply_text("Invalid filename. Use format: domain_cookies.txt (e.g., www.youtube.com_cookies.txt)")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
 logger = logging.getLogger(__name__)
 
 
@@ -108,10 +106,6 @@ class AdminFilter(filters.BaseFilter):
 
 async def cleanup_job(context):
     cleanup_temp_files(max_age_hours=24)
-
-
-async def persist_job(context):
-    persist_all_data()
 
 
 async def storage_alert_job(context):
@@ -134,6 +128,8 @@ async def storage_alert_job(context):
 
 
 def main():
+    setup_logging()
+    
     request = HTTPXRequest(
         write_timeout=600,
         connect_timeout=30,
@@ -187,13 +183,12 @@ def main():
 
     if CLEANUP_INTERVAL_HOURS > 0:
         app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60)
-
-    app.job_queue.run_repeating(persist_job, interval=60, first=30)
     
     if ADMIN_IDS:
         app.job_queue.run_repeating(storage_alert_job, interval=3600, first=300)
 
     async def post_init_callback(app: Application):
+        await init_db()
         download_queue.set_executor(_execute_download_task)
         await download_queue.start()
         await set_bot_commands(app)
@@ -202,7 +197,6 @@ def main():
     
     async def post_shutdown(context):
         await download_queue.stop()
-        persist_all_data()
 
     app.post_shutdown = post_shutdown
     

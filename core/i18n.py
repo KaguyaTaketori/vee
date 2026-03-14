@@ -40,8 +40,13 @@ def _load_translations(lang: str) -> dict:
     return {}
 
 
-async def get_user_lang(user_id: int) -> str:
-    return await users.get_user_lang(user_id)
+def get_user_lang(user_id: int) -> str:
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        return loop.run_until_complete(users.get_user_lang(user_id))
+    except RuntimeError:
+        return asyncio.run(users.get_user_lang(user_id))
 
 
 async def set_user_lang(user_id: int, lang: str):
