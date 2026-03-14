@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 import aiosqlite
 from dataclasses import dataclass
@@ -81,10 +82,6 @@ class RateLimiter:
         if not self.enabled:
             return True, None
             
-        now = time.time()
-        window = 3600
-        
-        import asyncio
         try:
             loop = asyncio.get_running_loop()
             return loop.run_until_complete(self.check_limit_async(user_id))

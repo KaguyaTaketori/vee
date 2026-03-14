@@ -55,24 +55,21 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
             if row:
                 existing_lang = row[0]
         
-        update_parts = []
-        params = []
+        set_clauses = ["last_seen = ?"]
+        params = [now]
         
         if username is not None:
-            update_parts.append("username = ?")
+            set_clauses.append("username = ?")
             params.append(username)
         if first_name is not None:
-            update_parts.append("first_name = ?")
+            set_clauses.append("first_name = ?")
             params.append(first_name)
         if last_name is not None:
-            update_parts.append("last_name = ?")
+            set_clauses.append("last_name = ?")
             params.append(last_name)
         
-        update_parts.append("last_seen = ?")
-        params.append(now)
-        
         if existing_lang is not None:
-            update_parts.append("lang = ?")
+            set_clauses.append("lang = ?")
             params.append(existing_lang)
         
         params.append(user_id)
@@ -82,9 +79,9 @@ async def update_user(user_id: int, username: str = None, first_name: str = None
             INSERT INTO users (user_id, username, first_name, last_name, lang, added_at, last_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                {', '.join(update_parts)}
+                {', '.join(set_clauses)}
             """,
-            (user_id, username, first_name, last_name, "en", now, now)
+            (user_id, username, first_name, last_name, "en", now, now) + tuple(params)
         )
         await db.commit()
 
