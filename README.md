@@ -1,5 +1,10 @@
 # Vee - Telegram Media Downloader Bot
 
+[中文版](./README.zh.md) | [日本語](./README.ja.md)
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 A powerful Telegram bot for downloading videos, audio, and thumbnails from multiple platforms.
 
 ## Features
@@ -123,6 +128,12 @@ vee/
 ## License
 
 MIT License
+
+## Links
+
+- [GitHub Repository](https://github.com/KaguyaTaketori/vee)
+- [yt-dlp Documentation](https://github.com/yt-dlp/yt-dlp)
+- [Telegram Bot API](https://core.telegram.org/bots/api)
 
 ## Contributing
 

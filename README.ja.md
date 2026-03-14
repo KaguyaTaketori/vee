@@ -1,5 +1,10 @@
 # Vee - Telegram メディアダウンボット
 
+[English](./README.md) | [中文版](./README.zh.md)
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 複数のプラットフォームから動画、音声、サムネイルをダウンロードできる強力なTelegramボットです。
 
 ## 機能
@@ -8,7 +13,7 @@
 - **多様なダウンロード形式**: 動画（最大2GB）、音声（MP3）、サムネイル
 - **高速ダウンロード**: aria2マルチ接続サポート
 - **ユーザー管理**: 許可/ブロックシステム、レート制限
-- **多言語**: 英語、中国語、日本語対応
+- **多言語**: 英語、中国語、日本語、韓国語対応
 - **キャッシュ**: ファイルIDキャッシュで再アップロードを回避
 - **Cookie管理**: 認証ダウンロード用の自動Cookie更新
 
@@ -118,6 +123,12 @@ vee/
 ## ライセンス
 
 MITライセンス
+
+## リンク
+
+- [GitHub リポジトリ](https://github.com/KaguyaTaketori/vee)
+- [yt-dlp ドキュメント](https://github.com/yt-dlp/yt-dlp)
+- [Telegram Bot API](https://core.telegram.org/bots/api)
 
 ## コントリビューション
 

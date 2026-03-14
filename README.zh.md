@@ -1,5 +1,10 @@
 # Vee - Telegram 媒体下载机器人
 
+[English](./README.md) | [日本語](./README.ja.md)
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 一个强大的Telegram机器人，支持从多个平台下载视频、音频和缩略图。
 
 ## 功能
@@ -8,7 +13,7 @@
 - **多种下载类型**: 视频（最大2GB）、音频（MP3）、缩略图
 - **高速下载**: aria2多连接支持
 - **用户管理**: 允许/阻止系统，速率限制
-- **多语言**: 英语、中文、日语支持
+- **多语言**: 英语、中文、日语、韩语支持
 - **缓存**: 自动缓存文件ID，避免重复上传
 - **Cookie管理**: 认证下载的自动Cookie刷新
 
@@ -118,6 +123,12 @@ vee/
 ## 许可证
 
 MIT 许可证
+
+## 链接
+
+- [GitHub 仓库](https://github.com/KaguyaTaketori/vee)
+- [yt-dlp 文档](https://github.com/yt-dlp/yt-dlp)
+- [Telegram Bot API](https://core.telegram.org/bots/api)
 
 ## 贡献
 
