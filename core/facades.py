@@ -48,7 +48,7 @@ class DownloadFacade:
         
         log_user(user, f"download_request:{callback_data}")
         
-        strategy_key = DownloadFacade._map_callback_to_strategy(callback_data)
+        strategy_key = DownloadFacade._map_callback_to_strategy(callback_data, url)
         if not strategy_key:
             logger.error(f"Unknown callback_data: {callback_data}")
             return False, "unknown_download_type"
@@ -68,11 +68,11 @@ class DownloadFacade:
             return False, "download_failed"
     
     @staticmethod
-    def _map_callback_to_strategy(callback_data: str) -> str | None:
+    def _map_callback_to_strategy(callback_data: str, url: str | None = None) -> str | None:
         """Map callback_data to strategy key.
         
         Examples:
-            "download_audio" -> "download_audio"
+            "download_audio" -> "download_audio" (or "spotify" if Spotify URL)
             "download_video" -> "download_video" 
             "download_thumbnail" -> "download_thumbnail"
             "quality_1080" -> "video_1080"
@@ -80,6 +80,10 @@ class DownloadFacade:
             "spotify" -> "spotify"
         """
         if callback_data in ("download_audio", "download_video", "download_thumbnail", "spotify"):
+            if callback_data == "download_audio" and url:
+                from core.downloader import is_spotify_url
+                if is_spotify_url(url):
+                    return "spotify"
             return callback_data
         
         if callback_data.startswith("quality_"):

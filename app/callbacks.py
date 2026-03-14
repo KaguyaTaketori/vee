@@ -10,11 +10,10 @@ logger = logging.getLogger(__name__)
 
 from config import track_user, get_allowed_users, MAX_CACHE_SIZE, MAX_FILE_SIZE
 from core.ratelimit import rate_limiter
-from core.logger import log_user, log_download
-from core.history import check_recent_download, get_file_id_by_url, add_history, get_user_history
+from core.logger import log_user
+from core.history import check_recent_download, get_user_history
 from core.i18n import t
-from core.downloader import get_formats, download_video, download_audio, get_thumbnail, download_spotify, is_spotify_url
-from app.download import _make_progress_hook
+from core.downloader import get_formats, is_spotify_url
 
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
@@ -160,13 +159,6 @@ async def handle_callback(update: Update, context: CallbackContext):
         await query.edit_message_text(msg)
         return
     
-    allowed = get_allowed_users()
-    if allowed and user_id not in allowed:
-        await query.answer(t("not_authorized", user_id), show_alert=True)
-        return
-
-    log_user(query.from_user, query.data)
-    
     url = context.user_data.get(f"pending_url_{user_id}")
     if not url:
         try:
@@ -175,36 +167,26 @@ async def handle_callback(update: Update, context: CallbackContext):
             pass
         return
 
-    try:
-        if query.data == "download_video":
-            await show_quality_options(query, url)
-        elif query.data.startswith("quality_"):
-            format_id = query.data.replace("quality_", "")
-            try:
-                processing_msg = await query.edit_message_text("Processing... Please wait.")
-            except Exception:
-                processing_msg = query.message
-            asyncio.create_task(send_video_with_format(query, url, processing_msg, format_id, context))
-        elif query.data in ("download_audio", "download_thumbnail"):
-            from core.strategies import StrategyFactory
-            strategy_key = "spotify" if (query.data == "download_audio" and is_spotify_url(url)) else query.data
-            strategy = StrategyFactory.get(strategy_key)
-            if strategy:
-                try:
-                    processing_msg = await query.edit_message_text("Processing... Please wait.")
-                except Exception:
-                    processing_msg = query.message
-                asyncio.create_task(strategy.execute(query, url, processing_msg, context))
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error: {e}")
+    if query.data == "download_video":
+        await show_quality_options(query, url)
+        return
+    
+    if query.data.startswith("quality_") or query.data in ("download_audio", "download_thumbnail"):
         try:
-            if "No video could be found" in error_msg or "No video" in error_msg:
-                await query.edit_message_text(t("no_video_found", user_id))
-            else:
-                await query.edit_message_text(f"Error: {error_msg[:200]}")
-        except:
-            pass
+            processing_msg = await query.edit_message_text("Processing... Please wait.")
+        except Exception:
+            processing_msg = query.message
+        
+        from core.facades import DownloadFacade
+        success, error_key = await DownloadFacade.process_download_request(
+            query, url, query.data, context, processing_msg
+        )
+        
+        if not success:
+            try:
+                await processing_msg.edit_text(t(error_key, user_id))
+            except Exception:
+                pass
 
 
 async def show_quality_options(query, url):
@@ -250,209 +232,3 @@ async def show_quality_options(query, url):
         await query.edit_message_text(t("select_quality", user_id, title=title[:50]), reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error editing message: {e}")
-
-
-async def send_video_with_format(query, url, processing_msg, format_id, context):
-    """Handle video download with format selection - uses Strategy pattern."""
-    from core.strategies import VideoStrategy
-    
-    user_id = query.from_user.id
-    cached_file = context.user_data.get(f"cached_file_{user_id}")
-    
-    if cached_file and os.path.exists(cached_file):
-        logger.info(f"Using cached file for {url}: {cached_file}")
-        filename = cached_file
-        title = os.path.splitext(os.path.basename(filename))[0]
-        info = {"title": title}
-    else:
-        try:
-            await processing_msg.edit_text(t("downloading", user_id))
-            formats, info = await get_formats(url)
-            available_ids = [f.get("format_id") for f in formats]
-            logger.error(f"Requested format: {format_id}, Available: {available_ids[:20]}")
-            
-            from core.downloader import download_video
-            progress_hook = _make_progress_hook(processing_msg)
-            filename, info = await download_video(url, format_id, progress_hook)
-        except Exception as e:
-            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
-            return
-
-        if not os.path.exists(filename):
-            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
-            return
-    
-    file_size = os.path.getsize(filename)
-    if file_size > MAX_FILE_SIZE:
-        await processing_msg.edit_text(
-            t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
-        )
-        if not cached_file and os.path.exists(filename):
-            os.remove(filename)
-        return
-
-    title = info.get("title")
-    caption = f"🎬 {title}" if title else None
-    
-    await processing_msg.edit_text(t("uploading", user_id))
-    try:
-        existing_file_id = get_file_id_by_url(url)
-        
-        if existing_file_id:
-            logger.info(f"Using file_id for {url}: {existing_file_id}")
-            await query.message.reply_video(video=existing_file_id, caption=caption)
-            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
-            await processing_msg.delete()
-            log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
-            add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, existing_file_id)
-        else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_video(video=f, caption=caption)
-            
-            new_file_id = sent_msg.video.file_id if sent_msg.video else None
-            await processing_msg.delete()
-            log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
-            add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, new_file_id)
-    except Exception as e:
-        await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
-        log_download(query.from_user, "video_downloaded", url, f"upload_failed: {e}", file_size, format_id)
-        add_history(query.from_user.id, url, "video", file_size, info.get("title"), "failed")
-    
-    if os.path.exists(filename) and not cached_file:
-        os.remove(filename)
-
-
-async def send_audio(query, url, processing_msg, context):
-    """Handle audio download - now delegates to Strategy pattern."""
-    from core.strategies import StrategyFactory
-    
-    strategy = StrategyFactory.get("download_audio")
-    if strategy:
-        asyncio.create_task(strategy.execute(query, url, processing_msg, context))
-    else:
-        await _send_audio_legacy(query, url, processing_msg, context)
-
-
-async def _send_audio_legacy(query, url, processing_msg, context):
-    user_id = query.from_user.id
-    cached_file = context.user_data.get(f"cached_file_{user_id}")
-    
-    if cached_file and os.path.exists(cached_file) and cached_file.endswith('.mp3'):
-        logger.info(f"Using cached audio file for {url}: {cached_file}")
-        filename = cached_file
-        title = os.path.splitext(os.path.basename(filename))[0]
-    else:
-        try:
-            await processing_msg.edit_text(t("downloading", user_id))
-            progress_hook = _make_progress_hook(processing_msg)
-            filename, info = await download_audio(url, progress_hook)
-        except Exception as e:
-            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
-            return
-
-        if not os.path.exists(filename):
-            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
-            log_download(query.from_user, "audio_downloaded", url, "file_not_found")
-            add_history(query.from_user.id, url, "audio", None, info.get("title"), "failed")
-            return
-
-        title = info.get("title")
-
-    file_size = os.path.getsize(filename)
-    
-    await processing_msg.edit_text(t("uploading", user_id))
-    try:
-        existing_file_id = get_file_id_by_url(url)
-        
-        if existing_file_id:
-            logger.info(f"Using file_id for audio {url}: {existing_file_id}")
-            await query.message.reply_audio(audio=existing_file_id, title=title)
-            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
-            await processing_msg.delete()
-            log_download(query.from_user, "audio_downloaded", url, "success", file_size)
-            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, existing_file_id)
-        else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_audio(audio=f, title=title)
-            
-            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
-            await processing_msg.delete()
-            log_download(query.from_user, "audio_downloaded", url, "success", file_size)
-            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
-    except Exception as e:
-        await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
-        log_download(query.from_user, "audio_downloaded", url, f"upload_failed: {e}", file_size)
-        add_history(query.from_user.id, url, "audio", file_size, title, "failed")
-    
-    if os.path.exists(filename) and not cached_file:
-        os.remove(filename)
-
-
-async def send_thumbnail(query, url, processing_msg):
-    user_id = query.from_user.id
-    try:
-        thumbnail_url, info = await get_thumbnail(url)
-    except Exception as e:
-        await processing_msg.edit_text(f"Error: {str(e)}")
-        return
-
-    if not thumbnail_url:
-        await processing_msg.edit_text(t("no_thumbnail", user_id))
-        return
-
-    title = info.get("title")
-    caption = f"🖼️ {title}" if title else None
-
-    await processing_msg.edit_text(t("fetching_thumbnail", user_id))
-    await query.message.reply_photo(photo=thumbnail_url, caption=caption)
-    await processing_msg.delete()
-
-
-async def _download_spotify(query, url, processing_msg):
-    """Handle Spotify download."""
-    user_id = query.from_user.id
-    
-    try:
-        await processing_msg.edit_text("🎵 Downloading from Spotify via YouTube...")
-        
-        filename, info = await download_spotify(url)
-        
-        if not os.path.exists(filename):
-            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
-            return
-        
-        file_size = os.path.getsize(filename)
-        
-        if file_size > MAX_FILE_SIZE:
-            await processing_msg.edit_text(
-                t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
-            )
-            os.remove(filename)
-            return
-        
-        title = info.get("title")
-        caption = f"🎵 {title}" if title else None
-        
-        await processing_msg.edit_text(t("uploading", user_id))
-        
-        existing_file_id = get_file_id_by_url(url)
-        
-        if existing_file_id:
-            logger.info(f"Using file_id for {url}: {existing_file_id}")
-            await query.message.reply_audio(audio=existing_file_id, caption=caption)
-            msg = await query.message.reply_text("✅ Sent via file ID")
-            await processing_msg.delete()
-        else:
-            with open(filename, "rb") as f:
-                sent_msg = await query.message.reply_audio(audio=f, title=title)
-            
-            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
-            await processing_msg.delete()
-            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
-        
-        if os.path.exists(filename):
-            os.remove(filename)
-            
-    except Exception as e:
-        logger.error(f"Spotify download error: {e}")
-        await processing_msg.edit_text(f"Error: {str(e)[:200]}")
