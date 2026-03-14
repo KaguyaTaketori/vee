@@ -44,7 +44,15 @@ class DownloadQueue:
         self._workers: list[asyncio.Task] = []
         self._running = False
         self._cancel_event: Optional[asyncio.Event] = None
-
+        self._executor: Optional[Callable] = None
+    
+    def set_executor(self, executor: Callable):
+        """Set the async function to execute when processing a task.
+        
+        The executor should accept: (task: DownloadTask, processing_msg, context)
+        """
+        self._executor = executor
+    
     async def start(self):
         self._running = True
         self._cancel_event = asyncio.Event()
@@ -75,6 +83,26 @@ class DownloadQueue:
         task.status = DownloadStatus.DOWNLOADING
         task.started_at = time.time()
         self.active_tasks[task.task_id] = task
+        
+        if self._executor:
+            try:
+                await self._executor(task)
+            except Exception as e:
+                task.status = DownloadStatus.FAILED
+                task.error = str(e)
+                task.completed_at = time.time()
+                self.completed_tasks[task.task_id] = task
+                if task.task_id in self.active_tasks:
+                    del self.active_tasks[task.task_id]
+                self._cleanup_completed()
+        else:
+            task.status = DownloadStatus.FAILED
+            task.error = "No executor configured"
+            task.completed_at = time.time()
+            self.completed_tasks[task.task_id] = task
+            if task.task_id in self.active_tasks:
+                del self.active_tasks[task.task_id]
+            self._cleanup_completed()
 
     async def add_task(self, task: DownloadTask) -> str:
         await self.queue.put(task)
@@ -94,6 +122,22 @@ class DownloadQueue:
             if task:
                 tasks.append(task)
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
+    
+    def get_queue_position(self, user_id: int) -> int:
+        """Get the number of queued tasks for a user (not including active)."""
+        position = 0
+        for item in self.queue.queue:
+            if item.user_id == user_id and item.status == DownloadStatus.QUEUED:
+                position += 1
+        return position
+    
+    def get_total_queued(self) -> int:
+        """Get total number of queued tasks."""
+        return self.queue.qsize()
+    
+    def get_active_count(self) -> int:
+        """Get number of currently active tasks."""
+        return len(self.active_tasks)
 
     def cancel_task(self, task_id: str) -> bool:
         task = self.active_tasks.get(task_id)

@@ -13,6 +13,8 @@ from app.commands import (
     lang_command, cookie_command, refresh_command
 )
 from app.callbacks import handle_link, handle_callback
+from core.queue import download_queue
+from core.facades import _execute_download_task
 
 
 async def set_bot_commands(app: Application):
@@ -192,11 +194,14 @@ def main():
         app.job_queue.run_repeating(storage_alert_job, interval=3600, first=300)
 
     async def post_init_callback(app: Application):
+        download_queue.set_executor(_execute_download_task)
+        await download_queue.start()
         await set_bot_commands(app)
 
     app.post_init = post_init_callback
     
     async def post_shutdown(context):
+        await download_queue.stop()
         persist_all_data()
 
     app.post_shutdown = post_shutdown
