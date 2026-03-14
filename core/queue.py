@@ -45,6 +45,7 @@ class DownloadQueue:
         self._running = False
         self._cancel_event: Optional[asyncio.Event] = None
         self._executor: Optional[Callable] = None
+        self._pending_user_tasks: dict[int, list[str]] = {}
     
     def set_executor(self, executor: Callable):
         """Set the async function to execute when processing a task.
@@ -84,6 +85,9 @@ class DownloadQueue:
         task.started_at = time.time()
         self.active_tasks[task.task_id] = task
         
+        if task.user_id in self._pending_user_tasks and task.task_id in self._pending_user_tasks[task.user_id]:
+            self._pending_user_tasks[task.user_id].remove(task.task_id)
+        
         if self._executor:
             try:
                 await self._executor(task)
@@ -109,6 +113,9 @@ class DownloadQueue:
         if task.user_id not in self.user_downloads:
             self.user_downloads[task.user_id] = set()
         self.user_downloads[task.user_id].add(task.task_id)
+        if task.user_id not in self._pending_user_tasks:
+            self._pending_user_tasks[task.user_id] = []
+        self._pending_user_tasks[task.user_id].append(task.task_id)
         return task.task_id
 
     def get_task(self, task_id: str) -> Optional[DownloadTask]:
@@ -125,11 +132,7 @@ class DownloadQueue:
     
     def get_queue_position(self, user_id: int) -> int:
         """Get the number of queued tasks for a user (not including active)."""
-        position = 0
-        for item in self.queue.queue:
-            if item.user_id == user_id and item.status == DownloadStatus.QUEUED:
-                position += 1
-        return position
+        return len(self._pending_user_tasks.get(user_id, []))
     
     def get_total_queued(self) -> int:
         """Get total number of queued tasks."""
