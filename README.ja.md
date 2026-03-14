@@ -81,6 +81,8 @@ python vee.py
 - `/storage` - ディスク使用量
 - `/status` - ボットシステム状態
 - `/setrate <max>` - レート制限設定
+- `/failed` - 失敗したダウンロードを表示
+- `/clear` - キャッシュまたは履歴をクリア
 
 ## アーキテクチャ
 
@@ -91,13 +93,15 @@ vee/
 │   ├── callbacks.py  # コールバックハンドラー
 │   └── download.py  # ダウンロードユーティリティ
 ├── core/             # コア機能
-│   ├── downloader.py    # ダウンロードロジック
-│   ├── strategies.py     # ダウンロード戦略
-│   ├── services.py      # サービス抽象化
-│   ├── file_handler.py  # ファイル操作
-│   ├── history.py       # ダウンロード履歴
+│   ├── downloader.py    # ダウンロードロジック (yt-dlp)
+│   ├── strategies.py     # ダウンロード戦略パターン
+│   ├── facades.py       # サービスファサード
+│   ├── history.py       # ダウンロード履歴 (SQLite)
+│   ├── users.py         # ユーザー管理
 │   ├── ratelimit.py     # レート制限
+│   ├── logger.py        # ログシステム
 │   └── i18n.py         # 国際化
+├── locales/          # 翻訳ファイル
 ├── config.py         # 設定
 └── vee.py           # メインエントリポイント
 ```

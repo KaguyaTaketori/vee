@@ -81,6 +81,8 @@ python vee.py
 - `/storage` - 磁盘使用情况
 - `/status` - 机器人系统状态
 - `/setrate <max>` - 设置速率限制
+- `/failed` - 查看失败的下载
+- `/clear` - 清除缓存或历史
 
 ## 架构
 
@@ -91,13 +93,15 @@ vee/
 │   ├── callbacks.py  # 回调处理器
 │   └── download.py  # 下载工具
 ├── core/             # 核心功能
-│   ├── downloader.py    # 下载逻辑
-│   ├── strategies.py     # 下载策略
-│   ├── services.py      # 服务抽象
-│   ├── file_handler.py  # 文件操作
-│   ├── history.py       # 下载历史
+│   ├── downloader.py    # 下载逻辑 (yt-dlp)
+│   ├── strategies.py     # 下载策略模式
+│   ├── facades.py       # 服务外观
+│   ├── history.py       # 下载历史 (SQLite)
+│   ├── users.py         # 用户管理
 │   ├── ratelimit.py     # 速率限制
+│   ├── logger.py        # 日志系统
 │   └── i18n.py         # 国际化
+├── locales/          # 翻译文件
 ├── config.py         # 配置
 └── vee.py           # 主入口
 ```
