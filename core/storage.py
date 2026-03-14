@@ -3,7 +3,19 @@ import json
 import time
 import fcntl
 import threading
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+
+_executor = ThreadPoolExecutor(max_workers=4)
+
+
+def _get_running_loop():
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 class JsonStore:
@@ -34,6 +46,20 @@ class JsonStore:
                 self._cache["time"] = now
             return self._cache["data"].copy()
     
+    async def load_async(self) -> dict:
+        loop = _get_running_loop()
+        if loop:
+            return await loop.run_in_executor(_executor, self._sync_load)
+        return self._sync_load()
+    
+    def _sync_load(self) -> dict:
+        with self._cache_lock:
+            now = time.time()
+            if self._cache["data"] is None or now - self._cache["time"] > self.cache_ttl:
+                self._cache["data"] = self._load_unsafe()
+                self._cache["time"] = now
+            return self._cache["data"].copy()
+    
     def _save_unsafe(self, data: dict):
         with open(self.lock_file, "w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -50,6 +76,20 @@ class JsonStore:
                 self._cache["dirty"] = False
                 self._last_persist = time.time()
     
+    async def persist_async(self):
+        loop = _get_running_loop()
+        if loop:
+            await loop.run_in_executor(_executor, self._sync_persist)
+        else:
+            self._sync_persist()
+    
+    def _sync_persist(self):
+        with self._cache_lock:
+            if self._cache["dirty"]:
+                self._save_unsafe(self._cache["data"])
+                self._cache["dirty"] = False
+                self._last_persist = time.time()
+    
     def mark_dirty(self, data: dict):
         with self._cache_lock:
             self._cache["data"] = data
@@ -58,3 +98,6 @@ class JsonStore:
     
     def force_persist(self):
         self.persist()
+    
+    async def force_persist_async(self):
+        await self.persist_async()

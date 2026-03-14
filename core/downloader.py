@@ -13,6 +13,16 @@ logger = logging.getLogger(__name__)
 _cookie_last_refresh = 0
 
 
+def _get_running_loop():
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            return None
+
+
 class YtDlpHelper:
     """Helper class to reduce duplicate yt-dlp configuration code."""
     
@@ -68,7 +78,11 @@ class YtDlpHelper:
     @staticmethod
     def prepare_url(url: str) -> str:
         """Common URL preprocessing: resolve short URLs and refresh cookies."""
-        refresh_cookies()
+        loop = _get_running_loop()
+        if loop and loop.is_running():
+            asyncio.create_task(refresh_cookies_async())
+        else:
+            refresh_cookies()
         return resolve_short_url(url)
 
 
@@ -148,6 +162,35 @@ def refresh_cookies():
         return False
 
 
+async def refresh_cookies_async():
+    global _cookie_last_refresh
+    if not COOKIE_REFRESH_CMD or not COOKIE_FILE:
+        return False
+    
+    if time.time() - _cookie_last_refresh < (COOKIE_REFRESH_INTERVAL_HOURS * 3600):
+        return False
+    
+    try:
+        logger.info("Refreshing cookies (async)...")
+        process = await asyncio.create_subprocess_shell(
+            COOKIE_REFRESH_CMD,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            logger.error(f"Failed to refresh cookies: {stderr.decode()}")
+            return False
+        
+        _cookie_last_refresh = time.time()
+        logger.info(f"Cookies refreshed successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to refresh cookies: {e}")
+        return False
+
+
 def _use_intl_api(url):
     """Convert Bilibili URL to use international API."""
     if "bilibili.com" in url and "b23.tv" not in url:
@@ -178,7 +221,7 @@ async def get_formats_cached(url):
 async def get_formats(url):
     url = YtDlpHelper.prepare_url(url)
     
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
         ydl_opts = helper.get_opts()
@@ -202,7 +245,7 @@ async def download_video(url, format_id, progress_hook=None):
         except Exception as e:
             logger.warning(f"aria2 failed, falling back to yt-dlp: {e}")
     
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _download():
         helper = YtDlpHelper(url)
         ydl_opts = helper.get_opts()
@@ -252,7 +295,7 @@ async def download_video(url, format_id, progress_hook=None):
 async def download_audio(url, progress_hook=None):
     url = YtDlpHelper.prepare_url(url)
     
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _download():
         helper = YtDlpHelper(url)
         ydl_opts = helper.get_opts()
@@ -276,7 +319,7 @@ async def download_audio(url, progress_hook=None):
 
 async def get_thumbnail(url):
     url = YtDlpHelper.prepare_url(url)
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
         with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
@@ -288,7 +331,7 @@ async def get_thumbnail(url):
 
 async def get_images(url):
     url = YtDlpHelper.prepare_url(url)
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
         with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
@@ -350,7 +393,7 @@ async def download_with_aria2(url, filename, progress_hook=None, connections=16)
 async def get_direct_url(url, format_id=None):
     url = YtDlpHelper.prepare_url(url)
     
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
         ydl_opts = helper.get_opts()
@@ -378,7 +421,7 @@ async def download_video_aria2(url, format_id, progress_hook=None):
     if not is_aria2_available():
         raise RuntimeError("aria2c is not installed")
 
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     
     def _get_info():
         helper = YtDlpHelper(url)
@@ -464,7 +507,7 @@ def is_spotify_url(url: str) -> bool:
 
 async def download_spotify(url, progress_hook=None):
     """Download Spotify track using spotDL."""
-    loop = asyncio.get_event_loop()
+    loop = _get_running_loop()
     
     def _download():
         output_template = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}%(title)s.%(ext)s")
