@@ -38,7 +38,7 @@ class DownloadStrategy(ABC):
         """Check for cached file from recent downloads."""
         from core.history import check_recent_download
         
-        recent = check_recent_download(url, max_age_hours=24)
+        recent = await check_recent_download(url, max_age_hours=24)
         if recent:
             file_path = recent.get("file_path")
             if file_path and os.path.exists(file_path):
@@ -50,7 +50,7 @@ class DownloadStrategy(ABC):
     
     async def _get_file_id_or_upload(self, query, url: str, filename: str, caption: str | None, user_id: int):
         """Get existing file_id or upload new file. Template method."""
-        existing_id = get_file_id_by_url(url)
+        existing_id = await get_file_id_by_url(url)
         
         if existing_id:
             logger.info(f"Using file_id for {url}: {existing_id}")
@@ -105,13 +105,13 @@ class DownloadStrategy(ABC):
                 logger.error(f"Download failed: {type(e).__name__}: {e}")
                 await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
                 log_download(query.from_user, f"{self.download_type}_downloaded", url, f"download_failed: {e}")
-                add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
+                await add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
                 return
             
             if not os.path.exists(filename):
                 await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
                 log_download(query.from_user, f"{self.download_type}_downloaded", url, "download_failed: File not found")
-                add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
+                await add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
                 return
         
         if not self._validate_file_size(filename, processing_msg, user_id):
@@ -130,14 +130,14 @@ class DownloadStrategy(ABC):
             
             logger.info(f"Upload completed successfully: file_id={file_id}")
             log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", file_size)
-            add_history(query.from_user.id, url, self.download_type, file_size, title, "success", filename, file_id)
+            await add_history(query.from_user.id, url, self.download_type, file_size, title, "success", filename, file_id)
         except Exception as e:
             import traceback
             logger.error(f"Upload failed: {type(e).__name__}: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
             log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
-            add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename) if os.path.exists(filename) else 0, title, "failed")
+            await add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename) if os.path.exists(filename) else 0, title, "failed")
         
         self._cleanup_temp_file(filename, cached_file)
     
@@ -223,12 +223,39 @@ class ThumbnailStrategy(DownloadStrategy):
     def telegram_method(self) -> str:
         return "photo"
     
+    async def execute(self, query, url: str, processing_msg, context: CallbackContext):
+        user_id = query.from_user.id
+        from core.i18n import t
+        
+        await processing_msg.edit_text(t("downloading", user_id))
+        try:
+            thumbnail_url, info = await self._do_download(url, None)
+        except Exception as e:
+            logger.error(f"Thumbnail download failed: {e}")
+            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+            return
+            
+        title = info.get("title") if info else None
+        caption = self._get_caption(title) if title else None
+        
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        try:
+            logger.info(f"Starting upload: {self.download_type} - URL: {thumbnail_url}")
+            file_id = await self._get_file_id_or_upload(query, url, thumbnail_url, caption, user_id)
+            
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", 0)
+            await add_history(query.from_user.id, url, self.download_type, 0, title, "success", thumbnail_url, file_id)
+        except Exception as e:
+            await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
+            await add_history(query.from_user.id, url, self.download_type, 0, title, "failed")
+    
     async def _send_from_file_id(self, query, file_id: str, caption: str | None):
         await query.message.reply_photo(photo=file_id, caption=caption)
     
     async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
-        with open(filename, "rb") as f:
-            sent_msg = await query.message.reply_photo(photo=f, caption=caption)
+        sent_msg = await query.message.reply_photo(photo=filename, caption=caption)
         return sent_msg.photo[-1].file_id if sent_msg.photo else None
     
     async def _do_download(self, url: str, progress_hook):

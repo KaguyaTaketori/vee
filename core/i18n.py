@@ -40,12 +40,12 @@ def _load_translations(lang: str) -> dict:
     return {}
 
 
-def get_user_lang(user_id: int) -> str:
-    return users.get_user_lang(user_id)
+async def get_user_lang(user_id: int) -> str:
+    return await users.get_user_lang(user_id)
 
 
-def set_user_lang(user_id: int, lang: str):
-    users.set_user_lang(user_id, lang)
+async def set_user_lang(user_id: int, lang: str):
+    await users.set_user_lang(user_id, lang)
 
 
 def _get_nested(translations: dict, key: str) -> Optional[str]:

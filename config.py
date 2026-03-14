@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import asyncio
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,7 +47,11 @@ from core.history import force_persist as _force_persist_history
 
 def track_user(user):
     if user:
-        _update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name)
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
+        except RuntimeError:
+            asyncio.run(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
 
 
 def get_allowed_users():
@@ -82,13 +87,21 @@ def get_all_users_info():
     if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
         return _users_db_cache["data"]
     
-    data = _get_all_users()
+    try:
+        loop = asyncio.get_running_loop()
+        data = loop.run_until_complete(_get_all_users())
+    except RuntimeError:
+        data = asyncio.run(_get_all_users())
     _users_db_cache = {"data": data, "time": now}
     return data
 
 
 def get_user_display_name(user_id: int) -> str:
-    info = _get_user_info(user_id)
+    try:
+        loop = asyncio.get_running_loop()
+        info = loop.run_until_complete(_get_user_info(user_id))
+    except RuntimeError:
+        info = asyncio.run(_get_user_info(user_id))
     if info:
         if info.get("username"):
             return f"@{info['username']}"

@@ -82,7 +82,7 @@ async def handle_link(update: Update, context: CallbackContext):
     
     log_user(update.message.from_user, "sent_link")
 
-    recent_download = check_recent_download(url, max_age_hours=24)
+    recent_download = await check_recent_download(url, max_age_hours=24)
     cached_file_path = None
     if recent_download:
         file_path = recent_download.get("file_path")
@@ -128,10 +128,10 @@ async def handle_callback(update: Update, context: CallbackContext):
     user_id = query.from_user.id
     
     if query.data.startswith("lang_"):
-        from core.i18n import set_user_lang, LANGUAGES, t
+        from core.i18n import set_user_lang as i18n_set_user_lang, LANGUAGES, t
         lang_code = query.data.replace("lang_", "")
         if lang_code in LANGUAGES:
-            set_user_lang(user_id, lang_code)
+            await i18n_set_user_lang(user_id, lang_code)
             await query.edit_message_text(t("language_changed", user_id))
         return
     
@@ -141,7 +141,7 @@ async def handle_callback(update: Update, context: CallbackContext):
             await query.answer("Admin only.", show_alert=True)
             return
         target_id = int(query.data.replace("uh_", ""))
-        history = get_user_history(target_id, limit=20)
+        history = await get_user_history(target_id, limit=20)
         if not history:
             await query.edit_message_text(f"No history for user {target_id}.")
             return

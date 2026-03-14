@@ -48,8 +48,8 @@ async def stats_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     stats = get_user_stats()
-    users_count = get_all_users_count()
-    total_downloads = get_total_downloads()
+    users_count = await get_all_users_count()
+    total_downloads = await get_total_downloads()
     msg = f"{stats}\n\nTotal registered users: {users_count}\nTotal downloads: {total_downloads}"
     await update.message.reply_text(msg)
 
@@ -58,7 +58,7 @@ async def history_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     user_id = update.message.from_user.id
-    history = get_user_history(user_id, limit=10)
+    history = await get_user_history(user_id, limit=10)
     
     if not history:
         await update.message.reply_text("No download history.")
@@ -343,7 +343,7 @@ async def failed_command(update: Update, context: CallbackContext):
         await update.message.reply_text("Invalid user ID.")
         return
     
-    history = get_user_history(target_id, limit=50)
+    history = await get_user_history(target_id, limit=50)
     failed = [h for h in history if h.get("status") == "failed"]
     
     if not failed:
@@ -387,7 +387,7 @@ async def lang_command(update: Update, context: CallbackContext):
         await update.message.reply_text("Invalid language. Use: en, zh, or ja")
         return
     
-    set_user_lang(user_id, lang_code)
+    await set_user_lang(user_id, lang_code)
     await update.message.reply_text(t("language_changed", user_id))
 
 
@@ -419,5 +419,5 @@ async def refresh_command(update: Update, context: CallbackContext):
     
     url = " ".join(context.args)
     from core.history import clear_file_id_by_url
-    clear_file_id_by_url(url)
+    await clear_file_id_by_url(url)
     await update.message.reply_text(f"✅ Cleared cached file ID for:\n{url}\n\nThe next download will fetch a fresh file.")
