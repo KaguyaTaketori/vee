@@ -1,15 +1,13 @@
-import json
 import os
-import threading
+import json
 from typing import Optional
+
+from core import users
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LANG_FILE = os.path.join(BASE_DIR, "users_db.json")
 LOCALES_DIR = os.path.join(BASE_DIR, "locales")
-_lock = threading.Lock()
-_cache = {"data": {}, "translations": {}, "time": 0}
-CACHE_TTL = 5
+_cache = {"translations": {}}
 
 DEFAULT_LANG = "en"
 
@@ -42,56 +40,12 @@ def _load_translations(lang: str) -> dict:
     return {}
 
 
-def _load_users_db():
-    global _cache
-    import time
-    now = time.time()
-    if _cache["data"] is not None and (now - _cache["time"]) < CACHE_TTL:
-        return _cache["data"]
-    
-    if os.path.exists(LANG_FILE):
-        try:
-            with open(LANG_FILE, "r") as f:
-                _cache["data"] = json.load(f)
-                _cache["time"] = now
-                return _cache["data"]
-        except:
-            pass
-    return {}
-
-
-def _save_users_db(data):
-    global _cache
-    with _lock:
-        try:
-            with open(LANG_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-            _cache["data"] = data
-            _cache["time"] = time.time()
-        except:
-            pass
-
-
-import time
-
-
 def get_user_lang(user_id: int) -> str:
-    db = _load_users_db()
-    user_id_str = str(user_id)
-    if user_id_str in db and isinstance(db[user_id_str], dict):
-        return db[user_id_str].get("lang", DEFAULT_LANG)
-    return DEFAULT_LANG
+    return users.get_user_lang(user_id)
 
 
 def set_user_lang(user_id: int, lang: str):
-    db = _load_users_db()
-    user_id_str = str(user_id)
-    if user_id_str not in db:
-        db[user_id_str] = {}
-    if not isinstance(db[user_id_str], dict):
-        db[user_id_str] = {}
-    db[user_id_str]["lang"] = lang
-    _save_users_db(db)
+    users.set_user_lang(user_id, lang)
 
 
 def _get_nested(translations: dict, key: str) -> Optional[str]:

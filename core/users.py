@@ -15,12 +15,31 @@ def get_user_info(user_id: int) -> dict:
     return users.get(str(user_id), {}).copy()
 
 
+def get_user_lang(user_id: int) -> str:
+    users = _users_store.load()
+    str_id = str(user_id)
+    return users.get(str_id, {}).get("lang", "en")
+
+
+def set_user_lang(user_id: int, lang: str):
+    users = _users_store.load()
+    str_id = str(user_id)
+    
+    if str_id not in users:
+        users[str_id] = {"id": user_id, "added_at": time.time()}
+    
+    users[str_id]["lang"] = lang
+    _users_store.mark_dirty(users)
+
+
 def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
     users = _users_store.load()
     str_id = str(user_id)
     
     if str_id not in users:
         users[str_id] = {"id": user_id, "added_at": time.time()}
+    
+    existing_lang = users[str_id].get("lang")
     
     if username:
         users[str_id]["username"] = username
@@ -30,6 +49,9 @@ def update_user(user_id: int, username: str = None, first_name: str = None, last
         users[str_id]["last_name"] = last_name
     
     users[str_id]["last_seen"] = time.time()
+    
+    if existing_lang is not None:
+        users[str_id]["lang"] = existing_lang
     
     _users_store.mark_dirty(users)
 
