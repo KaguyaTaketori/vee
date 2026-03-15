@@ -14,7 +14,8 @@ from utils.logger import log_user
 from database.history import check_recent_download, get_user_history
 from utils.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
 from core.downloader import get_formats, is_spotify_url
-from utils.utils import format_history_item, is_user_allowed
+from utils.utils import format_history_item, format_history_list, is_user_allowed
+from bot.user_commands import _send_history_page
 from services.session import UserSession
 from services.queue import download_queue
 

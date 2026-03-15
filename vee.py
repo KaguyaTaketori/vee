@@ -7,13 +7,16 @@ from telegram.error import TelegramError
 
 from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, CLEANUP_INTERVAL_HOURS, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES
 from services.user_service import cleanup_temp_files
-from bot.commands import (
-    start_command, help_command, stats_command, history_command, myid_command,
-    allow_command, block_command, users_command, broadcast_command,
+from bot.user_commands import (
+    start_command, help_command, history_command, myid_command,
+    lang_command, cancel_command, tasks_command,
+)
+from bot.admin_commands import (
+    stats_command, allow_command, block_command, users_command, broadcast_command,
     userhistory_command, rateinfo_command, setrate_command,
     cleanup_command, status_command, queue_command, storage_command, failed_command,
-    lang_command, cookie_command, refresh_command, cancel_command, admin_cancel_command,
-    report_command, setdisk_command, tasks_command, settier_command,
+    cookie_command, refresh_command, admin_cancel_command,
+    report_command, setdisk_command, settier_command,
 )
 from bot.callbacks import handle_link, handle_callback
 from services.queue import download_queue
