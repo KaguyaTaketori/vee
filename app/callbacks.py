@@ -3,17 +3,22 @@ import asyncio
 import logging
 import re
 from urllib.parse import urlparse
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
-logger = logging.getLogger(__name__)
-
-from config import track_user, get_allowed_users, MAX_CACHE_SIZE, MAX_FILE_SIZE
+from config import MAX_CACHE_SIZE, MAX_FILE_SIZE, ADMIN_IDS
+from services.user_service import track_user, get_allowed_users
 from core.ratelimit import rate_limiter
 from core.logger import log_user
 from core.history import check_recent_download, get_user_history
-from core.i18n import t
+from core.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
 from core.downloader import get_formats, is_spotify_url
+from core.utils import format_history_item, is_user_allowed
+from core.session import UserSession
+from core.queue import download_queue
+
+logger = logging.getLogger(__name__)
 
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
@@ -35,6 +40,99 @@ ALLOWED_URL_PATTERN = re.compile(
     r'(?::\d+)?'
     r'(?:/?|[/?]\S+)$', re.IGNORECASE)
 
+_CALLBACK_HANDLERS: list[tuple[callable, callable]] = []
+
+def register(matcher: callable):
+    def decorator(func: callable):
+        _CALLBACK_HANDLERS.append((matcher, func))
+        return func
+    return decorator
+
+@register(lambda d: d.startswith("lang_"))
+async def _cb_lang(query, context):
+    lang_code = query.data.replace("lang_", "")
+    if lang_code in LANGUAGES:
+        await i18n_set_user_lang(query.from_user.id, lang_code)
+        await query.edit_message_text(t("language_changed", query.from_user.id))
+
+
+
+@register(lambda d: d.startswith("uh_"))
+async def _cb_admin_history(query, context):
+    user_id = query.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    target_id = int(query.data.replace("uh_", ""))
+    history = await get_user_history(target_id, limit=20)
+    msg = format_history_list(history, f"Download history for user {target_id}:\n\n")
+    await query.edit_message_text(msg)
+
+@register(lambda d: d == "cancel_menu_close")
+async def _cb_cancel_close(query, context):
+    try:
+        await query.delete_message()
+    except Exception:
+        await query.edit_message_text(t("closed", query.from_user.id))
+
+
+@register(lambda d: d.startswith("cancel_task_"))
+async def _cb_cancel_task(query, context):
+    user_id = query.from_user.id
+    task_id = query.data.replace("cancel_task_", "")
+    task = download_queue.get_task(task_id)
+    if not task:
+        await query.edit_message_text(t("task_not_found", user_id))
+        return
+    is_admin = user_id in ADMIN_IDS if ADMIN_IDS else False
+    if task.user_id != user_id and not is_admin:
+        await query.answer(t("cancel_own_only", user_id), show_alert=True)
+        return
+    success = await download_queue.cancel_task(task_id)
+    key = "task_cancelled" if success else "cancel_failed"
+    await query.edit_message_text(t(key, user_id))
+
+@register(lambda d: d == "download_video")
+async def _cb_download_video(query, context):
+    url = UserSession.get_pending_url(context, query.from_user.id)
+    if url:
+        await show_quality_options(query, url)
+
+
+@register(lambda d: d.startswith("quality_") or d in ("download_audio", "download_thumbnail"))
+async def _cb_download(query, context):
+    user_id = query.from_user.id
+    url = UserSession.get_pending_url(context, user_id)
+    if not url:
+        await query.edit_message_text(t("session_expired", user_id))
+        return
+    try:
+        processing_msg = await query.edit_message_text(t("processing", user_id))
+    except Exception:
+        processing_msg = query.message
+    from core.facades import DownloadFacade
+    success, error_key = await DownloadFacade.process_download_request(
+        query, url, query.data, context, processing_msg
+    )
+    if not success:
+        try:
+            await processing_msg.edit_text(t(error_key, user_id))
+        except Exception:
+            pass
+
+@register(lambda d: d.startswith("history_page_"))
+async def _cb_history_page(query, context):
+    # callback_data 格式: history_page_{user_id}_{page}
+    parts = query.data.split("_")
+    target_user_id = int(parts[2])
+    page = int(parts[3])
+
+    if query.from_user.id != target_user_id:
+        await query.answer("Not your history.", show_alert=True)
+        return
+
+    await query.answer()
+    await _send_history_page(query, target_user_id, page)
 
 def extract_url(text: str) -> str | None:
     """Extract first URL from text message."""
@@ -62,26 +160,33 @@ async def handle_link(update: Update, context: CallbackContext):
     user = update.message.from_user
     user_id = user.id
     track_user(user)
-    
-    allowed = get_allowed_users()
-    if allowed and user_id not in allowed:
+    await warm_user_lang(user_id)
+
+    if not is_user_allowed(user_id):
         await update.message.reply_text(t("not_authorized", user_id))
         return
     
-    allowed, reason = await rate_limiter.check_limit(user_id)
-    if not allowed:
+    can_download, reason = await rate_limiter.check_limit(user_id)
+    if not can_download:
         await update.message.reply_text(t("rate_limit_exceeded", user_id))
         return
     
     text = update.message.text.strip()
-    url = extract_url(text)
-    
-    if not url or not is_valid_url(url):
+
+    urls = [u for u in URL_PATTERN.findall(text) if is_valid_url(u)]
+
+    if not urls:
         await update.message.reply_text(t("unsupported_url", user_id))
         return
-    
-    log_user(update.message.from_user, "sent_link")
 
+    if len(urls) == 1:
+        await _handle_single_url(update, context, user_id, urls[0])
+        return
+
+    await _handle_batch_urls(update, context, user_id, urls)
+
+
+async def _handle_single_url(update, context, user_id, url):
     recent_download = await check_recent_download(url, max_age_hours=24)
     cached_file_path = None
     if recent_download:
@@ -90,8 +195,7 @@ async def handle_link(update: Update, context: CallbackContext):
         if file_size <= MAX_CACHE_SIZE:
             cached_file_path = file_path
     
-    context.user_data[f"pending_url_{user_id}"] = url
-    context.user_data[f"cached_file_{user_id}"] = cached_file_path
+    UserSession.set_pending(context, user_id, url, cached_file_path)
 
     cached_msg = f"\n\n{t('cached_file_used', user_id)}" if cached_file_path else ""
     
@@ -107,86 +211,55 @@ async def handle_link(update: Update, context: CallbackContext):
                 InlineKeyboardButton(t("video", user_id), callback_data="download_video"),
                 InlineKeyboardButton(t("audio", user_id), callback_data="download_audio"),
             ],
-            [InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail")],
+            [
+                InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail"),
+                InlineKeyboardButton("📝 " + t("subtitle", user_id), callback_data="download_subtitle"),
+            ],
         ]
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
         t("what_download", user_id) + cached_msg,
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+MAX_BATCH_SIZE = 5
+
+async def _handle_batch_urls(update, context, user_id, urls: list[str]):
+    if len(urls) > MAX_BATCH_SIZE:
+        await update.message.reply_text(
+            t("batch_limit_exceeded", user_id, max=MAX_BATCH_SIZE, count=len(urls))
+        )
+        urls = urls[:MAX_BATCH_SIZE]
+
+    await update.message.reply_text(
+        t("batch_start", user_id, count=len(urls))
+    )
+
+    for i, url in enumerate(urls, 1):
+        status_msg = await update.message.reply_text(
+            t("batch_item_queued", user_id, index=i, total=len(urls), url=url[:40])
+        )
+        from core.facades import DownloadFacade
+        await DownloadFacade.enqueue_silent(
+            user=update.message.from_user,
+            url=url,
+            download_type="audio",
+            status_msg=status_msg,
+            context=context,
+        )
 
 async def handle_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     if not query:
         return
-
     await query.answer()
-    
-    user_id = query.from_user.id
-    
-    if query.data.startswith("lang_"):
-        from core.i18n import set_user_lang as i18n_set_user_lang, LANGUAGES, t
-        lang_code = query.data.replace("lang_", "")
-        if lang_code in LANGUAGES:
-            await i18n_set_user_lang(user_id, lang_code)
-            await query.edit_message_text(t("language_changed", user_id))
-        return
-    
-    if query.data.startswith("uh_"):
-        from config import ADMIN_IDS
-        if ADMIN_IDS and user_id not in ADMIN_IDS:
-            await query.answer("Admin only.", show_alert=True)
-            return
-        target_id = int(query.data.replace("uh_", ""))
-        history = await get_user_history(target_id, limit=20)
-        if not history:
-            await query.edit_message_text(f"No history for user {target_id}.")
-            return
-        msg = f"Download history for user {target_id}:\n\n"
-        from datetime import datetime
-        for item in history:
-            dt = datetime.fromtimestamp(item["timestamp"])
-            status = "✅" if item.get("status") == "success" else "❌"
-            size = ""
-            if item.get("file_size"):
-                size = f" ({item['file_size'] // (1024*1024)}MB)"
-            msg += f"{status} {item['download_type']}{size}\n"
-            msg += f"   {item.get('title', 'N/A')[:40]}\n"
-            msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
-        await query.edit_message_text(msg)
-        return
-    
-    url = context.user_data.get(f"pending_url_{user_id}")
-    if not url:
-        try:
-            await query.edit_message_text(t("session_expired", user_id))
-        except Exception as e:
-            logger.debug(f"Failed to edit message: {e}")
-        return
 
-    if query.data == "download_video":
-        await show_quality_options(query, url)
-        return
-    
-    if query.data.startswith("quality_") or query.data in ("download_audio", "download_thumbnail"):
-        try:
-            processing_msg = await query.edit_message_text("Processing... Please wait.")
-        except Exception:
-            processing_msg = query.message
-        
-        from core.facades import DownloadFacade
-        success, error_key = await DownloadFacade.process_download_request(
-            query, url, query.data, context, processing_msg
-        )
-        
-        if not success:
-            try:
-                await processing_msg.edit_text(t(error_key, user_id))
-            except Exception:
-                pass
+    for matcher, handler in _CALLBACK_HANDLERS:
+        if matcher(query.data):
+            await handler(query, context)
+            return
+
+    logger.warning(f"Unhandled callback_data: {query.data}")
 
 
 async def show_quality_options(query, url):

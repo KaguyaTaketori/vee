@@ -4,18 +4,13 @@ import time
 import fcntl
 import threading
 import asyncio
+from filelock import FileLock
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+from core.utils import get_running_loop as _get_running_loop
 
 
 _executor = ThreadPoolExecutor(max_workers=4)
-
-
-def _get_running_loop():
-    try:
-        return asyncio.get_running_loop()
-    except RuntimeError:
-        return None
 
 
 class JsonStore:
@@ -39,12 +34,7 @@ class JsonStore:
             return {}
     
     def load(self) -> dict:
-        with self._cache_lock:
-            now = time.time()
-            if self._cache["data"] is None or now - self._cache["time"] > self.cache_ttl:
-                self._cache["data"] = self._load_unsafe()
-                self._cache["time"] = now
-            return self._cache["data"].copy()
+        return self._sync_load()
     
     async def load_async(self) -> dict:
         loop = _get_running_loop()
@@ -61,20 +51,13 @@ class JsonStore:
             return self._cache["data"].copy()
     
     def _save_unsafe(self, data: dict):
-        with open(self.lock_file, "w") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                with open(self.data_file, "w") as f:
-                    json.dump(data, f, indent=2)
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock = FileLock(self.lock_file, timeout=10)
+        with lock:
+            with open(self.data_file, "w") as f:
+                json.dump(data, f, indent=2)
     
     def persist(self):
-        with self._cache_lock:
-            if self._cache["dirty"]:
-                self._save_unsafe(self._cache["data"])
-                self._cache["dirty"] = False
-                self._last_persist = time.time()
+        self._sync_persist()
     
     async def persist_async(self):
         loop = _get_running_loop()

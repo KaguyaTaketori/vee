@@ -2,46 +2,97 @@ import logging
 import asyncio
 import uuid
 
-from config import get_allowed_users
+from services.user_service import get_allowed_users
 from core.ratelimit import rate_limiter
 from core.logger import log_user
 from core.strategies import StrategyFactory
-from core.queue import DownloadTask, DownloadStatus, download_queue
+from core.queue import download_queue
+from core.models import DownloadTask, DownloadStatus
 from core.i18n import t
+from core.utils import is_user_allowed
+from core.downloader import is_spotify_url
 
 logger = logging.getLogger(__name__)
 
 
 async def _execute_download_task(task: DownloadTask):
     """Executor function called by the queue worker."""
-    from core.i18n import t as _t
-    
     user_id = task.user_id
     url = task.url
-    download_type = task.download_type
-    
-    strategy_key = task.download_type
-    strategy = StrategyFactory.get(strategy_key)
+
+    strategy = StrategyFactory.get(task.download_type)
     if not strategy:
         task.status = DownloadStatus.FAILED
-        task.error = f"No strategy found: {strategy_key}"
+        task.error = f"No strategy found: {task.download_type}"
         return
     
     task.status = DownloadStatus.PROCESSING
-    
-    processing_msg = task._processing_msg
-    context = task._context
-    query = task._query
-    
-    try:
-        await strategy.execute(query, url, processing_msg, context)
-        task.status = DownloadStatus.COMPLETED
-    except Exception as e:
-        logger.error(f"Strategy execution failed: {type(e).__name__}: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+   
+    ctx = download_queue.get_task_context(task.task_id)
+    if not ctx:
         task.status = DownloadStatus.FAILED
-        task.error = str(e)
+        task.error = "Task context missing"
+        return
+    
+    processing_msg = ctx["processing_msg"]
+    context = ctx["context"]
+    query = ctx["query"]
+
+    cancel_event = download_queue.get_cancel_event(task.task_id)
+
+    strategy_future = asyncio.ensure_future(
+        strategy.execute(query, url, processing_msg, context)
+    )
+
+    if cancel_event:
+        cancel_future = asyncio.ensure_future(cancel_event.wait())
+    else:
+        cancel_future = asyncio.ensure_future(asyncio.sleep(float("inf")))
+
+    try:
+        done, pending = await asyncio.wait(
+            [strategy_future, cancel_future],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        strategy_future.cancel()
+        cancel_future.cancel()
+        task.status = DownloadStatus.CANCELLED
+        task.error = "Queue stopped"
+        try:
+            await processing_msg.edit_text(t("bot_shutting_down", task.user_id))
+        except Exception:
+            pass
+        return
+
+    for f in pending:
+        f.cancel()
+        try:
+            await f
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if cancel_future in done:
+        task.status = DownloadStatus.CANCELLED
+        logger.info(f"Task {task.task_id} cancelled by user {user_id}")
+        try:
+            await processing_msg.edit_text(t("download_cancelled", task.user_id))
+        except Exception:
+            pass
+
+    elif strategy_future in done:
+        exc = strategy_future.exception()
+        if exc:
+            logger.error(f"Strategy execution failed: {type(exc).__name__}: {exc}")
+            task.status = DownloadStatus.FAILED
+            task.error = str(exc)
+            try:
+                await processing_msg.edit_text(t("download_failed", user_id))
+            except Exception:
+                pass
+        else:
+            task.status = DownloadStatus.COMPLETED
+            logger.info(f"Task {task.task_id} completed successfully")
 
 
 class DownloadFacade:
@@ -72,8 +123,7 @@ class DownloadFacade:
         user = query.from_user
         user_id = user.id
         
-        allowed_users = get_allowed_users()
-        if user_id not in allowed_users:
+        if not is_user_allowed(user_id):
             logger.warning(f"Unauthorized user {user_id} attempted to download {url}")
             return False, "unauthorized"
         
@@ -105,11 +155,13 @@ class DownloadFacade:
                 download_type=download_type,
             )
             
-            task._query = query
-            task._processing_msg = processing_msg
-            task._context = context
+            telegram_ctx = {
+                "query": query,
+                "processing_msg": processing_msg,
+                "context": context,
+            }
             
-            await download_queue.add_task(task)
+            await download_queue.add_task(task, telegram_ctx)
             
             position = download_queue.get_queue_position(user_id)
             active = download_queue.get_active_count()
@@ -141,18 +193,49 @@ class DownloadFacade:
             "quality_best" -> "video_best"
             "spotify" -> "spotify"
         """
-        if callback_data in ("download_audio", "download_video", "download_thumbnail", "spotify"):
-            if callback_data == "download_audio" and url:
-                from core.downloader import is_spotify_url
-                if is_spotify_url(url):
-                    return "spotify"
-            return callback_data
-        
+        if callback_data == "download_audio" or is_spotify_url(url):
+            return "spotify" if is_spotify_url(url) else "audio"
+        if callback_data == "download_thumbnail":
+            return "thumbnail"
+        if callback_data == "download_subtitle":
+            return "subtitle"
         if callback_data.startswith("quality_"):
-            format_id = callback_data.replace("quality_", "")
-            return f"video_{format_id}"
-        
-        if callback_data.startswith("video_"):
-            return callback_data
-        
+            return "video"
+        if callback_data == "download_video":
+            return "video"
         return None
+
+    @staticmethod
+    async def enqueue_silent(user, url: str, download_type: str, status_msg, context):
+        user_id = user.id
+
+        strategy = StrategyFactory.get(download_type)
+        if not strategy:
+            await status_msg.edit_text(f"❌ Unsupported type: {download_type}")
+            return
+
+        task_id = str(uuid.uuid4())[:8]
+        task = DownloadTask(
+            task_id=task_id,
+            user_id=user_id,
+            url=url,
+            download_type=download_type,
+        )
+
+        class _SilentQuery:
+            from_user = user
+            message = status_msg
+
+            async def edit_message_text(self, text, **kwargs):
+                try:
+                    await status_msg.edit_text(text, **kwargs)
+                except Exception:
+                    pass
+
+        task_ctx = {
+            "query": _SilentQuery(),
+            "processing_msg": status_msg,
+            "context": context,
+        }
+        await download_queue.add_task(task, telegram_ctx=task_ctx)
+        log_user(user, f"batch_enqueue:{download_type}")

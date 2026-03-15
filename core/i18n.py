@@ -40,21 +40,24 @@ def _load_translations(lang: str) -> dict:
     
     return {}
 
+_lang_cache: dict[int, str] = {}
 
 def get_user_lang(user_id: int) -> str:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row and row[0]:
-                return row[0]
-    except Exception:
-        pass
-    return "en"
+    return _lang_cache.get(user_id, DEFAULT_LANG)
 
+async def warm_user_lang(user_id: int) -> str:
+    from core.db import get_db
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT lang FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            lang = row[0] if row and row[0] else DEFAULT_LANG
+    _lang_cache[user_id] = lang
+    return lang
 
 async def set_user_lang(user_id: int, lang: str):
+    _lang_cache[user_id] = lang
     from core import users
     await users.set_user_lang(user_id, lang)
 
@@ -111,26 +114,24 @@ def detect_system_lang(lang_code: str) -> str:
     return lang_map.get(primary, DEFAULT_LANG)
 
 
-def t(key: str, user_id: Optional[int] = None, lang: Optional[str] = None, **kwargs) -> str:
-    if lang:
-        pass
-    elif user_id:
-        lang = get_user_lang(user_id)
-        kwargs['user_id'] = user_id
-    else:
-        lang = DEFAULT_LANG
-    
-    translations = _load_translations(lang)
-    
-    nested = _get_nested(translations, key)
-    if nested:
-        text = nested
-    else:
-        default_translations = _load_translations(DEFAULT_LANG)
-        text = default_translations.get(key, key)
-    
-    return text.format(**kwargs)
+def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -> str:
+    if not lang:
+        lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
 
+    if user_id:
+        kwargs.setdefault('user_id', user_id)
+
+    translations = _load_translations(lang)
+    text = _get_nested(translations, key)
+
+    if not text:
+        text = _get_nested(_load_translations(DEFAULT_LANG), key) or key
+
+    try:
+        return text.format(**kwargs)
+    except KeyError as e:
+        logger.warning(f"Missing i18n placeholder {e} for key '{key}'")
+        return text
 
 def tp(key: str, count: int, user_id: Optional[int] = None, **kwargs) -> str:
     if user_id:

@@ -59,21 +59,21 @@ class DownloadStrategy(ABC):
         
         return await self._upload_new_file(query, filename, caption, url, user_id)
     
-    def _send_from_file_id(self, query, file_id: str, caption: str | None):
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
         """Override in subclass for type-specific sending."""
         raise NotImplementedError
     
-    def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
         """Upload new file and save to history."""
         raise NotImplementedError
     
-    def _validate_file_size(self, filename: str, processing_msg, user_id: int) -> bool:
+    async def _validate_file_size(self, filename: str, processing_msg, user_id: int) -> bool:
         """Check file size and delete if too large."""
         from core.i18n import t
         
         file_size = os.path.getsize(filename)
         if file_size > MAX_FILE_SIZE:
-            processing_msg.edit_text(
+            await processing_msg.edit_text(
                 t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
             )
             os.remove(filename)
@@ -111,7 +111,8 @@ class DownloadStrategy(ABC):
         else:
             try:
                 await processing_msg.edit_text(t("downloading", user_id))
-                progress_hook = _make_progress_hook(processing_msg)
+                loop = asyncio.get_running_loop()
+                progress_hook = _make_progress_hook(processing_msg, loop)
                 filename, info = await self._do_download(url, progress_hook)
             except Exception as e:
                 logger.error(f"Download failed: {type(e).__name__}: {e}")
@@ -126,7 +127,7 @@ class DownloadStrategy(ABC):
                 await add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
                 return
         
-        if not self._validate_file_size(filename, processing_msg, user_id):
+        if not await self._validate_file_size(filename, processing_msg, user_id):
             return
         
         title = info.get("title") if info else None
@@ -221,10 +222,9 @@ class SpotifyStrategy(AudioStrategy):
     def download_type(self) -> str:
         return "spotify"
     
-    async def _do_download(self, url: str, progress_hook):
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
         from core.downloader import download_spotify
-        return await download_spotify(url, progress_hook)
-
+        return await download_spotify(url, progress_hook=progress_hook)
 
 class ThumbnailStrategy(DownloadStrategy):
     @property
@@ -294,6 +294,36 @@ class VideoFormatStrategy(VideoStrategy):
         return await download_video(url, self._format_id, progress_hook)
 
 
+# core/strategies.py — 新增 SubtitleStrategy
+
+class SubtitleStrategy(DownloadStrategy):
+
+    SUPPORTED_LANGS = ["zh-Hans", "zh-Hant", "zh", "en", "ja", "ko"]
+
+    @property
+    def download_type(self) -> str:
+        return "subtitle"
+
+    @property
+    def telegram_method(self) -> str:
+        return "document"
+
+    def _get_caption(self, title: str, emoji: str = "📝") -> str | None:
+        return f"{emoji} {title}" if title else None
+
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_document(document=file_id, caption=caption)
+
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        with open(filename, "rb") as f:
+            sent = await query.message.reply_document(document=f, caption=caption)
+        return sent.document.file_id if sent.document else None
+
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+        from core.downloader import download_subtitle
+        return await download_subtitle(url, preferred_langs=self.SUPPORTED_LANGS)
+
+
 class StrategyFactory:
     """Factory for creating download strategies with lazy loading."""
     
@@ -303,6 +333,7 @@ class StrategyFactory:
         "download_audio": AudioStrategy,
         "download_thumbnail": ThumbnailStrategy,
         "spotify": SpotifyStrategy,
+        "subtitle": SubtitleStrategy,
     }
     
     @classmethod

@@ -1,26 +1,17 @@
 import asyncio
 import time
+from core.utils import format_bytes as _format_size
 from concurrent.futures import ThreadPoolExecutor
 
 download_executor = ThreadPoolExecutor(max_workers=10)
 
 
-def _format_size(bytes_val):
-    if bytes_val is None:
-        return "?"
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if bytes_val < 1024:
-            return f"{bytes_val:.1f}{unit}"
-        bytes_val /= 1024
-    return f"{bytes_val:.1f}TB"
-
-
 class ProgressTracker:
-    def __init__(self, processing_msg):
+    def __init__(self, processing_msg, loop: asyncio.AbstractEventLoop):
         self.msg = processing_msg
         self.last_text = None
         self.last_update = 0
-        self.loop = asyncio.get_event_loop()
+        self.loop = loop
         self.max_total = 0
     
     def update(self, text):
@@ -36,33 +27,50 @@ class ProgressTracker:
             except Exception:
                 pass
 
+def _make_progress_hook(processing_msg, loop: asyncio.AbstractEventLoop):
+    tracker = ProgressTracker(processing_msg, loop)
 
-def _make_progress_hook(processing_msg):
-    tracker = ProgressTracker(processing_msg)
     def progress_hook(d):
-        if d.get('status') == 'downloading':
-            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-            downloaded = d.get('downloaded_bytes', 0)
-            speed = d.get('speed', 0)
+        status = d.get("status")
+
+        if status == "downloading" and "downloaded_bytes" in d:
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed", 0)
 
             if total > tracker.max_total:
                 tracker.max_total = total
-
             display_total = tracker.max_total
-            
-            if total > 0:
-                percent = min(100, int(downloaded * 100 / display_total))
-                bar_length = 10
-                filled = int(bar_length * downloaded / display_total)
-                filled = max(0, min(bar_length, filled))
-                bar = "█" * filled + "░" * (bar_length - filled)
-                
-                speed_str = _format_size(speed) + "/s" if speed else ""
-                text = f"⬇️ Downloading...\n{bar} {percent}%\n{_format_size(downloaded)} / {_format_size(total)}"
-                if speed_str:
-                    text += f" • {speed_str}"
-                
+
+            if display_total > 0:
+                percent  = min(100, int(downloaded * 100 / display_total))
+                filled   = max(0, min(10, int(10 * downloaded / display_total)))
+                bar      = "█" * filled + "░" * (10 - filled)
+                speed_s  = f" • {_format_size(speed)}/s" if speed else ""
+                text = (
+                    f"⬇️ Downloading...\n"
+                    f"{bar} {percent}%\n"
+                    f"{_format_size(downloaded)} / {_format_size(display_total)}"
+                    f"{speed_s}"
+                )
                 tracker.update(text)
-        elif d.get('status') == 'finished':
+
+        elif status == "finished" and "downloaded_bytes" in d:
             tracker.update("✅ Download complete! Processing...")
+
+        elif status == "downloading" and "percent" in d:
+            percent = int(d["percent"])
+            filled  = max(0, min(10, percent // 10))
+            bar     = "█" * filled + "░" * (10 - filled)
+            title   = d.get("title", "")
+            title_s = f"\n🎵 {title[:30]}" if title else ""
+            text = (
+                f"⬇️ Downloading Spotify...{title_s}\n"
+                f"{bar} {percent}%"
+            )
+            tracker.update(text)
+
+        elif status == "finished" and "title" in d and "downloaded_bytes" not in d:
+            tracker.update(f"✅ Downloaded: {d.get('title', '')[:30]}")
+
     return progress_hook

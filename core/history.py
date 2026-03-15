@@ -1,9 +1,8 @@
 import os
 import time
 import logging
-import aiosqlite
 from typing import Optional
-from core.db import DB_PATH
+from core.db import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ async def add_history(user_id: int, url: str, download_type: str, file_size: Opt
                      file_id: Optional[str] = None):
     now = time.time()
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute(
             """
             INSERT INTO history (user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp)
@@ -53,8 +52,7 @@ async def add_history(user_id: int, url: str, download_type: str, file_size: Opt
 
 
 async def get_user_history(user_id: int, limit: int = 10) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_db() as db:
         async with db.execute(
             """
             SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
@@ -66,49 +64,61 @@ async def get_user_history(user_id: int, limit: int = 10) -> list:
             return [dict(row) for row in rows]
 
 
+async def get_user_history_page(user_id: int, page: int = 0, page_size: int = 5) -> tuple[list, int]:
+    offset = page * page_size
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,)
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
+        async with db.execute(
+            """
+            SELECT user_id, url, download_type, status, file_size, title,
+                   file_path, file_id, timestamp
+            FROM history WHERE user_id = ?
+            ORDER BY timestamp DESC LIMIT ? OFFSET ?
+            """,
+            (user_id, page_size, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    return [dict(r) for r in rows], total
+
+
 async def clear_user_history(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
         await db.commit()
 
 
 async def get_all_users_count() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT COUNT(DISTINCT user_id) FROM history") as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
 
 async def get_total_downloads() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT COUNT(*) FROM history") as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
 
 async def get_failed_downloads(user_id: Optional[int] = None, limit: int = 20) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        if user_id:
-            async with db.execute(
-                """
-                SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
-                FROM history WHERE user_id = ? AND status = 'failed' ORDER BY timestamp DESC LIMIT ?
-                """,
-                (user_id, limit)
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        else:
-            async with db.execute(
-                """
-                SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
-                FROM history WHERE status = 'failed' ORDER BY timestamp DESC LIMIT ?
-                """,
-                (limit,)
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+    sql = "SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp FROM history WHERE status = 'failed'"
+    params: tuple = ()
+    if user_id:
+        sql += " AND user_id = ?"
+        params = (user_id,)
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params += (limit,)
+
+    async with get_db() as db:
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 async def check_recent_download(url: str, max_age_hours: int = 24) -> Optional[dict]:
@@ -116,8 +126,7 @@ async def check_recent_download(url: str, max_age_hours: int = 24) -> Optional[d
     now = time.time()
     max_age_seconds = max_age_hours * 3600
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_db() as db:
         async with db.execute(
             """
             SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
@@ -142,7 +151,7 @@ async def get_file_id_by_url(url: str, max_age_hours: int = 168) -> Optional[str
     now = time.time()
     max_age_seconds = max_age_hours * 3600
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute(
             """
             SELECT file_id FROM history 
@@ -159,7 +168,7 @@ async def get_file_id_by_url(url: str, max_age_hours: int = 168) -> Optional[str
 
 async def clear_file_id_by_url(url: str):
     """Remove file_id from history entries for a URL, forcing re-download."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE history SET file_id = NULL WHERE url = ? AND file_id IS NOT NULL",
             (url,)
@@ -167,5 +176,3 @@ async def clear_file_id_by_url(url: str):
         await db.commit()
 
 
-async def force_persist():
-    pass

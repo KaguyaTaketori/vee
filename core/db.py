@@ -1,18 +1,25 @@
 import os
 import logging
 import aiosqlite
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "bot_data.db")
 
+@asynccontextmanager
+async def get_db():
+    """Context manager for database connections."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
 
 async def init_db():
     """Initialize database tables if they don't exist."""
     logger.info(f"Initializing database at {DB_PATH}")
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys=ON")
         
@@ -42,6 +49,51 @@ async def init_db():
                 timestamp REAL,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id     TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                url         TEXT NOT NULL,
+                download_type TEXT NOT NULL,
+                format_id   TEXT,
+                status      TEXT NOT NULL DEFAULT 'queued',
+                progress    REAL DEFAULT 0.0,
+                error       TEXT,
+                file_path   TEXT,
+                file_size   INTEGER,
+                retry_count INTEGER DEFAULT 0,
+                created_at  REAL NOT NULL,
+                started_at  REAL,
+                completed_at REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_rate_tiers (
+                user_id       INTEGER PRIMARY KEY,
+                tier          TEXT NOT NULL DEFAULT 'normal',
+                max_per_hour  INTEGER,      
+                note          TEXT,         
+                set_by        INTEGER,          
+                set_at        REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)
         """)
         
         await db.execute("""
@@ -76,7 +128,3 @@ async def init_db():
         
     logger.info("Database initialized successfully")
 
-
-async def get_db():
-    """Context manager for database connections."""
-    return aiosqlite.connect(DB_PATH)

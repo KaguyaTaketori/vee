@@ -109,6 +109,3 @@ def format_user_display(user: dict) -> str:
     name = " ".join(parts) if parts else f"User {user['user_id']}"
     return f"{name} (`{user['user_id']}`)"
 
-
-async def force_persist():
-    pass

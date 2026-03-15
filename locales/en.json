@@ -82,5 +82,15 @@
     "plural_files": "{count} file",
     "plural_files_plural": "{count} files",
     "plural_downloads": "{count} download",
-    "plural_downloads_plural": "{count} downloads"
+    "plural_downloads_plural": "{count} downloads",
+    "closed": "Closed.",
+    "task_not_found": "❌ Task not found or already completed.",
+    "cancel_own_only": "You can only cancel your own tasks.",
+    "task_cancelled": "✅ Task cancelled.",
+    "cancel_failed": "❌ Cancel failed. Task may already be completed.",
+    "no_active_tasks": "You have no active download tasks.",
+    "select_task_to_cancel": "Select a task to cancel:",
+    "processing": "Processing... Please wait.",
+    "bot_shutting_down": "⚠️ Bot is shutting down, download aborted.",
+    "download_cancelled": "❌ Download cancelled."
 }

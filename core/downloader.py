@@ -1,27 +1,32 @@
 import os
+import shlex
+import tempfile
+import shutil
 import logging
 import asyncio
 import subprocess
 import time
 import yt_dlp
 import httpx
+import re as _re
 from functools import lru_cache
+from urllib.parse import urlparse
+from core.utils import get_running_loop as _get_running_loop
 from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS, COOKIES_DIR
 
 logger = logging.getLogger(__name__)
 
 _cookie_last_refresh = 0
 
+_DOMAIN_COOKIE_MAP = {
+    "youtube.com":  "www.youtube.com_cookies.txt",
+    "youtu.be":     "www.youtube.com_cookies.txt",
+    "bilibili.com": "www.bilibili.com_cookies.txt",
+    "b23.tv":       "www.bilibili.com_cookies.txt",
+}
 
-def _get_running_loop():
-    try:
-        return asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            return asyncio.get_event_loop()
-        except RuntimeError:
-            return None
-
+_SPOTDL_PROGRESS_RE = _re.compile(r"(\d+)%\|")
+_SPOTDL_DONE_RE     = _re.compile(r'Downloaded\s+"(.+?)"')
 
 class YtDlpHelper:
     """Helper class to reduce duplicate yt-dlp configuration code."""
@@ -46,19 +51,21 @@ class YtDlpHelper:
         return opts
     
     def _get_cookie_file(self, url: str) -> str:
-        if "youtube.com" in url:
-            site_cookie = os.path.join(COOKIES_DIR, "www.youtube.com_cookies.txt")
-            if os.path.exists(site_cookie):
-                return site_cookie
-        elif "bilibili.com" in url or "b23.tv" in url:
-            site_cookie = os.path.join(COOKIES_DIR, "www.bilibili.com_cookies.txt")
-            if os.path.exists(site_cookie):
-                return site_cookie
-        
+        try:
+            netloc = urlparse(url).netloc.lower().removeprefix("www.")
+        except Exception:
+            netloc = ""
+
+        for domain, cookie_filename in _DOMAIN_COOKIE_MAP.items():
+            if netloc == domain or netloc.endswith(f".{domain}"):
+                site_cookie = os.path.join(COOKIES_DIR, cookie_filename)
+                if os.path.exists(site_cookie):
+                    return site_cookie
+
         if COOKIE_FILE and os.path.exists(COOKIE_FILE):
             return COOKIE_FILE
         return ""
-    
+
     def _add_extractor_headers(self, url, opts):
         if "bilibili.com" in url:
             opts["http_headers"] = {
@@ -76,24 +83,57 @@ class YtDlpHelper:
         return self.opts
     
     @staticmethod
-    def prepare_url(url: str) -> str:
+    async def prepare_url(url: str) -> str:
         """Common URL preprocessing: resolve short URLs and refresh cookies."""
-        loop = _get_running_loop()
-        if loop and loop.is_running():
-            asyncio.create_task(refresh_cookies_async())
-        else:
-            refresh_cookies()
-        return resolve_short_url(url)
+        await refresh_cookies_async()
+        return await resolve_short_url(url)
 
 
-def resolve_short_url(url: str) -> str:
+def _mask_url(url: str, max_path_len: int = 20) -> str:
+    try:
+        p = urlparse(url)
+        path = p.path[:max_path_len] + ("..." if len(p.path) > max_path_len else "")
+        return f"{p.scheme}://{p.netloc}{path}"
+    except Exception:
+        return "[invalid url]"
+
+def _build_aria2_cmd(
+    url: str,
+    output_dir: str,
+    output_file: str,
+    connections: int = ARIA2_CONNECTIONS,
+) -> list[str]:
+    return [
+        "aria2c",
+        "-x", str(connections),
+        "-s", str(connections),
+        "-d", output_dir,
+        "-o", output_file,
+        "--continue=true",
+        "--retry-wait=3",
+        "--max-tries=5",
+        url,
+    ]
+
+async def _run_aria2(cmd: list[str]) -> None:
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"aria2c failed: {stderr.decode()}")
+
+async def resolve_short_url(url: str) -> str:
     """Resolve short URLs (b23.tv, youtu.be, etc.) to full URLs."""
     short_domains = {"b23.tv", "youtu.be"}
     try:
         domain = url.split("/")[2].lower() if "://" in url else url.split("/")[0].lower()
         if any(d in domain for d in short_domains):
             logger.info(f"Resolving short URL: {url}")
-            response = httpx.head(url, follow_redirects=True, timeout=10)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+                response = await client.head(url)
             resolved = str(response.url)
             logger.info(f"Resolved to: {resolved}")
             return resolved
@@ -101,129 +141,106 @@ def resolve_short_url(url: str) -> str:
         logger.warning(f"Failed to resolve short URL {url}: {e}")
     return url
 
-
-def _get_bilibili_info(url: str) -> dict:
-    """Get video info from Bilibili API directly."""
-    import re
-    
-    bvid = None
-    if "b23.tv" in url:
-        resolved = resolve_short_url(url)
-        match = re.search(r'BV[\w]+', resolved)
-        if match:
-            bvid = match.group(0)
-    else:
-        match = re.search(r'BV[\w]+', url)
-        if match:
-            bvid = match.group(0)
-    
-    if not bvid:
-        return None
-    
-    api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.bilibili.com/",
-    }
-    
-    try:
-        response = httpx.get(api_url, headers=headers, timeout=10)
-        data = response.json()
-        if data.get("code") == 0:
-            return data.get("data")
-    except Exception as e:
-        logger.error(f"Bilibili API error: {e}")
-    
-    return None
-
-
-def refresh_cookies():
-    global _cookie_last_refresh
+def _should_refresh_cookies() -> bool:
     if not COOKIE_REFRESH_CMD or not COOKIE_FILE:
         return False
-    
-    if time.time() - _cookie_last_refresh < (COOKIE_REFRESH_INTERVAL_HOURS * 3600):
+    return time.time() - _cookie_last_refresh >= (COOKIE_REFRESH_INTERVAL_HOURS * 3600)
+
+def refresh_cookies() -> bool:
+    global _cookie_last_refresh
+    if not _should_refresh_cookies():
         return False
-    
+
     try:
         logger.info("Refreshing cookies...")
+        cmd = shlex.split(COOKIE_REFRESH_CMD)
         result = subprocess.run(
-            COOKIE_REFRESH_CMD,
-            shell=True,
+            cmd,
+            shell=False,
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            timeout=120
         )
         _cookie_last_refresh = time.time()
-        logger.info(f"Cookies refreshed successfully")
+        logger.info("Cookies refreshed successfully")
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to refresh cookies: {e.stderr}")
+        logger.error(f"Cookie refresh failed (exit {e.returncode}): {e.stderr[:200]}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Cookie refresh timed out after 120s")
+        return False
+    except Exception as e:
+        logger.error(f"Cookie refresh unexpected error: {e}")
         return False
 
 
-async def refresh_cookies_async():
+
+async def refresh_cookies_async() -> bool:
     global _cookie_last_refresh
-    if not COOKIE_REFRESH_CMD or not COOKIE_FILE:
+    if not _should_refresh_cookies():
         return False
-    
-    if time.time() - _cookie_last_refresh < (COOKIE_REFRESH_INTERVAL_HOURS * 3600):
-        return False
-    
+
     try:
         logger.info("Refreshing cookies (async)...")
-        process = await asyncio.create_subprocess_shell(
-            COOKIE_REFRESH_CMD,
+        cmd = shlex.split(COOKIE_REFRESH_CMD)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            logger.error(f"Failed to refresh cookies: {stderr.decode()}")
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            logger.error("Cookie refresh (async) timed out after 120s")
             return False
-        
+
+        if process.returncode != 0:
+            logger.error(f"Cookie refresh failed (exit {process.returncode}): "
+                         f"{stderr.decode()[:200]}")
+            return False
+
         _cookie_last_refresh = time.time()
-        logger.info(f"Cookies refreshed successfully")
+        logger.info("Cookies refreshed successfully (async)")
         return True
+
+    except FileNotFoundError:
+        logger.error(f"Cookie refresh command not found: {shlex.split(COOKIE_REFRESH_CMD)[0]}")
+        return False
     except Exception as e:
-        logger.error(f"Failed to refresh cookies: {e}")
+        logger.error(f"Cookie refresh (async) unexpected error: {e}")
         return False
 
 
-def _use_intl_api(url):
-    """Convert Bilibili URL to use international API."""
-    if "bilibili.com" in url and "b23.tv" not in url:
-        return url
-    return url
+_FORMATS_CACHE: dict[str, tuple] = {}
+_FORMATS_CACHE_MAX = 100
 
-
-_FORMATS_CACHE = {}
-
-async def get_formats_cached(url):
-    """Get formats with caching for improved performance."""
+async def get_formats_cached(url: str) -> tuple:
+    """Get formats with simple LRU-style cache."""
     if url in _FORMATS_CACHE:
         return _FORMATS_CACHE[url]
     
-    res = await get_formats(url)
-    _FORMATS_CACHE[url] = res
+    result = await get_formats(url)
+    _FORMATS_CACHE[url] = result
     
-    if len(_FORMATS_CACHE) > 100:
-        _FORMATS_CACHE.clear()
-        
-    return res
-
-
-async def get_formats_cached(url):
-    """Get formats with caching for improved performance."""
-    try:
-        return _cached_get_formats(url)
-    except Exception:
-        return await get_formats(url)
+    if len(_FORMATS_CACHE) > _FORMATS_CACHE_MAX:
+        keys_to_remove = list(_FORMATS_CACHE.keys())[:_FORMATS_CACHE_MAX // 2]
+        for k in keys_to_remove:
+            del _FORMATS_CACHE[k]
+    
+    return result
 
 
 async def get_formats(url):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     
     loop = _get_running_loop()
     def _get():
@@ -233,13 +250,14 @@ async def get_formats(url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             formats = info.get("formats") or []
-            logger.info(f"URL: {url}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
+            logger.info(f"URL: {_mask_url(url)}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
+            logger.debug(f"Full URL (debug only): {url}")
             return formats, info
     return await loop.run_in_executor(None, _get)
 
 
 async def download_video(url, format_id, progress_hook=None):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     
     needs_merging = format_id == "best" or "+" in str(format_id)
     
@@ -273,7 +291,7 @@ async def download_video(url, format_id, progress_hook=None):
             acodec = selected_format.get("acodec") if selected_format else None
             has_audio = acodec not in (None, "none") if acodec else False
             
-            logger.error(f"Format {format_id} selected: acodec={acodec}, has_audio={has_audio}")
+            logger.debug(f"Format {format_id} selected: acodec={acodec}, has_audio={has_audio}")
             
             if has_audio:
                 ydl_opts["format"] = format_id
@@ -295,9 +313,41 @@ async def download_video(url, format_id, progress_hook=None):
         return filename, info
     return await loop.run_in_executor(None, _download)
 
+async def download_subtitle(url: str, preferred_langs: list[str] | None = None) -> tuple[str, dict]:
+    url = await YtDlpHelper.prepare_url(url)
+    loop = _get_running_loop()
+
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts.update({
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "srt/vtt/best",
+            "outtmpl": get_temp_template(),
+        })
+
+        if preferred_langs:
+            ydl_opts["subtitleslangs"] = preferred_langs
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "subtitle")
+
+        for ext in ("srt", "vtt", "ass"):
+            for fname in os.listdir(TEMP_DIR):
+                if fname.startswith(BOT_FILE_PREFIX) and fname.endswith(f".{ext}"):
+                    full_path = os.path.join(TEMP_DIR, fname)
+                    if time.time() - os.path.getmtime(full_path) < 60:
+                        return full_path, info
+
+        raise RuntimeError("No subtitle file found. The video may not have subtitles.")
+
+    return await loop.run_in_executor(None, _download)
 
 async def download_audio(url, progress_hook=None):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     
     loop = _get_running_loop()
     def _download():
@@ -322,7 +372,7 @@ async def download_audio(url, progress_hook=None):
 
 
 async def get_thumbnail(url):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
@@ -334,7 +384,7 @@ async def get_thumbnail(url):
 
 
 async def get_images(url):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     loop = _get_running_loop()
     def _get():
         helper = YtDlpHelper(url)
@@ -355,47 +405,26 @@ async def get_images(url):
     return await loop.run_in_executor(None, _get)
 
 
-def is_aria2_available():
-    try:
-        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+_aria2_available: bool | None = None
+def is_aria2_available() -> bool:
+    global _aria2_available
+    if _aria2_available is None:
+        _aria2_available = shutil.which("aria2c") is not None
+    return _aria2_available
 
 
 async def download_with_aria2(url, filename, progress_hook=None, connections=16):
     if not is_aria2_available():
         raise RuntimeError("aria2c is not installed")
 
-    cmd = [
-        "aria2c",
-        "-x", str(connections),
-        "-s", str(connections),
-        "-d", os.path.dirname(filename),
-        "-o", os.path.basename(filename),
-        "--continue=true",
-        "--retry-wait=3",
-        "--max-tries=5",
-        url
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        logger.error(f"aria2c failed: {stderr.decode()}")
-        raise RuntimeError(f"aria2c download failed: {stderr.decode()}")
+    cmd = _build_aria2_cmd(direct_url, os.path.dirname(filename), os.path.basename(filename))
+    await _run_aria2(cmd)
 
     return filename
 
 
 async def get_direct_url(url, format_id=None):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     
     loop = _get_running_loop()
     def _get():
@@ -420,7 +449,7 @@ async def get_direct_url(url, format_id=None):
 
 
 async def download_video_aria2(url, format_id, progress_hook=None):
-    url = YtDlpHelper.prepare_url(url)
+    url = await YtDlpHelper.prepare_url(url)
     
     if not is_aria2_available():
         raise RuntimeError("aria2c is not installed")
@@ -478,29 +507,8 @@ async def download_video_aria2(url, format_id, progress_hook=None):
     if not direct_url:
         raise RuntimeError("Could not extract direct URL from video")
 
-    cmd = [
-        "aria2c",
-        "-x", str(ARIA2_CONNECTIONS),
-        "-s", str(ARIA2_CONNECTIONS),
-        "-d", os.path.dirname(filename),
-        "-o", os.path.basename(filename),
-        "--continue=true",
-        "--retry-wait=3",
-        "--max-tries=5",
-        direct_url
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        logger.error(f"aria2c failed: {stderr.decode()}")
-        raise RuntimeError(f"aria2c download failed: {stderr.decode()}")
+    cmd = _build_aria2_cmd(direct_url, os.path.dirname(filename), os.path.basename(filename))
+    await _run_aria2(cmd)
 
     return filename, info
 
@@ -508,51 +516,75 @@ async def download_video_aria2(url, format_id, progress_hook=None):
 def is_spotify_url(url: str) -> bool:
     return "spotify.com" in url.lower()
 
+async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
+    tmp_dir = tempfile.mkdtemp(dir=TEMP_DIR, prefix=f"{BOT_FILE_PREFIX}spotify_")
 
-async def download_spotify(url, progress_hook=None):
-    """Download Spotify track using spotDL."""
-    loop = _get_running_loop()
-    
-    def _download():
-        output_template = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}%(title)s.%(ext)s")
-        
-        cmd = [
-            "spotdl",
-            url,
-            "--output", TEMP_DIR,
-            "--format", "mp3",
-            "--bitrate", "320k",
-            "--overwrite", "force",
-        ]
-        
-        logger.info(f"Running spotdl: {' '.join(cmd)}")
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=TEMP_DIR
+    cmd = [
+        "spotdl", url,
+        "--output", tmp_dir,
+        "--format", "mp3",
+        "--bitrate", "320k",
+        "--overwrite", "force",
+        "--log-level", "INFO",
+    ]
+
+    logger.info(f"Running spotdl: {' '.join(cmd)}")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=tmp_dir,
         )
-        
-        if result.returncode != 0:
-            logger.error(f"spotdl failed: {result.stderr}")
-            raise RuntimeError(f"spotdl failed: {result.stderr}")
-        
-        import glob
-        pattern = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}*.mp3")
-        files = glob.glob(pattern)
-        
+
+        title = "Unknown"
+        last_percent = -1
+
+        async for raw_line in process.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            logger.debug(f"[spotdl] {line}")
+
+            m_done = _SPOTDL_DONE_RE.search(line)
+            if m_done:
+                title = m_done.group(1)
+                if progress_hook:
+                    progress_hook({"status": "finished", "title": title})
+                continue
+
+            m_pct = _SPOTDL_PROGRESS_RE.search(line)
+            if m_pct and progress_hook:
+                percent = int(m_pct.group(1))
+                if percent != last_percent:
+                    last_percent = percent
+                    progress_hook({
+                        "status": "downloading",
+                        "percent": float(percent),
+                        "title": title,
+                    })
+
+        await process.wait()
+
+        if process.returncode != 0:
+            raise RuntimeError(f"spotdl exited with code {process.returncode}")
+
+        files = [
+            os.path.join(tmp_dir, f)
+            for f in os.listdir(tmp_dir)
+            if f.endswith(".mp3")
+        ]
         if not files:
-            raise RuntimeError("spotdl didn't produce any output files")
-        
-        filename = max(files, key=os.path.getmtime)
-        
-        with open(filename, "rb") as f:
-            pass
-        
-        title = os.path.splitext(os.path.basename(filename))[0]
-        info = {"title": title, "url": url}
-        
-        return filename, info
-    
-    return await loop.run_in_executor(None, _download)
+            raise RuntimeError("spotdl produced no output files")
+
+        src  = max(files, key=os.path.getmtime)
+        dest = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}{os.path.basename(src)}")
+        shutil.move(src, dest)
+
+        title = title or os.path.splitext(os.path.basename(dest))[0]
+        return dest, {"title": title, "url": url}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

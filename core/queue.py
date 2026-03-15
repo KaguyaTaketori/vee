@@ -1,37 +1,14 @@
+import logging
 import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, TypedDict, Any
 from telegram import Bot
+from core.task_store import persist_task
+from core.models import DownloadTask, DownloadStatus, STATUS_EMOJI, TaskContext
 
-
-class DownloadStatus(Enum):
-    QUEUED = "queued"
-    DOWNLOADING = "downloading"
-    PROCESSING = "processing"
-    UPLOADING = "uploading"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-@dataclass
-class DownloadTask:
-    task_id: str
-    user_id: int
-    url: str
-    download_type: str
-    format_id: Optional[str] = None
-    status: DownloadStatus = DownloadStatus.QUEUED
-    progress: float = 0.0
-    created_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    error: Optional[str] = None
-    file_path: Optional[str] = None
-    file_size: Optional[int] = None
-
+logger = logging.getLogger(__name__)
 
 class DownloadQueue:
     def __init__(self, max_concurrent: int = 3, max_completed_tasks: int = 100):
@@ -43,9 +20,10 @@ class DownloadQueue:
         self.user_downloads: dict[int, set[str]] = {}
         self._workers: list[asyncio.Task] = []
         self._running = False
-        self._cancel_event: Optional[asyncio.Event] = None
+        self._cancel_events: dict[str, asyncio.Event] = {}
         self._executor: Optional[Callable] = None
         self._pending_user_tasks: dict[int, list[str]] = {}
+        self._task_contexts: dict[str, TaskContext] = {}
     
     def set_executor(self, executor: Callable):
         """Set the async function to execute when processing a task.
@@ -80,46 +58,101 @@ class DownloadQueue:
             except asyncio.CancelledError:
                 break
 
+    def get_task_context(self, task_id: str) -> Optional[TaskContext]:
+        return self._task_contexts.get(task_id)
+
+    def _finalize_task(self, task: DownloadTask, status: DownloadStatus, error: str = None):
+        task.status = status
+        task.completed_at = time.time()
+        if error:
+            task.error = error
+        self.completed_tasks[task.task_id] = task
+        self.active_tasks.pop(task.task_id, None)
+        self._task_contexts.pop(task.task_id, None)
+        self._cleanup_completed()
+        self._cancel_events.pop(task.task_id, None)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(persist_task(task))
+        except RuntimeError:
+            pass
+
     async def _process_task(self, task: DownloadTask):
         task.status = DownloadStatus.DOWNLOADING
         task.started_at = time.time()
         self.active_tasks[task.task_id] = task
-        
-        if task.user_id in self._pending_user_tasks and task.task_id in self._pending_user_tasks[task.user_id]:
-            self._pending_user_tasks[task.user_id].remove(task.task_id)
-        
-        if self._executor:
+        await persist_task(task)
+
+        user_pending = self._pending_user_tasks.get(task.user_id, [])
+        if task.task_id in user_pending:
+            user_pending.remove(task.task_id)
+
+        if not self._executor:
+            self._finalize_task(task, DownloadStatus.FAILED, "No executor configured")
+            return
+
+        last_error = None
+        for attempt in range(task.max_retries + 1):
+            if attempt > 0:
+                logger.info(
+                    f"Retrying task {task.task_id} "
+                    f"(attempt {attempt}/{task.max_retries}, delay={task.retry_delay}s)"
+                )
+                await asyncio.sleep(task.retry_delay * attempt)
+                task.retry_count = attempt
+                await persist_task(task)
+
+                ctx = self.get_task_context(task.task_id)
+                if ctx:
+                    try:
+                        await ctx["processing_msg"].edit_text(
+                            f"🔄 Retrying... (attempt {attempt}/{task.max_retries})"
+                        )
+                    except Exception:
+                        pass
+
             try:
                 await self._executor(task)
+                if task.status not in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+                    self._finalize_task(task, DownloadStatus.COMPLETED)
+                elif task.status == DownloadStatus.FAILED and attempt < task.max_retries:
+                    last_error = task.error
+                    task.status = DownloadStatus.DOWNLOADING
+                    continue
+                else:
+                    self._finalize_task(task, task.status, task.error)
+                return
             except Exception as e:
-                task.status = DownloadStatus.FAILED
-                task.error = str(e)
-                task.completed_at = time.time()
-                self.completed_tasks[task.task_id] = task
-                if task.task_id in self.active_tasks:
-                    del self.active_tasks[task.task_id]
-                self._cleanup_completed()
-        else:
-            task.status = DownloadStatus.FAILED
-            task.error = "No executor configured"
-            task.completed_at = time.time()
-            self.completed_tasks[task.task_id] = task
-            if task.task_id in self.active_tasks:
-                del self.active_tasks[task.task_id]
-            self._cleanup_completed()
+                last_error = str(e)
+                logger.warning(f"Task {task.task_id} attempt {attempt} failed: {e}")
+                if attempt >= task.max_retries:
+                    break
 
-    async def add_task(self, task: DownloadTask) -> str:
+        logger.error(f"Task {task.task_id} failed after {task.max_retries} retries: {last_error}")
+        self._finalize_task(task, DownloadStatus.FAILED, f"Failed after {task.max_retries} retries: {last_error}")
+
+    async def add_task(self, task: DownloadTask, telegram_ctx: TaskContext = None) -> str:
         await self.queue.put(task)
         if task.user_id not in self.user_downloads:
             self.user_downloads[task.user_id] = set()
         self.user_downloads[task.user_id].add(task.task_id)
+
         if task.user_id not in self._pending_user_tasks:
             self._pending_user_tasks[task.user_id] = []
         self._pending_user_tasks[task.user_id].append(task.task_id)
+
+        if telegram_ctx is not None:
+            self._task_contexts[task.task_id] = telegram_ctx
+        
+        self._cancel_events[task.task_id] = asyncio.Event()
         return task.task_id
 
     def get_task(self, task_id: str) -> Optional[DownloadTask]:
         return self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
+
+    def get_cancel_event(self, task_id: str) -> Optional[asyncio.Event]:
+        return self._cancel_events.get(task_id)
 
     def get_user_tasks(self, user_id: int) -> list[DownloadTask]:
         task_ids = self.user_downloads.get(user_id, set())
@@ -142,16 +175,49 @@ class DownloadQueue:
         """Get number of currently active tasks."""
         return len(self.active_tasks)
 
-    def cancel_task(self, task_id: str) -> bool:
+    async def cancel_active_task(self, task_id: str) -> bool:
         task = self.active_tasks.get(task_id)
-        if task and task.status == DownloadStatus.QUEUED:
-            task.status = DownloadStatus.CANCELLED
-            task.completed_at = time.time()
-            self.completed_tasks[task_id] = task
-            del self.active_tasks[task_id]
-            self._cleanup_completed()
-            return True
-        return False
+        if not task:
+            return False
+        
+        event = self._cancel_events.get(task_id)
+        if event:
+            event.set()
+        return True
+
+    async def cancel_queued_task(self, task_id: str) -> bool:
+        remaining = []
+        cancelled = False
+        
+        while not self.queue.empty():
+            try:
+                task = self.queue.get_nowait()
+                if task.task_id == task_id:
+                    task.status = DownloadStatus.CANCELLED
+                    task.completed_at = time.time()
+                    self.completed_tasks[task_id] = task
+                    self._task_contexts.pop(task_id, None)
+                    cancelled = True
+                else:
+                    remaining.append(task)
+            except asyncio.QueueEmpty:
+                break
+    
+        for t in remaining:
+            await self.queue.put(t)
+    
+        if cancelled:
+            user_pending = self._pending_user_tasks.get(task.user_id, [])
+            if task_id in user_pending:
+                user_pending.remove(task_id)
+    
+        return cancelled
+
+    async def cancel_task(self, task_id: str) -> bool:
+        if task_id in self.active_tasks:
+            return await self.cancel_active_task(task_id)
+        
+        return await self.cancel_queued_task(task_id)
 
     def complete_task(self, task: DownloadTask):
         task.status = DownloadStatus.COMPLETED

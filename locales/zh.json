@@ -81,5 +81,20 @@
     "plural_files": "{count} 个文件",
     "plural_files_plural": "{count} 个文件",
     "plural_downloads": "{count} 次下载",
-    "plural_downloads_plural": "{count} 次下载"
+    "plural_downloads_plural": "{count} 次下载",
+    "closed": "已关闭。",
+    "task_not_found": "❌ 任务不存在或已完成。",
+    "cancel_own_only": "你只能取消自己的任务。",
+    "task_cancelled": "✅ 任务已取消。",
+    "cancel_failed": "❌ 取消失败，任务可能已完成或状态已变更。",
+    "no_active_tasks": "你目前没有进行中的下载任务。",
+    "select_task_to_cancel": "选择要取消的任务：",
+    "processing": "Processing... Please wait.",
+    "bot_shutting_down": "⚠️ Bot 正在关闭，下载已中止。",
+    "download_cancelled": "❌ 下载已取消。",
+    "batch_limit_exceeded": "⚠️ 最多支持 {max} 个 URL，已自动截取前 {max} 个（共 {count} 个）",
+    "batch_start": "📥 检测到 {count} 个链接，开始批量下载...",
+    "batch_item_queued": "[{index}/{total}] 已加入队列：\n{url}...",
+    "history_header": "📋 下载历史（第 {page}/{total_pages} 页，共 {count} 条）\n\n",
+    "no_history": "暂无下载记录。"
 }

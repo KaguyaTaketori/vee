@@ -5,8 +5,8 @@ import logging
 import aiosqlite
 from dataclasses import dataclass
 from typing import Optional
-
-from core.db import DB_PATH
+from config import RATE_TIER_LIMITS, ADMIN_IDS
+from core.db import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,55 @@ def save_rate_limit(max_downloads: int, enabled: bool):
         json.dump({"max_downloads_per_hour": max_downloads, "enabled": enabled}, f)
 
 
+async def get_user_tier(user_id: int) -> str:
+    """查询用户等级，默认 normal。"""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT tier FROM user_rate_tiers WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else "normal"
+
+
+async def get_user_limit(user_id: int) -> int:
+    if ADMIN_IDS and user_id in ADMIN_IDS:
+        return 999999
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT tier, max_per_hour FROM user_rate_tiers WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if row:
+        tier, custom_max = row
+        if custom_max is not None:
+            return custom_max                       
+        return RATE_TIER_LIMITS.get(tier, RATE_TIER_LIMITS["normal"])
+
+    return RATE_TIER_LIMITS["normal"]
+
+
+async def set_user_tier(user_id: int, tier: str, note: str = "", set_by: int = None, custom_max: int = None):
+    import time
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO user_rate_tiers (user_id, tier, max_per_hour, note, set_by, set_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                tier         = excluded.tier,
+                max_per_hour = excluded.max_per_hour,
+                note         = excluded.note,
+                set_by       = excluded.set_by,
+                set_at       = excluded.set_at
+            """,
+            (user_id, tier, custom_max, note, set_by, time.time()),
+        )
+        await db.commit()
+
+
 class RateLimiter:
     def __init__(self):
         config = load_rate_limit()
@@ -41,42 +90,44 @@ class RateLimiter:
     async def check_limit(self, user_id: int) -> tuple[bool, Optional[str]]:
         if not self.enabled:
             return True, None
-            
+
+        user_max = await get_user_limit(user_id)
+
+        if user_max == 999999:
+            return True, None
+        if user_max == 0:
+            return False, "Your account has been suspended."
+
         now = time.time()
         window = 3600
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO rate_limit (user_id, timestamp) VALUES (?, ?)",
-                (user_id, now)
-            )
-            await db.commit()
-            
-            await db.execute(
-                "DELETE FROM rate_limit WHERE timestamp < ?",
-                (now - window,)
-            )
-            await db.commit()
-            
-            async with db.execute(
-                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
-                (user_id, now - window)
-            ) as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
-            
-            if count >= self.max_downloads_per_hour:
+
+        async with get_db() as db:
+            await db.execute("BEGIN IMMEDIATE")   # 独占锁，消除竞态
+            try:
+                await db.execute(
+                    "DELETE FROM rate_limit WHERE timestamp < ?", (now - window,)
+                )
                 async with db.execute(
-                    "SELECT timestamp FROM rate_limit WHERE user_id = ? ORDER BY timestamp ASC LIMIT 1",
-                    (user_id,)
+                    "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                    (user_id, now - window),
                 ) as cursor:
                     row = await cursor.fetchone()
-                    if row:
-                        wait_time = int(window - (now - row[0]) + 60)
-                        return False, f"Rate limit exceeded. Try again in {wait_time // 60} minutes."
-                return False, "Rate limit exceeded. Try again later."
-            
-            return True, None
+                    count = row[0] if row else 0
+
+                if count >= user_max:
+                    await db.execute("ROLLBACK")
+                    remaining_secs = int(window - (now - (now - window)))
+                    return False, f"Rate limit exceeded ({count}/{user_max} per hour)."
+
+                await db.execute(
+                    "INSERT INTO rate_limit (user_id, timestamp) VALUES (?, ?)",
+                    (user_id, now),
+                )
+                await db.commit()
+                return True, None
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
 
     async def get_remaining(self, user_id: int) -> int:
         if not self.enabled:
@@ -84,7 +135,7 @@ class RateLimiter:
         now = time.time()
         window = 3600
         
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
                 (user_id, now - window)
@@ -95,7 +146,7 @@ class RateLimiter:
         return max(0, self.max_downloads_per_hour - count)
 
     async def reset(self, user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             await db.execute("DELETE FROM rate_limit WHERE user_id = ?", (user_id,))
             await db.commit()
 
@@ -105,6 +156,22 @@ class RateLimiter:
             "enabled": self.enabled,
             "active_users": 0
         }
+
+    async def get_remaining(self, user_id: int) -> int:
+        user_max = await get_user_limit(user_id)
+        if user_max >= 999999:
+            return 999
+        if user_max == 0:
+            return 0
+        now = time.time()
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                (user_id, now - 3600),
+            ) as cur:
+                row = await cur.fetchone()
+                count = row[0] if row else 0
+        return max(0, user_max - count)
 
 
 rate_limiter = RateLimiter()
