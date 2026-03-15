@@ -3,13 +3,13 @@ import asyncio
 import uuid
 
 from services.user_service import get_allowed_users
-from core.ratelimit import rate_limiter
-from core.logger import log_user
+from services.ratelimit import rate_limiter
+from utils.logger import log_user
 from core.strategies import StrategyFactory
-from core.queue import download_queue
-from core.models import DownloadTask, DownloadStatus
-from core.i18n import t
-from core.utils import is_user_allowed
+from services.queue import download_queue
+from models.domain_models import DownloadTask, DownloadStatus
+from utils.i18n import t
+from utils.utils import is_user_allowed
 from core.downloader import is_spotify_url
 
 logger = logging.getLogger(__name__)

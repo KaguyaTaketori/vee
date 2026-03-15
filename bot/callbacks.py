@@ -9,14 +9,14 @@ from telegram.ext import CallbackContext
 
 from config import MAX_CACHE_SIZE, MAX_FILE_SIZE, ADMIN_IDS
 from services.user_service import track_user, get_allowed_users
-from core.ratelimit import rate_limiter
-from core.logger import log_user
-from core.history import check_recent_download, get_user_history
-from core.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
+from services.ratelimit import rate_limiter
+from utils.logger import log_user
+from database.history import check_recent_download, get_user_history
+from utils.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
 from core.downloader import get_formats, is_spotify_url
-from core.utils import format_history_item, is_user_allowed
-from core.session import UserSession
-from core.queue import download_queue
+from utils.utils import format_history_item, is_user_allowed
+from services.session import UserSession
+from services.queue import download_queue
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ async def _cb_download(query, context):
         processing_msg = await query.edit_message_text(t("processing", user_id))
     except Exception:
         processing_msg = query.message
-    from core.facades import DownloadFacade
+    from services.facades import DownloadFacade
     success, error_key = await DownloadFacade.process_download_request(
         query, url, query.data, context, processing_msg
     )
@@ -239,7 +239,7 @@ async def _handle_batch_urls(update, context, user_id, urls: list[str]):
         status_msg = await update.message.reply_text(
             t("batch_item_queued", user_id, index=i, total=len(urls), url=url[:40])
         )
-        from core.facades import DownloadFacade
+        from services.facades import DownloadFacade
         await DownloadFacade.enqueue_silent(
             user=update.message.from_user,
             url=url,

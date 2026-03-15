@@ -6,7 +6,7 @@ import aiosqlite
 from dataclasses import dataclass
 from typing import Optional
 from config import RATE_TIER_LIMITS, ADMIN_IDS
-from core.db import get_db
+from database.db import get_db
 
 logger = logging.getLogger(__name__)
 

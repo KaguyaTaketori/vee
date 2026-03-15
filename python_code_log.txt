@@ -1,0 +1,4509 @@
+========================================
+FILE: ./app/__init__.py
+========================================
+
+========================================
+FILE: ./app/callbacks.py
+========================================
+import os
+import asyncio
+import logging
+import re
+from urllib.parse import urlparse
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackContext
+
+from config import MAX_CACHE_SIZE, MAX_FILE_SIZE, ADMIN_IDS
+from services.user_service import track_user, get_allowed_users
+from core.ratelimit import rate_limiter
+from core.logger import log_user
+from core.history import check_recent_download, get_user_history
+from core.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
+from core.downloader import get_formats, is_spotify_url
+from core.utils import format_history_item, is_user_allowed
+from core.session import UserSession
+from core.queue import download_queue
+
+logger = logging.getLogger(__name__)
+
+URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+
+SUPPORTED_DOMAINS = {
+    "youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com",
+    "instagram.com", "twitter.com", "x.com",
+    "tiktok.com", "facebook.com", "reddit.com",
+    "vk.com", "snapchat.com", "tumblr.com",
+    "pin.it", "threads.net",
+    "bilibili.com", "b23.tv",
+    "spotify.com", "open.spotify.com",
+}
+
+ALLOWED_URL_PATTERN = re.compile(
+    r'^https?://'
+    r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'
+    r'localhost|'
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+    r'(?::\d+)?'
+    r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
+_CALLBACK_HANDLERS: list[tuple[callable, callable]] = []
+
+def register(matcher: callable):
+    def decorator(func: callable):
+        _CALLBACK_HANDLERS.append((matcher, func))
+        return func
+    return decorator
+
+@register(lambda d: d.startswith("lang_"))
+async def _cb_lang(query, context):
+    lang_code = query.data.replace("lang_", "")
+    if lang_code in LANGUAGES:
+        await i18n_set_user_lang(query.from_user.id, lang_code)
+        await query.edit_message_text(t("language_changed", query.from_user.id))
+
+
+
+@register(lambda d: d.startswith("uh_"))
+async def _cb_admin_history(query, context):
+    user_id = query.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    target_id = int(query.data.replace("uh_", ""))
+    history = await get_user_history(target_id, limit=20)
+    msg = format_history_list(history, f"Download history for user {target_id}:\n\n")
+    await query.edit_message_text(msg)
+
+@register(lambda d: d == "cancel_menu_close")
+async def _cb_cancel_close(query, context):
+    try:
+        await query.delete_message()
+    except Exception:
+        await query.edit_message_text(t("closed", query.from_user.id))
+
+
+@register(lambda d: d.startswith("cancel_task_"))
+async def _cb_cancel_task(query, context):
+    user_id = query.from_user.id
+    task_id = query.data.replace("cancel_task_", "")
+    task = download_queue.get_task(task_id)
+    if not task:
+        await query.edit_message_text(t("task_not_found", user_id))
+        return
+    is_admin = user_id in ADMIN_IDS if ADMIN_IDS else False
+    if task.user_id != user_id and not is_admin:
+        await query.answer(t("cancel_own_only", user_id), show_alert=True)
+        return
+    success = await download_queue.cancel_task(task_id)
+    key = "task_cancelled" if success else "cancel_failed"
+    await query.edit_message_text(t(key, user_id))
+
+@register(lambda d: d == "download_video")
+async def _cb_download_video(query, context):
+    url = UserSession.get_pending_url(context, query.from_user.id)
+    if url:
+        await show_quality_options(query, url)
+
+
+@register(lambda d: d.startswith("quality_") or d in ("download_audio", "download_thumbnail"))
+async def _cb_download(query, context):
+    user_id = query.from_user.id
+    url = UserSession.get_pending_url(context, user_id)
+    if not url:
+        await query.edit_message_text(t("session_expired", user_id))
+        return
+    try:
+        processing_msg = await query.edit_message_text(t("processing", user_id))
+    except Exception:
+        processing_msg = query.message
+    from core.facades import DownloadFacade
+    success, error_key = await DownloadFacade.process_download_request(
+        query, url, query.data, context, processing_msg
+    )
+    if not success:
+        try:
+            await processing_msg.edit_text(t(error_key, user_id))
+        except Exception:
+            pass
+
+@register(lambda d: d.startswith("history_page_"))
+async def _cb_history_page(query, context):
+    # callback_data 格式: history_page_{user_id}_{page}
+    parts = query.data.split("_")
+    target_user_id = int(parts[2])
+    page = int(parts[3])
+
+    if query.from_user.id != target_user_id:
+        await query.answer("Not your history.", show_alert=True)
+        return
+
+    await query.answer()
+    await _send_history_page(query, target_user_id, page)
+
+def extract_url(text: str) -> str | None:
+    """Extract first URL from text message."""
+    match = URL_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
+def is_valid_url(url: str) -> bool:
+    if not ALLOWED_URL_PATTERN.match(url):
+        return False
+    try:
+        domain = urlparse(url).netloc.lower()
+        domain = domain.replace("www.", "")
+        if not any(domain.endswith(d) or domain == d for d in SUPPORTED_DOMAINS):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def handle_link(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    user = update.message.from_user
+    user_id = user.id
+    track_user(user)
+    await warm_user_lang(user_id)
+
+    if not is_user_allowed(user_id):
+        await update.message.reply_text(t("not_authorized", user_id))
+        return
+    
+    can_download, reason = await rate_limiter.check_limit(user_id)
+    if not can_download:
+        await update.message.reply_text(t("rate_limit_exceeded", user_id))
+        return
+    
+    text = update.message.text.strip()
+
+    urls = [u for u in URL_PATTERN.findall(text) if is_valid_url(u)]
+
+    if not urls:
+        await update.message.reply_text(t("unsupported_url", user_id))
+        return
+
+    if len(urls) == 1:
+        await _handle_single_url(update, context, user_id, urls[0])
+        return
+
+    await _handle_batch_urls(update, context, user_id, urls)
+
+
+async def _handle_single_url(update, context, user_id, url):
+    recent_download = await check_recent_download(url, max_age_hours=24)
+    cached_file_path = None
+    if recent_download:
+        file_path = recent_download.get("file_path")
+        file_size = os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0
+        if file_size <= MAX_CACHE_SIZE:
+            cached_file_path = file_path
+    
+    UserSession.set_pending(context, user_id, url, cached_file_path)
+
+    cached_msg = f"\n\n{t('cached_file_used', user_id)}" if cached_file_path else ""
+    
+    is_spotify = is_spotify_url(url)
+    
+    if is_spotify:
+        keyboard = [
+            [InlineKeyboardButton("🎵 Download MP3 (320k)", callback_data="download_audio")],
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton(t("video", user_id), callback_data="download_video"),
+                InlineKeyboardButton(t("audio", user_id), callback_data="download_audio"),
+            ],
+            [
+                InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail"),
+                InlineKeyboardButton("📝 " + t("subtitle", user_id), callback_data="download_subtitle"),
+            ],
+        ]
+    
+    await update.message.reply_text(
+        t("what_download", user_id) + cached_msg,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+MAX_BATCH_SIZE = 5
+
+async def _handle_batch_urls(update, context, user_id, urls: list[str]):
+    if len(urls) > MAX_BATCH_SIZE:
+        await update.message.reply_text(
+            t("batch_limit_exceeded", user_id, max=MAX_BATCH_SIZE, count=len(urls))
+        )
+        urls = urls[:MAX_BATCH_SIZE]
+
+    await update.message.reply_text(
+        t("batch_start", user_id, count=len(urls))
+    )
+
+    for i, url in enumerate(urls, 1):
+        status_msg = await update.message.reply_text(
+            t("batch_item_queued", user_id, index=i, total=len(urls), url=url[:40])
+        )
+        from core.facades import DownloadFacade
+        await DownloadFacade.enqueue_silent(
+            user=update.message.from_user,
+            url=url,
+            download_type="audio",
+            status_msg=status_msg,
+            context=context,
+        )
+
+async def handle_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    for matcher, handler in _CALLBACK_HANDLERS:
+        if matcher(query.data):
+            await handler(query, context)
+            return
+
+    logger.warning(f"Unhandled callback_data: {query.data}")
+
+
+async def show_quality_options(query, url):
+    user_id = query.from_user.id
+    try:
+        await query.edit_message_text(t("loading_quality", user_id))
+    except Exception as e:
+        logger.debug(f"Error editing message: {e}")
+    
+    formats, info = await get_formats(url)
+    logger.info(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")
+
+    resolutions = {}
+    for f in formats:
+        height = f.get("height")
+        filesize = f.get("filesize") or f.get("filesize_approx", 0)
+        acodec = f.get("acodec", "none")
+        has_audio = acodec and acodec != "none"
+        if height and height in [2160, 1440, 1080, 720, 480, 360, 240]:
+            if height not in resolutions:
+                resolutions[height] = (f.get("format_id"), has_audio)
+            elif filesize and filesize < MAX_FILE_SIZE:
+                current = resolutions.get(height)
+                if current and not current[1] and has_audio:
+                    resolutions[height] = (f.get("format_id"), has_audio)
+
+    keyboard = []
+    priority = [1080, 720, 480, 360, 240, 2160, 1440]
+    
+    for height in priority:
+        if height in resolutions:
+            format_data = resolutions[height]
+            format_id = format_data[0] if isinstance(format_data, tuple) else format_data
+            label = f"{height}p HD" if height >= 720 else f"{height}p"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"quality_{format_id}")])
+    
+    keyboard.append([InlineKeyboardButton("⭐ Best Quality (Auto)", callback_data="quality_best")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    title = info.get("title") or "this video"
+    try:
+        await query.edit_message_text(t("select_quality", user_id, title=title[:50]), reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+
+========================================
+FILE: ./app/commands.py
+========================================
+import os
+import psutil
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackContext
+from functools import wraps
+
+from config import ADMIN_IDS, get_config, TEMP_DIR, BOT_FILE_PREFIX
+from services.user_service import get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, cleanup_temp_files
+from core.db import get_db
+from core.logger import log_user, get_user_stats
+from core.history import clear_file_id_by_url,  get_user_history, get_user_history_page, get_all_users_count, get_total_downloads, get_failed_downloads
+from core.queue import download_queue
+from core.models import DownloadStatus, STATUS_EMOJI
+from core.ratelimit import rate_limiter, save_rate_limit
+from core.i18n import t, set_user_lang, LANGUAGES
+from core.utils import require_admin, check_admin, scan_temp_files, format_bytes, format_history_list, format_history_item
+
+logger = logging.getLogger(__name__)
+
+
+async def start_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    track_user(update.message.from_user)
+    log_user(update.message.from_user, "start")
+    user = update.message.from_user
+    await update.message.reply_text(t("welcome", user.id))
+
+
+async def myid_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user = update.message.from_user
+    await update.message.reply_text(t("your_id", user.id, username=user.username or "N/A", name=f"{user.first_name} {user.last_name or ''}"), parse_mode="Markdown")
+
+
+async def help_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    is_admin = user_id in ADMIN_IDS if ADMIN_IDS else False
+    
+    if is_admin:
+        await update.message.reply_text(t("admin_commands", user_id))
+    else:
+        await update.message.reply_text(t("available_commands", user_id))
+
+
+async def tasks_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    from core.task_store import get_user_tasks
+
+    records = await get_user_tasks(user_id, limit=10)
+    if not records:
+        await update.message.reply_text(t("no_tasks", user_id))
+        return
+
+    STATUS_EMOJI = {
+        "queued":      "⏳", "downloading": "⬇️",
+        "processing":  "⚙️", "uploading":   "📤",
+        "completed":   "✅", "failed":      "❌",
+        "cancelled":   "🚫",
+    }
+
+    lines = [f"📋 {t('recent_tasks', user_id)}\n"]
+    for r in records:
+        emoji = STATUS_EMOJI.get(r["status"], "❓")
+        title = (r.get("title") or r["url"])[:35]
+        retry_info = f" (重试 {r['retry_count']} 次)" if r.get("retry_count") else ""
+        err_info = f"\n   ⚠️ {r['error'][:40]}" if r.get("error") else ""
+        lines.append(f"{emoji} [{r['download_type']}] {title}{retry_info}{err_info}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cancel_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+
+    user_id = update.message.from_user.id
+
+    user_tasks = download_queue.get_user_tasks(user_id)
+    active = [
+        t for t in user_tasks
+        if t.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.PROCESSING)
+    ]
+
+    if not active:
+        await update.message.reply_text(t("no_active_tasks", user_id))
+        return
+
+    keyboard = []
+    for task in active:
+        short_url = task.url[:30] + "..." if len(task.url) > 30 else task.url
+        status_emoji = {
+            DownloadStatus.QUEUED: "⏳",
+            DownloadStatus.DOWNLOADING: "⬇️",
+            DownloadStatus.PROCESSING: "⚙️",
+        }.get(task.status, "❓")
+
+        label = f"{status_emoji} {task.download_type} | {short_url}"
+        keyboard.append([
+            InlineKeyboardButton(label, callback_data=f"cancel_task_{task.task_id}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("❌ 关闭", callback_data="cancel_menu_close")])
+
+    await update.message.reply_text(
+        "选择要取消的任务：",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+@require_admin
+async def setdisk_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+
+    import main as _main
+
+    if not context.args:
+        from config import DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES
+        await update.message.reply_text(
+            f"💾 当前磁盘告警配置：\n"
+            f"  WARNING 阈值：{DISK_WARN_THRESHOLD}%\n"
+            f"  CRITICAL 阈值：{DISK_CRIT_THRESHOLD}%\n"
+            f"  检查间隔：{DISK_CHECK_INTERVAL_MINUTES} 分钟\n\n"
+            f"用法：/setdisk <warn%> [crit%]\n"
+            f"示例：/setdisk 75 85"
+        )
+        return
+
+    try:
+        warn = int(context.args[0])
+        crit = int(context.args[1]) if len(context.args) > 1 else warn + 10
+
+        if not (0 < warn < crit <= 100):
+            raise ValueError("warn 必须 < crit，且均在 1-100 之间")
+    except ValueError as e:
+        await update.message.reply_text(f"❌ 参数错误：{e}")
+        return
+
+    import config
+    config.DISK_WARN_THRESHOLD = warn
+    config.DISK_CRIT_THRESHOLD = crit
+    _main._last_alert_level = "ok"
+
+    await update.message.reply_text(
+        f"✅ 磁盘告警阈值已更新：\n"
+        f"  WARNING：{warn}%\n"
+        f"  CRITICAL：{crit}%"
+    )
+
+@require_admin
+async def settier_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+
+    from config import RATE_TIER_LIMITS
+    from core.ratelimit import get_user_tier, get_user_limit, set_user_tier
+
+    VALID_TIERS = list(RATE_TIER_LIMITS.keys())
+
+    if not context.args:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT user_id, tier, max_per_hour, note, set_at FROM user_rate_tiers ORDER BY set_at DESC LIMIT 20"
+            ) as cur:
+                rows = await cur.fetchall()
+
+        if not rows:
+            await update.message.reply_text("当前没有自定义等级的用户。")
+            return
+
+        lines = ["👥 自定义等级用户列表：\n"]
+        for r in rows:
+            limit_str = f"(自定义: {r[2]}/h)" if r[2] is not None else f"({RATE_TIER_LIMITS.get(r[1], '?')}/h)"
+            note_str  = f" — {r[3]}" if r[3] else ""
+            lines.append(f"  UID {r[0]}: [{r[1]}] {limit_str}{note_str}")
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if len(context.args) == 1:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 无效的用户 ID")
+            return
+
+        tier  = await get_user_tier(target_id)
+        limit = await get_user_limit(target_id)
+        remaining = await rate_limiter.get_remaining(target_id)
+        await update.message.reply_text(
+            f"👤 用户 {target_id}\n"
+            f"  等级：{tier}\n"
+            f"  限额：{limit}/小时\n"
+            f"  剩余：{remaining} 次"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 无效的用户 ID")
+        return
+
+    tier_arg = context.args[1].lower()
+
+    if tier_arg == "custom":
+        if len(context.args) < 3:
+            await update.message.reply_text("用法：/settier <user_id> custom <max_per_hour>")
+            return
+        try:
+            custom_max = int(context.args[2])
+            if custom_max < 0 or custom_max > 10000:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ 自定义限额必须为 0–10000 的整数")
+            return
+
+        note = " ".join(context.args[3:]) if len(context.args) > 3 else ""
+        await set_user_tier(target_id, "custom", note=note,
+                            set_by=update.message.from_user.id, custom_max=custom_max)
+        await update.message.reply_text(
+            f"✅ 用户 {target_id} 自定义限额已设为 {custom_max}/小时"
+        )
+
+    elif tier_arg in VALID_TIERS:
+        note = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+        await set_user_tier(target_id, tier_arg, note=note,
+                            set_by=update.message.from_user.id)
+        tier_limit = RATE_TIER_LIMITS[tier_arg]
+        await update.message.reply_text(
+            f"✅ 用户 {target_id} 等级已设为 [{tier_arg}]（{tier_limit}/小时）"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ 无效等级：{tier_arg}\n"
+            f"可用选项：{' | '.join(VALID_TIERS)} | custom <数值>"
+        )
+
+@require_admin
+async def report_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+
+    days = 1
+    if context.args:
+        try:
+            days = max(1, min(90, int(context.args[0])))
+        except ValueError:
+            pass
+
+    from core.analytics import get_daily_stats, format_daily_report
+    stats = await get_daily_stats(days=days)
+    period = f"近 {days} 天" if days > 1 else "今日"
+    await update.message.reply_text(format_daily_report(stats, period=period))
+
+@require_admin
+async def admin_cancel_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+      
+    if not context.args:
+        active = list(download_queue.active_tasks.values())
+        queued_size = download_queue.get_total_queued()
+        
+        if not active and queued_size == 0:
+            await update.message.reply_text("当前队列为空。")
+            return
+        
+        keyboard = []
+        for task in active:
+            short_url = task.url[:25] + "..." if len(task.url) > 25 else task.url
+            label = f"[{task.task_id}] UID:{task.user_id} {short_url}"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"取消 {label}",
+                    callback_data=f"cancel_task_{task.task_id}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("❌ 关闭", callback_data="cancel_menu_close")])
+        
+        msg = f"活跃任务：{len(active)} 个，排队中：{queued_size} 个\n\n选择要取消的任务："
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    task_id = context.args[0]
+    success = await download_queue.cancel_task(task_id)
+    
+    if success:
+        await update.message.reply_text(f"✅ 任务 {task_id} 已取消。")
+    else:
+        await update.message.reply_text(
+            f"❌ 取消失败。任务 {task_id} 不存在或已完成。\n"
+            f"使用 /admcancel 查看当前活跃任务。"
+        )
+
+@require_admin
+async def stats_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    msg = await get_user_stats()
+    await update.message.reply_text(msg)
+
+PAGE_SIZE = 5
+
+async def history_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    await _send_history_page(update.message, user_id, page=0)
+
+
+async def _send_history_page(message_or_query, user_id: int, page: int):
+    records, total = await get_user_history_page(user_id, page=page, page_size=PAGE_SIZE)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    if not records:
+        text = t("no_history", user_id)
+    else:
+        header = t("history_header", user_id, page=page + 1, total=total_pages, count=total)
+        body = "".join(format_history_item(r) for r in records)
+        text = header + body
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"history_page_{user_id}_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"history_page_{user_id}_{page + 1}"))
+
+    keyboard = [nav] if nav else []
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    if hasattr(message_or_query, "reply_text"):
+        await message_or_query.reply_text(text, reply_markup=markup)
+    else:
+        await message_or_query.edit_message_text(text, reply_markup=markup)
+
+@require_admin
+async def allow_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /allow <user_id>")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Must be a number.")
+        return
+    
+    users = get_allowed_users()
+    users.add(target_id)
+    save_allowed_users(users)
+    
+    await update.message.reply_text(f"User {target_id} has been allowed.")
+
+
+@require_admin
+async def block_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /block <user_id>")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Must be a number.")
+        return
+    
+    users = get_allowed_users()
+    users.discard(target_id)
+    save_allowed_users(users)
+    
+    await update.message.reply_text(f"User {target_id} has been blocked.")
+
+
+@require_admin
+async def users_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    allowed = get_allowed_users()
+    users_info = await get_all_users_info()
+    
+    if not allowed:
+        await update.message.reply_text("No allowed users in the list.")
+        return
+    
+    last_seen_map = {}
+    if users_info:
+        last_seen_map = {u.get("user_id"): u.get("last_seen", 0) for u in users_info}
+    
+    msg = "✅ Allowed users:\n\n"
+    
+    for uid in sorted(allowed, key=lambda x: last_seen_map.get(x, 0), reverse=True):
+        name = await get_user_display_name(uid)
+        
+        if name == str(uid):
+            msg += f"• `{uid}` *(Never used bot)*\n"
+        else:
+            safe_name = name.replace('_', '\\_')
+            msg += f"• {safe_name} (`{uid}`)\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+@require_admin
+async def broadcast_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    
+    message = " ".join(context.args)
+    users = get_allowed_users() - ADMIN_IDS
+    
+    bot = context.bot
+    success = 0
+    failed = 0
+    
+    for uid in users:
+        try:
+            await bot.send_message(chat_id=uid, text=message)
+            success += 1
+        except Exception as e:
+            logger.warning(f"Failed to send broadcast to {uid}: {e}")
+            failed += 1
+    
+    await update.message.reply_text(f"Broadcast sent to {success} users. Failed: {failed}")
+
+
+@require_admin
+async def userhistory_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    users = get_allowed_users() - ADMIN_IDS
+    
+    if not users:
+        await update.message.reply_text("No users to show.")
+        return
+    
+    
+    keyboard = []
+    for uid in sorted(users):
+        name = await get_user_display_name(uid)
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"uh_{uid}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
+
+
+@require_admin
+async def rateinfo_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    status = rate_limiter.get_status()
+    status_text = "Enabled" if status["enabled"] else "Disabled"
+    msg = f"Rate Limit Status:\n"
+    msg += f"- Status: {status_text}\n"
+    msg += f"- Max downloads/hour: {status['max_downloads_per_hour']}\n"
+    msg += f"- Active users tracked: {status['active_users']}"
+    await update.message.reply_text(msg)
+
+
+@require_admin
+async def setrate_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /setrate <max_per_hour> [on/off]")
+        return
+    
+    try:
+        max_per_hour = int(context.args[0])
+        if max_per_hour < 1 or max_per_hour > 100:
+            await update.message.reply_text("Value must be between 1-100")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid number.")
+        return
+    
+    enabled = True
+    if len(context.args) > 1:
+        enabled = context.args[1].lower() in ["on", "true", "1"]
+    
+    save_rate_limit(max_per_hour, enabled)
+    rate_limiter.reload()
+    
+    status = "enabled" if enabled else "disabled"
+    await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
+
+
+@require_admin
+async def cleanup_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    cleanup_temp_files()
+    await update.message.reply_text("Temp files cleaned up.")
+
+
+@require_admin
+async def status_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    config = get_config()
+    rate_status = rate_limiter.get_status()
+    
+    temp_files, temp_size, _, _ = scan_temp_files(config["temp_dir"])
+    
+    msg = "📊 Bot Status\n\n"
+    msg += f"CPU: {psutil.cpu_percent()}%\n"
+    mem = psutil.virtual_memory()
+    msg += f"Memory: {mem.percent}% ({mem.available // (1024*1024)}MB available)\n\n"
+    msg += f"Temp files: {temp_files}\n"
+    msg += f"Temp size: {temp_size // (1024*1024)}MB\n\n"
+    msg += f"Rate limit: {rate_status['max_downloads_per_hour']}/hour\n"
+    msg += f"Rate enabled: {rate_status['enabled']}\n"
+    msg += f"Cleanup interval: {config['cleanup_interval_hours']}h\n"
+    msg += f"Temp file max age: {config['temp_file_max_age_hours']}h\n"
+    msg += f"Max cache size: {config.get('max_cache_size', 500*1024*1024) // (1024*1024)}MB"
+    
+    await update.message.reply_text(msg)
+
+
+@require_admin
+async def queue_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+     
+    active = download_queue.active_tasks
+    queued = download_queue.queue.qsize()
+    
+    msg = "📥 Download Queue\n\n"
+    msg += f"Active downloads: {len(active)}\n"
+    msg += f"Queued: {queued}\n\n"
+    
+    if active:
+        msg += "Active:\n"
+        for tid, task in list(active.items())[:10]:
+            user_name = await get_user_display_name(task.user_id)
+            status_emoji = {
+                "downloading": "⬇️",
+                "processing": "⚙️",
+                "uploading": "📤",
+            }.get(task.status.value, "⏳")
+            msg += f"{status_emoji} {task.download_type} - {user_name}\n"
+    
+    await update.message.reply_text(msg)
+
+
+@require_admin
+async def storage_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    config = get_config()
+    temp_dir = config["temp_dir"]
+    
+    disk = psutil.disk_usage("/")
+    total, used, free = disk.total, disk.used, disk.free
+    temp_files, temp_size, oldest_file, oldest_time = scan_temp_files(temp_dir)
+    
+    disk_percent = (used / total) * 100
+    alert = ""
+    if disk_percent > 90:
+        alert = "\n⚠️ WARNING: Disk usage above 90%!"
+    elif disk_percent > 80:
+        alert = "\n⚠️ CAUTION: Disk usage above 80%"
+    
+    msg = f"💾 Storage Status{alert}\n\n"
+    msg += f"Total disk: {format_bytes(total)}\n"
+    msg += f"Used: {format_bytes(used)} ({disk_percent:.1f}%)\n"
+    msg += f"Free: {format_bytes(free)}\n\n"
+    msg += f"Temp directory ({temp_dir}):\n"
+    msg += f"Files: {temp_files}\n"
+    msg += f"Size: {format_bytes(temp_size)}\n"
+    if oldest_file:
+        from datetime import datetime
+        msg += f"Oldest: {oldest_file}\n"
+        msg += f"   {datetime.fromtimestamp(oldest_time).strftime('%Y-%m-%d %H:%M')}"
+    
+    await update.message.reply_text(msg)
+
+
+@require_admin
+async def failed_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /failed [user_id]")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    
+    history = await get_user_history(target_id, limit=50)
+    failed = [h for h in history if h.get("status") == "failed"]
+    
+    if not failed:
+        await update.message.reply_text(f"No failed downloads for user {target_id}.")
+        return
+    
+    msg = format_history_list(failed[:20], f"❌ Failed downloads for user {target_id}:\n\n")
+    
+    await update.message.reply_text(msg)
+
+
+async def lang_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    
+    if not context.args:
+        keyboard = []
+        for code, name in LANGUAGES.items():
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"lang_{code}")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(t("select_language", user_id), reply_markup=reply_markup)
+        return
+    
+    lang_code = context.args[0].lower()
+    if lang_code not in LANGUAGES:
+        await update.message.reply_text("Invalid language. Use: en, zh, or ja")
+        return
+    
+    await set_user_lang(user_id, lang_code)
+    await update.message.reply_text(t("language_changed", user_id))
+
+
+@require_admin
+async def cookie_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    await update.message.reply_text(
+        "Send me your cookies.txt file to update the bot's cookies.\n\n"
+        "To generate cookies:\n"
+        "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n\n"
+        "For site-specific cookies, use filename format:\n"
+        "• `www.youtube.com_cookies.txt` for YouTube\n"
+        "• `www.bilibili.com_cookies.txt` for Bilibili\n\n"
+        "The bot will automatically use the appropriate cookie file based on the URL being downloaded."
+    )
+
+
+@require_admin
+async def refresh_command(update: Update, context: CallbackContext):
+    """Force re-download by clearing cached file_id for a URL."""
+    if not update.message:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /refresh <url>\n\nClears cached file ID so the video will be re-downloaded.")
+        return
+    
+    url = " ".join(context.args)
+    await clear_file_id_by_url(url)
+    await update.message.reply_text(f"✅ Cleared cached file ID for:\n{url}\n\nThe next download will fetch a fresh file.")
+
+========================================
+FILE: ./app/download.py
+========================================
+import asyncio
+import time
+from core.utils import format_bytes as _format_size
+from concurrent.futures import ThreadPoolExecutor
+
+download_executor = ThreadPoolExecutor(max_workers=10)
+
+
+class ProgressTracker:
+    def __init__(self, processing_msg, loop: asyncio.AbstractEventLoop):
+        self.msg = processing_msg
+        self.last_text = None
+        self.last_update = 0
+        self.loop = loop
+        self.max_total = 0
+    
+    def update(self, text):
+        now = time.time()
+        if text != self.last_text and now - self.last_update > 2:
+            self.last_text = text
+            self.last_update = now
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.msg.edit_text(text), 
+                    self.loop
+                )
+            except Exception:
+                pass
+
+def _make_progress_hook(processing_msg, loop: asyncio.AbstractEventLoop):
+    tracker = ProgressTracker(processing_msg, loop)
+
+    def progress_hook(d):
+        status = d.get("status")
+
+        if status == "downloading" and "downloaded_bytes" in d:
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            downloaded = d.get("downloaded_bytes", 0)
+            speed = d.get("speed", 0)
+
+            if total > tracker.max_total:
+                tracker.max_total = total
+            display_total = tracker.max_total
+
+            if display_total > 0:
+                percent  = min(100, int(downloaded * 100 / display_total))
+                filled   = max(0, min(10, int(10 * downloaded / display_total)))
+                bar      = "█" * filled + "░" * (10 - filled)
+                speed_s  = f" • {_format_size(speed)}/s" if speed else ""
+                text = (
+                    f"⬇️ Downloading...\n"
+                    f"{bar} {percent}%\n"
+                    f"{_format_size(downloaded)} / {_format_size(display_total)}"
+                    f"{speed_s}"
+                )
+                tracker.update(text)
+
+        elif status == "finished" and "downloaded_bytes" in d:
+            tracker.update("✅ Download complete! Processing...")
+
+        elif status == "downloading" and "percent" in d:
+            percent = int(d["percent"])
+            filled  = max(0, min(10, percent // 10))
+            bar     = "█" * filled + "░" * (10 - filled)
+            title   = d.get("title", "")
+            title_s = f"\n🎵 {title[:30]}" if title else ""
+            text = (
+                f"⬇️ Downloading Spotify...{title_s}\n"
+                f"{bar} {percent}%"
+            )
+            tracker.update(text)
+
+        elif status == "finished" and "title" in d and "downloaded_bytes" not in d:
+            tracker.update(f"✅ Downloaded: {d.get('title', '')[:30]}")
+
+    return progress_hook
+
+========================================
+FILE: ./config.py
+========================================
+import os
+import sys
+from dotenv import load_dotenv
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv()
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    print("Error: TELEGRAM_BOT_TOKEN not set in .env")
+    sys.exit(1)
+
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2 * 1024 * 1024 * 1024))
+MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", 500 * 1024 * 1024))
+BOT_API_URL = os.getenv("BOT_API_URL", "http://127.0.0.1:8082/bot")
+LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
+COOKIE_FILE = os.getenv("COOKIE_FILE", "")
+COOKIES_DIR = os.path.join(BASE_DIR, "cookies")
+COOKIE_REFRESH_CMD = os.getenv("COOKIE_REFRESH_CMD", "")
+COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", 12))
+ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
+ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", os.path.join(BASE_DIR, "allowed_users.txt"))
+TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
+TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
+CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
+USE_ARIA2 = os.getenv("USE_ARIA2", "false").lower() == "true"
+ARIA2_CONNECTIONS = int(os.getenv("ARIA2_CONNECTIONS", "16"))
+BOT_FILE_PREFIX = "vee_"
+DISK_WARN_THRESHOLD = int(os.getenv("DISK_WARN_THRESHOLD", 80))
+DISK_CRIT_THRESHOLD = int(os.getenv("DISK_CRIT_THRESHOLD", 90))
+DISK_CHECK_INTERVAL_MINUTES = int(os.getenv("DISK_CHECK_INTERVAL_MINUTES", 60))
+
+RATE_TIER_LIMITS: dict[str, int] = {
+    "normal":   int(os.getenv("RATE_LIMIT_NORMAL",   "10")),
+    "vip":      int(os.getenv("RATE_LIMIT_VIP",      "30")),
+    "power":    int(os.getenv("RATE_LIMIT_POWER",    "60")),
+    "blocked":  0,
+}
+
+os.makedirs(COOKIES_DIR, exist_ok=True)
+
+CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))
+
+
+def get_config() -> dict:
+    return {
+        "max_file_size": MAX_FILE_SIZE,
+        "max_cache_size": MAX_CACHE_SIZE,
+        "cache_ttl": CACHE_TTL,
+        "temp_dir": TEMP_DIR,
+        "temp_file_max_age_hours": TEMP_FILE_MAX_AGE_HOURS,
+        "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
+    }
+
+
+def get_temp_template():
+    return os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}%(title)s.%(ext)s")
+
+========================================
+FILE: ./core/__init__.py
+========================================
+
+========================================
+FILE: ./core/analytics.py
+========================================
+import time
+from core.db import get_db
+
+async def get_daily_stats(days: int = 1) -> dict:
+    since = time.time() - days * 86400
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM history WHERE timestamp > ?", (since,)
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM history WHERE timestamp > ? GROUP BY status",
+            (since,),
+        ) as cur:
+            status_counts = {row[0]: row[1] for row in await cur.fetchall()}
+
+        async with db.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM history WHERE timestamp > ?", (since,)
+        ) as cur:
+            active_users = (await cur.fetchone())[0]
+
+        async with db.execute(
+            "SELECT download_type, COUNT(*) FROM history WHERE timestamp > ? GROUP BY download_type",
+            (since,),
+        ) as cur:
+            type_dist = {row[0]: row[1] for row in await cur.fetchall()}
+
+        async with db.execute(
+            """
+            SELECT u.username, u.first_name, h.user_id, COUNT(*) as cnt
+            FROM history h
+            LEFT JOIN users u ON h.user_id = u.user_id
+            WHERE h.timestamp > ?
+            GROUP BY h.user_id
+            ORDER BY cnt DESC LIMIT 5
+            """,
+            (since,),
+        ) as cur:
+            top_users = await cur.fetchall()
+
+        async with db.execute(
+            "SELECT SUM(file_size) FROM history WHERE timestamp > ? AND status = 'success'",
+            (since,),
+        ) as cur:
+            total_bytes = (await cur.fetchone())[0] or 0
+
+    return {
+        "total": total,
+        "success": status_counts.get("success", 0),
+        "failed": status_counts.get("failed", 0),
+        "active_users": active_users,
+        "type_dist": type_dist,
+        "top_users": top_users,
+        "total_bytes": total_bytes,
+    }
+
+
+def format_daily_report(stats: dict, period: str = "今日") -> str:
+    from core.utils import format_bytes
+
+    success_rate = (
+        f"{stats['success'] / stats['total'] * 100:.1f}%"
+        if stats["total"] > 0 else "N/A"
+    )
+
+    type_lines = "\n".join(
+        f"  • {k}: {v} 次" for k, v in sorted(stats["type_dist"].items(), key=lambda x: -x[1])
+    )
+
+    top_lines = "\n".join(
+        f"  {i+1}. {row[1] or row[0] or 'User'} ({row[2]}): {row[3]} 次"
+        for i, row in enumerate(stats["top_users"])
+    )
+
+    return (
+        f"📊 {period}统计报告\n"
+        f"{'─' * 24}\n"
+        f"📥 总下载：{stats['total']} 次\n"
+        f"✅ 成功：{stats['success']}  ❌ 失败：{stats['failed']}\n"
+        f"📈 成功率：{success_rate}\n"
+        f"💾 总体积：{format_bytes(stats['total_bytes'])}\n"
+        f"👥 活跃用户：{stats['active_users']} 人\n"
+        f"\n📂 类型分布：\n{type_lines or '  暂无'}\n"
+        f"\n🏆 活跃榜 Top5：\n{top_lines or '  暂无'}"
+    )
+
+========================================
+FILE: ./core/db.py
+========================================
+import os
+import logging
+import aiosqlite
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "bot_data.db")
+
+@asynccontextmanager
+async def get_db():
+    """Context manager for database connections."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
+
+async def init_db():
+    """Initialize database tables if they don't exist."""
+    logger.info(f"Initializing database at {DB_PATH}")
+    
+    async with get_db() as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA foreign_keys=ON")
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                lang TEXT DEFAULT 'en',
+                added_at REAL,
+                last_seen REAL
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                url TEXT,
+                download_type TEXT,
+                status TEXT,
+                file_size INTEGER,
+                title TEXT,
+                file_path TEXT,
+                file_id TEXT,
+                timestamp REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id     TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                url         TEXT NOT NULL,
+                download_type TEXT NOT NULL,
+                format_id   TEXT,
+                status      TEXT NOT NULL DEFAULT 'queued',
+                progress    REAL DEFAULT 0.0,
+                error       TEXT,
+                file_path   TEXT,
+                file_size   INTEGER,
+                retry_count INTEGER DEFAULT 0,
+                created_at  REAL NOT NULL,
+                started_at  REAL,
+                completed_at REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_rate_tiers (
+                user_id       INTEGER PRIMARY KEY,
+                tier          TEXT NOT NULL DEFAULT 'normal',
+                max_per_hour  INTEGER,      
+                note          TEXT,         
+                set_by        INTEGER,          
+                set_at        REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_history_user_id ON history(user_id)
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_history_url ON history(url)
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp)
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rate_limit (
+                user_id INTEGER,
+                timestamp REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rate_limit_user_id ON rate_limit(user_id)
+        """)
+        
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rate_limit_timestamp ON rate_limit(timestamp)
+        """)
+        
+        await db.commit()
+        
+    logger.info("Database initialized successfully")
+
+
+========================================
+FILE: ./core/downloader.py
+========================================
+import os
+import shlex
+import tempfile
+import shutil
+import logging
+import asyncio
+import subprocess
+import time
+import yt_dlp
+import httpx
+import re as _re
+from functools import lru_cache
+from urllib.parse import urlparse
+from core.utils import get_running_loop as _get_running_loop
+from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS, COOKIES_DIR
+
+logger = logging.getLogger(__name__)
+
+_cookie_last_refresh = 0
+
+_DOMAIN_COOKIE_MAP = {
+    "youtube.com":  "www.youtube.com_cookies.txt",
+    "youtu.be":     "www.youtube.com_cookies.txt",
+    "bilibili.com": "www.bilibili.com_cookies.txt",
+    "b23.tv":       "www.bilibili.com_cookies.txt",
+}
+
+_SPOTDL_PROGRESS_RE = _re.compile(r"(\d+)%\|")
+_SPOTDL_DONE_RE     = _re.compile(r'Downloaded\s+"(.+?)"')
+
+class YtDlpHelper:
+    """Helper class to reduce duplicate yt-dlp configuration code."""
+    
+    def __init__(self, url: str = None):
+        self.url = url
+        self.opts = self._build_opts()
+    
+    def _build_opts(self):
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extractor_retries": 3,
+            "fragment_retries": 3,
+            "js_runtimes": {"node": {}},
+        }
+        if self.url:
+            cookie_file = self._get_cookie_file(self.url)
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
+            opts = self._add_extractor_headers(self.url, opts)
+        return opts
+    
+    def _get_cookie_file(self, url: str) -> str:
+        try:
+            netloc = urlparse(url).netloc.lower().removeprefix("www.")
+        except Exception:
+            netloc = ""
+
+        for domain, cookie_filename in _DOMAIN_COOKIE_MAP.items():
+            if netloc == domain or netloc.endswith(f".{domain}"):
+                site_cookie = os.path.join(COOKIES_DIR, cookie_filename)
+                if os.path.exists(site_cookie):
+                    return site_cookie
+
+        if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+            return COOKIE_FILE
+        return ""
+
+    def _add_extractor_headers(self, url, opts):
+        if "bilibili.com" in url:
+            opts["http_headers"] = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            }
+        return opts
+    
+    def get_opts(self):
+        return self.opts
+    
+    def merge_opts(self, **kwargs):
+        self.opts.update(kwargs)
+        return self.opts
+    
+    @staticmethod
+    async def prepare_url(url: str) -> str:
+        """Common URL preprocessing: resolve short URLs and refresh cookies."""
+        await refresh_cookies_async()
+        return await resolve_short_url(url)
+
+
+def _mask_url(url: str, max_path_len: int = 20) -> str:
+    try:
+        p = urlparse(url)
+        path = p.path[:max_path_len] + ("..." if len(p.path) > max_path_len else "")
+        return f"{p.scheme}://{p.netloc}{path}"
+    except Exception:
+        return "[invalid url]"
+
+def _build_aria2_cmd(
+    url: str,
+    output_dir: str,
+    output_file: str,
+    connections: int = ARIA2_CONNECTIONS,
+) -> list[str]:
+    return [
+        "aria2c",
+        "-x", str(connections),
+        "-s", str(connections),
+        "-d", output_dir,
+        "-o", output_file,
+        "--continue=true",
+        "--retry-wait=3",
+        "--max-tries=5",
+        url,
+    ]
+
+async def _run_aria2(cmd: list[str]) -> None:
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"aria2c failed: {stderr.decode()}")
+
+async def resolve_short_url(url: str) -> str:
+    """Resolve short URLs (b23.tv, youtu.be, etc.) to full URLs."""
+    short_domains = {"b23.tv", "youtu.be"}
+    try:
+        domain = url.split("/")[2].lower() if "://" in url else url.split("/")[0].lower()
+        if any(d in domain for d in short_domains):
+            logger.info(f"Resolving short URL: {url}")
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+                response = await client.head(url)
+            resolved = str(response.url)
+            logger.info(f"Resolved to: {resolved}")
+            return resolved
+    except Exception as e:
+        logger.warning(f"Failed to resolve short URL {url}: {e}")
+    return url
+
+def _should_refresh_cookies() -> bool:
+    if not COOKIE_REFRESH_CMD or not COOKIE_FILE:
+        return False
+    return time.time() - _cookie_last_refresh >= (COOKIE_REFRESH_INTERVAL_HOURS * 3600)
+
+def refresh_cookies() -> bool:
+    global _cookie_last_refresh
+    if not _should_refresh_cookies():
+        return False
+
+    try:
+        logger.info("Refreshing cookies...")
+        cmd = shlex.split(COOKIE_REFRESH_CMD)
+        result = subprocess.run(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120
+        )
+        _cookie_last_refresh = time.time()
+        logger.info("Cookies refreshed successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Cookie refresh failed (exit {e.returncode}): {e.stderr[:200]}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("Cookie refresh timed out after 120s")
+        return False
+    except Exception as e:
+        logger.error(f"Cookie refresh unexpected error: {e}")
+        return False
+
+
+
+async def refresh_cookies_async() -> bool:
+    global _cookie_last_refresh
+    if not _should_refresh_cookies():
+        return False
+
+    try:
+        logger.info("Refreshing cookies (async)...")
+        cmd = shlex.split(COOKIE_REFRESH_CMD)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            logger.error("Cookie refresh (async) timed out after 120s")
+            return False
+
+        if process.returncode != 0:
+            logger.error(f"Cookie refresh failed (exit {process.returncode}): "
+                         f"{stderr.decode()[:200]}")
+            return False
+
+        _cookie_last_refresh = time.time()
+        logger.info("Cookies refreshed successfully (async)")
+        return True
+
+    except FileNotFoundError:
+        logger.error(f"Cookie refresh command not found: {shlex.split(COOKIE_REFRESH_CMD)[0]}")
+        return False
+    except Exception as e:
+        logger.error(f"Cookie refresh (async) unexpected error: {e}")
+        return False
+
+
+_FORMATS_CACHE: dict[str, tuple] = {}
+_FORMATS_CACHE_MAX = 100
+
+async def get_formats_cached(url: str) -> tuple:
+    """Get formats with simple LRU-style cache."""
+    if url in _FORMATS_CACHE:
+        return _FORMATS_CACHE[url]
+    
+    result = await get_formats(url)
+    _FORMATS_CACHE[url] = result
+    
+    if len(_FORMATS_CACHE) > _FORMATS_CACHE_MAX:
+        keys_to_remove = list(_FORMATS_CACHE.keys())[:_FORMATS_CACHE_MAX // 2]
+        for k in keys_to_remove:
+            del _FORMATS_CACHE[k]
+    
+    return result
+
+
+async def get_formats(url):
+    url = await YtDlpHelper.prepare_url(url)
+    
+    loop = _get_running_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts['logger'] = logging.getLogger('yt_dlp')
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            logger.info(f"URL: {_mask_url(url)}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
+            logger.debug(f"Full URL (debug only): {url}")
+            return formats, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def download_video(url, format_id, progress_hook=None):
+    url = await YtDlpHelper.prepare_url(url)
+    
+    needs_merging = format_id == "best" or "+" in str(format_id)
+    
+    if USE_ARIA2 and is_aria2_available() and format_id == "best" and not needs_merging:
+        try:
+            return await download_video_aria2(url, format_id, progress_hook)
+        except Exception as e:
+            logger.warning(f"aria2 failed, falling back to yt-dlp: {e}")
+    
+    loop = _get_running_loop()
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        
+        if "twitter.com" in url or "x.com" in url:
+            ydl_opts["extractor_args"] = {
+                "twitter": {"lang": "en"}
+            }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [])
+            
+            selected_format = None
+            if format_id != "best":
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        selected_format = f
+                        break
+            
+            acodec = selected_format.get("acodec") if selected_format else None
+            has_audio = acodec not in (None, "none") if acodec else False
+            
+            logger.debug(f"Format {format_id} selected: acodec={acodec}, has_audio={has_audio}")
+            
+            if has_audio:
+                ydl_opts["format"] = format_id
+                ydl_opts.pop("merge_output_format", None)
+            elif format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+            else:
+                ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+        
+        ydl_opts["outtmpl"] = get_temp_template()
+        if progress_hook:
+            ydl_opts["progress_hooks"] = [progress_hook]
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+        return filename, info
+    return await loop.run_in_executor(None, _download)
+
+async def download_subtitle(url: str, preferred_langs: list[str] | None = None) -> tuple[str, dict]:
+    url = await YtDlpHelper.prepare_url(url)
+    loop = _get_running_loop()
+
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts.update({
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "srt/vtt/best",
+            "outtmpl": get_temp_template(),
+        })
+
+        if preferred_langs:
+            ydl_opts["subtitleslangs"] = preferred_langs
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "subtitle")
+
+        for ext in ("srt", "vtt", "ass"):
+            for fname in os.listdir(TEMP_DIR):
+                if fname.startswith(BOT_FILE_PREFIX) and fname.endswith(f".{ext}"):
+                    full_path = os.path.join(TEMP_DIR, fname)
+                    if time.time() - os.path.getmtime(full_path) < 60:
+                        return full_path, info
+
+        raise RuntimeError("No subtitle file found. The video may not have subtitles.")
+
+    return await loop.run_in_executor(None, _download)
+
+async def download_audio(url, progress_hook=None):
+    url = await YtDlpHelper.prepare_url(url)
+    
+    loop = _get_running_loop()
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": get_temp_template(),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+            }],
+            "progress_hooks": [progress_hook] if progress_hook else None,
+        })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            filename = os.path.splitext(filename)[0] + ".mp3"
+        return filename, info
+    return await loop.run_in_executor(None, _download)
+
+
+async def get_thumbnail(url):
+    url = await YtDlpHelper.prepare_url(url)
+    loop = _get_running_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            thumbnail_url = info.get("thumbnail")
+        return thumbnail_url, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def get_images(url):
+    url = await YtDlpHelper.prepare_url(url)
+    loop = _get_running_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            images = info.get("thumbnail") or []
+            if isinstance(images, str):
+                images = [images]
+            
+            additional_thumbnails = info.get("additional_thumbnails") or []
+            if additional_thumbnails:
+                for t in additional_thumbnails:
+                    if t.get("url"):
+                        images.append(t.get("url"))
+            
+            title = info.get("title", "Image")
+        return images, title
+    return await loop.run_in_executor(None, _get)
+
+
+_aria2_available: bool | None = None
+def is_aria2_available() -> bool:
+    global _aria2_available
+    if _aria2_available is None:
+        _aria2_available = shutil.which("aria2c") is not None
+    return _aria2_available
+
+
+async def download_with_aria2(url, filename, progress_hook=None, connections=16):
+    if not is_aria2_available():
+        raise RuntimeError("aria2c is not installed")
+
+    cmd = _build_aria2_cmd(direct_url, os.path.dirname(filename), os.path.basename(filename))
+    await _run_aria2(cmd)
+
+    return filename
+
+
+async def get_direct_url(url, format_id=None):
+    url = await YtDlpHelper.prepare_url(url)
+    
+    loop = _get_running_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        if format_id:
+            ydl_opts["format"] = f"{format_id}+bestaudio/best"
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            
+            if format_id:
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        return f.get("url"), info
+                return formats[0].get("url"), info if formats else (None, info)
+            else:
+                best = formats[-1] if formats else None
+                return best.get("url") if best else None, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def download_video_aria2(url, format_id, progress_hook=None):
+    url = await YtDlpHelper.prepare_url(url)
+    
+    if not is_aria2_available():
+        raise RuntimeError("aria2c is not installed")
+
+    loop = _get_running_loop()
+    
+    def _get_info():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            
+            target_format = None
+            
+            if format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                for f in reversed(formats):
+                    if f.get("url") and f.get("ext") in ("mp4", "m4a", "webm"):
+                        target_format = f
+                        break
+            else:
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        target_format = f
+                        break
+                
+                if target_format:
+                    acodec = target_format.get("acodec")
+                    has_audio = acodec not in (None, "none") if acodec else False
+                    logger.info(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
+                    if has_audio:
+                        ydl_opts["format"] = format_id
+                    else:
+                        ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                else:
+                    ydl_opts["format"] = f"{format_id}+bestaudio/best"
+            
+            if not target_format and formats:
+                target_format = formats[-1]
+            
+            direct_url = target_format.get("url") if target_format else None
+            
+            title = info.get("title", "video")
+            ext = target_format.get("ext", "mp4") if target_format else "mp4"
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:50]
+            
+            filename = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}{safe_title}.{ext}")
+            
+            return direct_url, filename, info
+    
+    direct_url, filename, info = await loop.run_in_executor(None, _get_info)
+    
+    if not direct_url:
+        raise RuntimeError("Could not extract direct URL from video")
+
+    cmd = _build_aria2_cmd(direct_url, os.path.dirname(filename), os.path.basename(filename))
+    await _run_aria2(cmd)
+
+    return filename, info
+
+
+def is_spotify_url(url: str) -> bool:
+    return "spotify.com" in url.lower()
+
+async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
+    tmp_dir = tempfile.mkdtemp(dir=TEMP_DIR, prefix=f"{BOT_FILE_PREFIX}spotify_")
+
+    cmd = [
+        "spotdl", url,
+        "--output", tmp_dir,
+        "--format", "mp3",
+        "--bitrate", "320k",
+        "--overwrite", "force",
+        "--log-level", "INFO",
+    ]
+
+    logger.info(f"Running spotdl: {' '.join(cmd)}")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=tmp_dir,
+        )
+
+        title = "Unknown"
+        last_percent = -1
+
+        async for raw_line in process.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            logger.debug(f"[spotdl] {line}")
+
+            m_done = _SPOTDL_DONE_RE.search(line)
+            if m_done:
+                title = m_done.group(1)
+                if progress_hook:
+                    progress_hook({"status": "finished", "title": title})
+                continue
+
+            m_pct = _SPOTDL_PROGRESS_RE.search(line)
+            if m_pct and progress_hook:
+                percent = int(m_pct.group(1))
+                if percent != last_percent:
+                    last_percent = percent
+                    progress_hook({
+                        "status": "downloading",
+                        "percent": float(percent),
+                        "title": title,
+                    })
+
+        await process.wait()
+
+        if process.returncode != 0:
+            raise RuntimeError(f"spotdl exited with code {process.returncode}")
+
+        files = [
+            os.path.join(tmp_dir, f)
+            for f in os.listdir(tmp_dir)
+            if f.endswith(".mp3")
+        ]
+        if not files:
+            raise RuntimeError("spotdl produced no output files")
+
+        src  = max(files, key=os.path.getmtime)
+        dest = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}{os.path.basename(src)}")
+        shutil.move(src, dest)
+
+        title = title or os.path.splitext(os.path.basename(dest))[0]
+        return dest, {"title": title, "url": url}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+========================================
+FILE: ./core/facades.py
+========================================
+import logging
+import asyncio
+import uuid
+
+from services.user_service import get_allowed_users
+from core.ratelimit import rate_limiter
+from core.logger import log_user
+from core.strategies import StrategyFactory
+from core.queue import download_queue
+from core.models import DownloadTask, DownloadStatus
+from core.i18n import t
+from core.utils import is_user_allowed
+from core.downloader import is_spotify_url
+
+logger = logging.getLogger(__name__)
+
+
+async def _execute_download_task(task: DownloadTask):
+    """Executor function called by the queue worker."""
+    user_id = task.user_id
+    url = task.url
+
+    strategy = StrategyFactory.get(task.download_type)
+    if not strategy:
+        task.status = DownloadStatus.FAILED
+        task.error = f"No strategy found: {task.download_type}"
+        return
+    
+    task.status = DownloadStatus.PROCESSING
+   
+    ctx = download_queue.get_task_context(task.task_id)
+    if not ctx:
+        task.status = DownloadStatus.FAILED
+        task.error = "Task context missing"
+        return
+    
+    processing_msg = ctx["processing_msg"]
+    context = ctx["context"]
+    query = ctx["query"]
+
+    cancel_event = download_queue.get_cancel_event(task.task_id)
+
+    strategy_future = asyncio.ensure_future(
+        strategy.execute(query, url, processing_msg, context)
+    )
+
+    if cancel_event:
+        cancel_future = asyncio.ensure_future(cancel_event.wait())
+    else:
+        cancel_future = asyncio.ensure_future(asyncio.sleep(float("inf")))
+
+    try:
+        done, pending = await asyncio.wait(
+            [strategy_future, cancel_future],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        strategy_future.cancel()
+        cancel_future.cancel()
+        task.status = DownloadStatus.CANCELLED
+        task.error = "Queue stopped"
+        try:
+            await processing_msg.edit_text(t("bot_shutting_down", task.user_id))
+        except Exception:
+            pass
+        return
+
+    for f in pending:
+        f.cancel()
+        try:
+            await f
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if cancel_future in done:
+        task.status = DownloadStatus.CANCELLED
+        logger.info(f"Task {task.task_id} cancelled by user {user_id}")
+        try:
+            await processing_msg.edit_text(t("download_cancelled", task.user_id))
+        except Exception:
+            pass
+
+    elif strategy_future in done:
+        exc = strategy_future.exception()
+        if exc:
+            logger.error(f"Strategy execution failed: {type(exc).__name__}: {exc}")
+            task.status = DownloadStatus.FAILED
+            task.error = str(exc)
+            try:
+                await processing_msg.edit_text(t("download_failed", user_id))
+            except Exception:
+                pass
+        else:
+            task.status = DownloadStatus.COMPLETED
+            logger.info(f"Task {task.task_id} completed successfully")
+
+
+class DownloadFacade:
+    """Facade for orchestrating the download process.
+    
+    Handles cross-cutting concerns:
+    - Authorization check
+    - Rate limiting check
+    - Logging
+    - Strategy selection and execution via queue
+    """
+    
+    @staticmethod
+    async def process_download_request(query, url: str, callback_data: str, context, processing_msg) -> tuple[bool, str | None]:
+        """Process download request through the facade with queue support.
+        
+        Args:
+            query: Telegram callback query
+            url: URL to download
+            callback_data: Callback data determining download type (e.g., "download_audio", "quality_1080")
+            context: Telegram callback context
+            processing_msg: Message to update with progress
+            
+        Returns:
+            Tuple of (success: bool, error_msg_key: str | None)
+            If success is False, error_msg_key contains the i18n key for the error message.
+        """
+        user = query.from_user
+        user_id = user.id
+        
+        if not is_user_allowed(user_id):
+            logger.warning(f"Unauthorized user {user_id} attempted to download {url}")
+            return False, "unauthorized"
+        
+        can_download, rate_limit_msg = await rate_limiter.check_limit(user_id)
+        if not can_download:
+            logger.warning(f"User {user_id} blocked by rate limit: {rate_limit_msg}")
+            return False, "rate_limit_exceeded"
+        
+        log_user(user, f"download_request:{callback_data}")
+        
+        strategy_key = DownloadFacade._map_callback_to_strategy(callback_data, url)
+        if not strategy_key:
+            logger.error(f"Unknown callback_data: {callback_data}")
+            return False, "unknown_download_type"
+        
+        strategy = StrategyFactory.get(strategy_key)
+        if not strategy:
+            logger.error(f"No strategy found for key: {strategy_key}")
+            return False, "unknown_download_type"
+        
+        try:
+            task_id = str(uuid.uuid4())[:8]
+            download_type = strategy_key
+            
+            task = DownloadTask(
+                task_id=task_id,
+                user_id=user_id,
+                url=url,
+                download_type=download_type,
+            )
+            
+            telegram_ctx = {
+                "query": query,
+                "processing_msg": processing_msg,
+                "context": context,
+            }
+            
+            await download_queue.add_task(task, telegram_ctx)
+            
+            position = download_queue.get_queue_position(user_id)
+            active = download_queue.get_active_count()
+            
+            if position > 0 or active >= download_queue.max_concurrent:
+                await processing_msg.edit_text(
+                    t("queued", user_id, position=position + 1)
+                )
+            else:
+                await processing_msg.edit_text(t("downloading", user_id))
+            
+            return True, None
+            
+        except Exception as e:
+            logger.error(f"Failed to queue task: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False, "download_failed"
+    
+    @staticmethod
+    def _map_callback_to_strategy(callback_data: str, url: str | None = None) -> str | None:
+        """Map callback_data to strategy key.
+        
+        Examples:
+            "download_audio" -> "download_audio" (or "spotify" if Spotify URL)
+            "download_video" -> "download_video" 
+            "download_thumbnail" -> "download_thumbnail"
+            "quality_1080" -> "video_1080"
+            "quality_best" -> "video_best"
+            "spotify" -> "spotify"
+        """
+        if callback_data == "download_audio" or is_spotify_url(url):
+            return "spotify" if is_spotify_url(url) else "audio"
+        if callback_data == "download_thumbnail":
+            return "thumbnail"
+        if callback_data == "download_subtitle":
+            return "subtitle"
+        if callback_data.startswith("quality_"):
+            return "video"
+        if callback_data == "download_video":
+            return "video"
+        return None
+
+    @staticmethod
+    async def enqueue_silent(user, url: str, download_type: str, status_msg, context):
+        user_id = user.id
+
+        strategy = StrategyFactory.get(download_type)
+        if not strategy:
+            await status_msg.edit_text(f"❌ Unsupported type: {download_type}")
+            return
+
+        task_id = str(uuid.uuid4())[:8]
+        task = DownloadTask(
+            task_id=task_id,
+            user_id=user_id,
+            url=url,
+            download_type=download_type,
+        )
+
+        class _SilentQuery:
+            from_user = user
+            message = status_msg
+
+            async def edit_message_text(self, text, **kwargs):
+                try:
+                    await status_msg.edit_text(text, **kwargs)
+                except Exception:
+                    pass
+
+        task_ctx = {
+            "query": _SilentQuery(),
+            "processing_msg": status_msg,
+            "context": context,
+        }
+        await download_queue.add_task(task, telegram_ctx=task_ctx)
+        log_user(user, f"batch_enqueue:{download_type}")
+
+========================================
+FILE: ./core/history.py
+========================================
+import os
+import time
+import logging
+from typing import Optional
+from core.db import get_db
+
+logger = logging.getLogger(__name__)
+
+MAX_ENTRIES_PER_USER = 100
+MAX_TOTAL_ENTRIES = 5000
+
+
+async def add_history(user_id: int, url: str, download_type: str, file_size: Optional[int] = None, 
+                     title: Optional[str] = None, status: str = "success", file_path: Optional[str] = None,
+                     file_id: Optional[str] = None):
+    now = time.time()
+    
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO history (user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, url, download_type, status, file_size, title, file_path, file_id, now)
+        )
+        
+        await db.execute(
+            """
+            DELETE FROM history WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
+            )
+            """,
+            (user_id, user_id, MAX_ENTRIES_PER_USER)
+        )
+        
+        async with db.execute("SELECT COUNT(*) FROM history") as cursor:
+            row = await cursor.fetchone()
+            total = row[0] if row else 0
+        
+        if total > MAX_TOTAL_ENTRIES:
+            delete_count = total - MAX_TOTAL_ENTRIES
+            await db.execute(
+                """
+                DELETE FROM history WHERE id IN (
+                    SELECT id FROM history ORDER BY timestamp ASC LIMIT ?
+                )
+                """,
+                (delete_count,)
+            )
+        
+        await db.commit()
+
+
+async def get_user_history(user_id: int, limit: int = 10) -> list:
+    async with get_db() as db:
+        async with db.execute(
+            """
+            SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
+            FROM history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
+            """,
+            (user_id, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def get_user_history_page(user_id: int, page: int = 0, page_size: int = 5) -> tuple[list, int]:
+    offset = page * page_size
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,)
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
+        async with db.execute(
+            """
+            SELECT user_id, url, download_type, status, file_size, title,
+                   file_path, file_id, timestamp
+            FROM history WHERE user_id = ?
+            ORDER BY timestamp DESC LIMIT ? OFFSET ?
+            """,
+            (user_id, page_size, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    return [dict(r) for r in rows], total
+
+
+async def clear_user_history(user_id: int):
+    async with get_db() as db:
+        await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+async def get_all_users_count() -> int:
+    async with get_db() as db:
+        async with db.execute("SELECT COUNT(DISTINCT user_id) FROM history") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def get_total_downloads() -> int:
+    async with get_db() as db:
+        async with db.execute("SELECT COUNT(*) FROM history") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def get_failed_downloads(user_id: Optional[int] = None, limit: int = 20) -> list:
+    sql = "SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp FROM history WHERE status = 'failed'"
+    params: tuple = ()
+    if user_id:
+        sql += " AND user_id = ?"
+        params = (user_id,)
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params += (limit,)
+
+    async with get_db() as db:
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def check_recent_download(url: str, max_age_hours: int = 24) -> Optional[dict]:
+    """Check if URL was recently downloaded and file still exists."""
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    async with get_db() as db:
+        async with db.execute(
+            """
+            SELECT user_id, url, download_type, status, file_size, title, file_path, file_id, timestamp
+            FROM history 
+            WHERE url = ? AND status = 'success' AND timestamp > ? AND (file_path IS NOT NULL OR file_id IS NOT NULL)
+            ORDER BY timestamp DESC LIMIT 1
+            """,
+            (url, now - max_age_seconds)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                entry = dict(row)
+                if entry.get("file_path") and os.path.exists(entry["file_path"]):
+                    return entry
+                if entry.get("file_id"):
+                    return entry
+    return None
+
+
+async def get_file_id_by_url(url: str, max_age_hours: int = 168) -> Optional[str]:
+    """Get file_id by URL (up to 7 days). Returns file_id if available."""
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    async with get_db() as db:
+        async with db.execute(
+            """
+            SELECT file_id FROM history 
+            WHERE url = ? AND status = 'success' AND file_id IS NOT NULL AND timestamp > ?
+            ORDER BY timestamp DESC LIMIT 1
+            """,
+            (url, now - max_age_seconds)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+    return None
+
+
+async def clear_file_id_by_url(url: str):
+    """Remove file_id from history entries for a URL, forcing re-download."""
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE history SET file_id = NULL WHERE url = ? AND file_id IS NOT NULL",
+            (url,)
+        )
+        await db.commit()
+
+
+
+========================================
+FILE: ./core/i18n.py
+========================================
+import os
+import json
+import sqlite3
+from typing import Optional
+
+from core.db import DB_PATH
+
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCALES_DIR = os.path.join(BASE_DIR, "locales")
+_cache = {"translations": {}}
+
+DEFAULT_LANG = "en"
+
+LANGUAGES = {
+    "en": "English",
+    "zh": "中文",
+    "ja": "日本語",
+    "ko": "한국어",
+}
+
+
+def _load_translations(lang: str) -> dict:
+    global _cache
+    
+    if lang in _cache["translations"]:
+        return _cache["translations"][lang]
+    
+    file_path = os.path.join(LOCALES_DIR, f"{lang}.json")
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                _cache["translations"][lang] = json.load(f)
+                return _cache["translations"][lang]
+        except Exception:
+            pass
+    
+    if lang != DEFAULT_LANG:
+        return _load_translations(DEFAULT_LANG)
+    
+    return {}
+
+_lang_cache: dict[int, str] = {}
+
+def get_user_lang(user_id: int) -> str:
+    return _lang_cache.get(user_id, DEFAULT_LANG)
+
+async def warm_user_lang(user_id: int) -> str:
+    from core.db import get_db
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT lang FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            lang = row[0] if row and row[0] else DEFAULT_LANG
+    _lang_cache[user_id] = lang
+    return lang
+
+async def set_user_lang(user_id: int, lang: str):
+    _lang_cache[user_id] = lang
+    from core import users
+    await users.set_user_lang(user_id, lang)
+
+
+def _get_nested(translations: dict, key: str) -> Optional[str]:
+    keys = key.split(".")
+    value = translations
+    for k in keys:
+        if isinstance(value, dict):
+            value = value.get(k)
+        else:
+            return None
+    return value if isinstance(value, str) else None
+
+
+def _get_plural(translations: dict, key: str, count: int) -> Optional[str]:
+    if count == 1:
+        plural_key = key
+    else:
+        plural_key = f"{key}_plural"
+    
+    result = translations.get(plural_key)
+    if result and "{count}" in result:
+        return result.replace("{count}", str(count))
+    return result if result else str(count)
+
+
+def detect_system_lang(lang_code: str) -> str:
+    lang_code = lang_code.lower().replace("-", "_")
+    
+    if lang_code in LANGUAGES:
+        return lang_code
+    
+    primary = lang_code.split("_")[0]
+    if primary in LANGUAGES:
+        return primary
+    
+    lang_map = {
+        "zh": "zh", "zhcn": "zh", "zhtw": "zh", "zhhk": "zh",
+        "ja": "ja",
+        "ko": "ko",
+        "es": "es", "sp": "es",
+        "fr": "fr",
+        "de": "de",
+        "pt": "pt", "ptbr": "pt", "ptpt": "pt",
+        "ru": "ru",
+        "ar": "ar",
+        "hi": "hi",
+        "id": "id", "in": "id",
+        "vi": "vi",
+        "th": "th",
+    }
+    
+    return lang_map.get(primary, DEFAULT_LANG)
+
+
+def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -> str:
+    if not lang:
+        lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
+
+    if user_id:
+        kwargs.setdefault('user_id', user_id)
+
+    translations = _load_translations(lang)
+    text = _get_nested(translations, key)
+
+    if not text:
+        text = _get_nested(_load_translations(DEFAULT_LANG), key) or key
+
+    try:
+        return text.format(**kwargs)
+    except KeyError as e:
+        logger.warning(f"Missing i18n placeholder {e} for key '{key}'")
+        return text
+
+def tp(key: str, count: int, user_id: Optional[int] = None, **kwargs) -> str:
+    if user_id:
+        lang = get_user_lang(user_id)
+    else:
+        lang = DEFAULT_LANG
+    
+    translations = _load_translations(lang)
+    
+    plural_text = _get_plural(translations, key, count)
+    
+    if plural_text and "{count}" in plural_text:
+        return plural_text.replace("{count}", str(count))
+    elif plural_text:
+        return plural_text
+    
+    fallback = _get_plural(_load_translations(DEFAULT_LANG), key, count)
+    if fallback and "{count}" in fallback:
+        return fallback.replace("{count}", str(count))
+    elif fallback:
+        return fallback
+    
+    return str(count)
+
+========================================
+FILE: ./core/logger.py
+========================================
+import logging
+import os
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, "bot_users.log")
+
+def setup_logging():
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(console_handler)
+    
+    file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "app.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3
+    )
+    file_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(file_handler)
+    
+    audit_logger = logging.getLogger("audit")
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
+    
+    audit_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5
+    )
+    audit_handler.setFormatter(logging.Formatter(log_format))
+    audit_logger.addHandler(audit_handler)
+
+def log_user(user, action, extra=None):
+    if not user:
+        return
+    
+    user_id = user.id
+    username = user.username or "N/A"
+    name = f"{user.first_name} {user.last_name or ''}".strip()
+    
+    extra_info = f" | {extra}" if extra else ""
+    entry = f"{datetime.now()} | ID: {user_id} | @{username} | {name} | {action}{extra_info}"
+    
+    logging.getLogger("audit").info(entry)
+
+
+def log_download(user, action, url, status, file_size=None, format_id=None):
+    extra = f"url={url[:50]}... | status={status}"
+    if file_size:
+        mb = file_size / (1024 * 1024)
+        extra += f" | size={mb:.1f}MB"
+    if format_id:
+        extra += f" | format={format_id}"
+    log_user(user, action, extra)
+
+
+async def get_user_stats():
+    from core.history import get_all_users_count, get_total_downloads, get_failed_downloads
+
+    total_users = await get_all_users_count()
+    total_dl = await get_total_downloads()
+    failed = await get_failed_downloads(limit=5)
+
+    msg = (
+        f"📊 Bot Statistics\n"
+        f"Total registered users: {total_users}\n"
+        f"Total downloads: {total_dl}\n"
+        f"Recent failures: {len(failed)}\n"
+    )
+    return msg
+
+
+========================================
+FILE: ./core/model.py
+========================================
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Any, TypedDict
+
+
+class DownloadStatus(Enum):
+    QUEUED = "queued"
+    DOWNLOADING = "downloading"
+    PROCESSING = "processing"
+    UPLOADING = "uploading"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+STATUS_EMOJI: dict[DownloadStatus, str] = {
+    DownloadStatus.QUEUED:      "⏳",
+    DownloadStatus.DOWNLOADING: "⬇️",
+    DownloadStatus.PROCESSING:  "⚙️",
+    DownloadStatus.UPLOADING:   "📤",
+    DownloadStatus.COMPLETED:   "✅",
+    DownloadStatus.FAILED:      "❌",
+    DownloadStatus.CANCELLED:   "🚫",
+}
+
+
+@dataclass
+class DownloadTask:
+    task_id: str
+    user_id: int
+    url: str
+    download_type: str
+    format_id: Optional[str] = None
+    status: DownloadStatus = DownloadStatus.QUEUED
+    progress: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    max_retries: int = 2
+    retry_count: int = 0
+    retry_delay: float = 5.0
+
+
+class TaskContext(TypedDict):
+    query: Any
+    processing_msg: Any
+    context: Any
+
+========================================
+FILE: ./core/models.py
+========================================
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Any, TypedDict
+
+
+class DownloadStatus(Enum):
+    QUEUED = "queued"
+    DOWNLOADING = "downloading"
+    PROCESSING = "processing"
+    UPLOADING = "uploading"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+STATUS_EMOJI: dict[DownloadStatus, str] = {
+    DownloadStatus.QUEUED:      "⏳",
+    DownloadStatus.DOWNLOADING: "⬇️",
+    DownloadStatus.PROCESSING:  "⚙️",
+    DownloadStatus.UPLOADING:   "📤",
+    DownloadStatus.COMPLETED:   "✅",
+    DownloadStatus.FAILED:      "❌",
+    DownloadStatus.CANCELLED:   "🚫",
+}
+
+
+@dataclass
+class DownloadTask:
+    task_id: str
+    user_id: int
+    url: str
+    download_type: str
+    format_id: Optional[str] = None
+    status: DownloadStatus = DownloadStatus.QUEUED
+    progress: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    max_retries: int = 2
+    retry_count: int = 0
+    retry_delay: float = 5.0
+
+
+class TaskContext(TypedDict):
+    query: Any
+    processing_msg: Any
+    context: Any
+
+========================================
+FILE: ./core/queue.py
+========================================
+import logging
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Callable, TypedDict, Any
+from telegram import Bot
+from core.task_store import persist_task
+from core.models import DownloadTask, DownloadStatus, STATUS_EMOJI, TaskContext
+
+logger = logging.getLogger(__name__)
+
+class DownloadQueue:
+    def __init__(self, max_concurrent: int = 3, max_completed_tasks: int = 100):
+        self.max_concurrent = max_concurrent
+        self.max_completed_tasks = max_completed_tasks
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.active_tasks: dict[str, DownloadTask] = {}
+        self.completed_tasks: dict[str, DownloadTask] = {}
+        self.user_downloads: dict[int, set[str]] = {}
+        self._workers: list[asyncio.Task] = []
+        self._running = False
+        self._cancel_events: dict[str, asyncio.Event] = {}
+        self._executor: Optional[Callable] = None
+        self._pending_user_tasks: dict[int, list[str]] = {}
+        self._task_contexts: dict[str, TaskContext] = {}
+    
+    def set_executor(self, executor: Callable):
+        """Set the async function to execute when processing a task.
+        
+        The executor should accept: (task: DownloadTask, processing_msg, context)
+        """
+        self._executor = executor
+    
+    async def start(self):
+        self._running = True
+        self._cancel_event = asyncio.Event()
+        self._workers = [
+            asyncio.create_task(self._worker(i))
+            for i in range(self.max_concurrent)
+        ]
+
+    async def stop(self):
+        self._running = False
+        if self._cancel_event:
+            self._cancel_event.set()
+        for worker in self._workers:
+            worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+
+    async def _worker(self, worker_id: int):
+        while self._running:
+            try:
+                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                await self._process_task(task)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    def get_task_context(self, task_id: str) -> Optional[TaskContext]:
+        return self._task_contexts.get(task_id)
+
+    def _finalize_task(self, task: DownloadTask, status: DownloadStatus, error: str = None):
+        task.status = status
+        task.completed_at = time.time()
+        if error:
+            task.error = error
+        self.completed_tasks[task.task_id] = task
+        self.active_tasks.pop(task.task_id, None)
+        self._task_contexts.pop(task.task_id, None)
+        self._cleanup_completed()
+        self._cancel_events.pop(task.task_id, None)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(persist_task(task))
+        except RuntimeError:
+            pass
+
+    async def _process_task(self, task: DownloadTask):
+        task.status = DownloadStatus.DOWNLOADING
+        task.started_at = time.time()
+        self.active_tasks[task.task_id] = task
+        await persist_task(task)
+
+        user_pending = self._pending_user_tasks.get(task.user_id, [])
+        if task.task_id in user_pending:
+            user_pending.remove(task.task_id)
+
+        if not self._executor:
+            self._finalize_task(task, DownloadStatus.FAILED, "No executor configured")
+            return
+
+        last_error = None
+        for attempt in range(task.max_retries + 1):
+            if attempt > 0:
+                logger.info(
+                    f"Retrying task {task.task_id} "
+                    f"(attempt {attempt}/{task.max_retries}, delay={task.retry_delay}s)"
+                )
+                await asyncio.sleep(task.retry_delay * attempt)
+                task.retry_count = attempt
+                await persist_task(task)
+
+                ctx = self.get_task_context(task.task_id)
+                if ctx:
+                    try:
+                        await ctx["processing_msg"].edit_text(
+                            f"🔄 Retrying... (attempt {attempt}/{task.max_retries})"
+                        )
+                    except Exception:
+                        pass
+
+            try:
+                await self._executor(task)
+                if task.status not in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+                    self._finalize_task(task, DownloadStatus.COMPLETED)
+                elif task.status == DownloadStatus.FAILED and attempt < task.max_retries:
+                    last_error = task.error
+                    task.status = DownloadStatus.DOWNLOADING
+                    continue
+                else:
+                    self._finalize_task(task, task.status, task.error)
+                return
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Task {task.task_id} attempt {attempt} failed: {e}")
+                if attempt >= task.max_retries:
+                    break
+
+        logger.error(f"Task {task.task_id} failed after {task.max_retries} retries: {last_error}")
+        self._finalize_task(task, DownloadStatus.FAILED, f"Failed after {task.max_retries} retries: {last_error}")
+
+    async def add_task(self, task: DownloadTask, telegram_ctx: TaskContext = None) -> str:
+        await self.queue.put(task)
+        if task.user_id not in self.user_downloads:
+            self.user_downloads[task.user_id] = set()
+        self.user_downloads[task.user_id].add(task.task_id)
+
+        if task.user_id not in self._pending_user_tasks:
+            self._pending_user_tasks[task.user_id] = []
+        self._pending_user_tasks[task.user_id].append(task.task_id)
+
+        if telegram_ctx is not None:
+            self._task_contexts[task.task_id] = telegram_ctx
+        
+        self._cancel_events[task.task_id] = asyncio.Event()
+        return task.task_id
+
+    def get_task(self, task_id: str) -> Optional[DownloadTask]:
+        return self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
+
+    def get_cancel_event(self, task_id: str) -> Optional[asyncio.Event]:
+        return self._cancel_events.get(task_id)
+
+    def get_user_tasks(self, user_id: int) -> list[DownloadTask]:
+        task_ids = self.user_downloads.get(user_id, set())
+        tasks = []
+        for tid in task_ids:
+            task = self.get_task(tid)
+            if task:
+                tasks.append(task)
+        return sorted(tasks, key=lambda t: t.created_at, reverse=True)
+    
+    def get_queue_position(self, user_id: int) -> int:
+        """Get the number of queued tasks for a user (not including active)."""
+        return len(self._pending_user_tasks.get(user_id, []))
+    
+    def get_total_queued(self) -> int:
+        """Get total number of queued tasks."""
+        return self.queue.qsize()
+    
+    def get_active_count(self) -> int:
+        """Get number of currently active tasks."""
+        return len(self.active_tasks)
+
+    async def cancel_active_task(self, task_id: str) -> bool:
+        task = self.active_tasks.get(task_id)
+        if not task:
+            return False
+        
+        event = self._cancel_events.get(task_id)
+        if event:
+            event.set()
+        return True
+
+    async def cancel_queued_task(self, task_id: str) -> bool:
+        remaining = []
+        cancelled = False
+        
+        while not self.queue.empty():
+            try:
+                task = self.queue.get_nowait()
+                if task.task_id == task_id:
+                    task.status = DownloadStatus.CANCELLED
+                    task.completed_at = time.time()
+                    self.completed_tasks[task_id] = task
+                    self._task_contexts.pop(task_id, None)
+                    cancelled = True
+                else:
+                    remaining.append(task)
+            except asyncio.QueueEmpty:
+                break
+    
+        for t in remaining:
+            await self.queue.put(t)
+    
+        if cancelled:
+            user_pending = self._pending_user_tasks.get(task.user_id, [])
+            if task_id in user_pending:
+                user_pending.remove(task_id)
+    
+        return cancelled
+
+    async def cancel_task(self, task_id: str) -> bool:
+        if task_id in self.active_tasks:
+            return await self.cancel_active_task(task_id)
+        
+        return await self.cancel_queued_task(task_id)
+
+    def complete_task(self, task: DownloadTask):
+        task.status = DownloadStatus.COMPLETED
+        task.completed_at = time.time()
+        self.completed_tasks[task.task_id] = task
+        if task.task_id in self.active_tasks:
+            del self.active_tasks[task.task_id]
+        self._cleanup_completed()
+
+    def fail_task(self, task: DownloadTask, error: str):
+        task.status = DownloadStatus.FAILED
+        task.error = error
+        task.completed_at = time.time()
+        self.completed_tasks[task.task_id] = task
+        if task.task_id in self.active_tasks:
+            del self.active_tasks[task.task_id]
+        self._cleanup_completed()
+
+    def _cleanup_completed(self):
+        if len(self.completed_tasks) > self.max_completed_tasks:
+            sorted_tasks = sorted(
+                self.completed_tasks.items(),
+                key=lambda x: x[1].completed_at or 0
+            )
+            to_remove = sorted_tasks[:len(sorted_tasks) - self.max_completed_tasks]
+            for task_id, _ in to_remove:
+                del self.completed_tasks[task_id]
+                for user_tasks in self.user_downloads.values():
+                    user_tasks.discard(task_id)
+
+
+download_queue = DownloadQueue(max_concurrent=3)
+
+========================================
+FILE: ./core/ratelimit.py
+========================================
+import os
+import time
+import asyncio
+import logging
+import aiosqlite
+from dataclasses import dataclass
+from typing import Optional
+from config import RATE_TIER_LIMITS, ADMIN_IDS
+from core.db import get_db
+
+logger = logging.getLogger(__name__)
+
+
+def load_rate_limit() -> dict:
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rate_limit_config.json")
+    if os.path.exists(config_path):
+        import json
+        with open(config_path, "r") as f:
+            return json.load(f)
+    return {"max_downloads_per_hour": 10, "enabled": True}
+
+
+def save_rate_limit(max_downloads: int, enabled: bool):
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rate_limit_config.json")
+    import json
+    with open(config_path, "w") as f:
+        json.dump({"max_downloads_per_hour": max_downloads, "enabled": enabled}, f)
+
+
+async def get_user_tier(user_id: int) -> str:
+    """查询用户等级，默认 normal。"""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT tier FROM user_rate_tiers WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else "normal"
+
+
+async def get_user_limit(user_id: int) -> int:
+    if ADMIN_IDS and user_id in ADMIN_IDS:
+        return 999999
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT tier, max_per_hour FROM user_rate_tiers WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if row:
+        tier, custom_max = row
+        if custom_max is not None:
+            return custom_max                       
+        return RATE_TIER_LIMITS.get(tier, RATE_TIER_LIMITS["normal"])
+
+    return RATE_TIER_LIMITS["normal"]
+
+
+async def set_user_tier(user_id: int, tier: str, note: str = "", set_by: int = None, custom_max: int = None):
+    import time
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO user_rate_tiers (user_id, tier, max_per_hour, note, set_by, set_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                tier         = excluded.tier,
+                max_per_hour = excluded.max_per_hour,
+                note         = excluded.note,
+                set_by       = excluded.set_by,
+                set_at       = excluded.set_at
+            """,
+            (user_id, tier, custom_max, note, set_by, time.time()),
+        )
+        await db.commit()
+
+
+class RateLimiter:
+    def __init__(self):
+        config = load_rate_limit()
+        self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
+        self.enabled = config.get("enabled", True)
+
+    def reload(self):
+        config = load_rate_limit()
+        self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
+        self.enabled = config.get("enabled", True)
+
+    async def check_limit(self, user_id: int) -> tuple[bool, Optional[str]]:
+        if not self.enabled:
+            return True, None
+
+        user_max = await get_user_limit(user_id)
+
+        if user_max == 999999:
+            return True, None
+        if user_max == 0:
+            return False, "Your account has been suspended."
+
+        now = time.time()
+        window = 3600
+
+        async with get_db() as db:
+            await db.execute("BEGIN IMMEDIATE")   # 独占锁，消除竞态
+            try:
+                await db.execute(
+                    "DELETE FROM rate_limit WHERE timestamp < ?", (now - window,)
+                )
+                async with db.execute(
+                    "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                    (user_id, now - window),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    count = row[0] if row else 0
+
+                if count >= user_max:
+                    await db.execute("ROLLBACK")
+                    remaining_secs = int(window - (now - (now - window)))
+                    return False, f"Rate limit exceeded ({count}/{user_max} per hour)."
+
+                await db.execute(
+                    "INSERT INTO rate_limit (user_id, timestamp) VALUES (?, ?)",
+                    (user_id, now),
+                )
+                await db.commit()
+                return True, None
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    async def get_remaining(self, user_id: int) -> int:
+        if not self.enabled:
+            return 999
+        now = time.time()
+        window = 3600
+        
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                (user_id, now - window)
+            ) as cursor:
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+        
+        return max(0, self.max_downloads_per_hour - count)
+
+    async def reset(self, user_id: int):
+        async with get_db() as db:
+            await db.execute("DELETE FROM rate_limit WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    def get_status(self) -> dict:
+        return {
+            "max_downloads_per_hour": self.max_downloads_per_hour,
+            "enabled": self.enabled,
+            "active_users": 0
+        }
+
+    async def get_remaining(self, user_id: int) -> int:
+        user_max = await get_user_limit(user_id)
+        if user_max >= 999999:
+            return 999
+        if user_max == 0:
+            return 0
+        now = time.time()
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                (user_id, now - 3600),
+            ) as cur:
+                row = await cur.fetchone()
+                count = row[0] if row else 0
+        return max(0, user_max - count)
+
+
+rate_limiter = RateLimiter()
+
+========================================
+FILE: ./core/session.py
+========================================
+class UserSession:
+    
+    _KEY_URL    = "pending_url_{}"
+    _KEY_CACHE  = "cached_file_{}"
+
+    @staticmethod
+    def set_pending(context, user_id: int, url: str, cached_path: str = None):
+        context.user_data[UserSession._KEY_URL.format(user_id)] = url
+        context.user_data[UserSession._KEY_CACHE.format(user_id)] = cached_path
+
+    @staticmethod
+    def get_pending_url(context, user_id: int) -> str | None:
+        return context.user_data.get(UserSession._KEY_URL.format(user_id))
+
+    @staticmethod
+    def get_cached_file(context, user_id: int) -> str | None:
+        return context.user_data.get(UserSession._KEY_CACHE.format(user_id))
+
+    @staticmethod
+    def clear(context, user_id: int):
+        context.user_data.pop(UserSession._KEY_URL.format(user_id), None)
+        context.user_data.pop(UserSession._KEY_CACHE.format(user_id), None)
+
+========================================
+FILE: ./core/storage.py
+========================================
+import os
+import json
+import time
+import fcntl
+import threading
+import asyncio
+from filelock import FileLock
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+from core.utils import get_running_loop as _get_running_loop
+
+
+_executor = ThreadPoolExecutor(max_workers=4)
+
+
+class JsonStore:
+    def __init__(self, data_file: str, lock_file: str, cache_ttl: float = 5.0):
+        self.data_file = data_file
+        self.lock_file = lock_file
+        self.cache_ttl = cache_ttl
+        
+        self._cache = {"data": None, "dirty": False, "time": 0}
+        self._cache_lock = threading.Lock()
+        self._persist_interval = 30
+        self._last_persist = 0
+    
+    def _load_unsafe(self) -> dict:
+        if not os.path.exists(self.data_file):
+            return {}
+        try:
+            with open(self.data_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    
+    def load(self) -> dict:
+        return self._sync_load()
+    
+    async def load_async(self) -> dict:
+        loop = _get_running_loop()
+        if loop:
+            return await loop.run_in_executor(_executor, self._sync_load)
+        return self._sync_load()
+    
+    def _sync_load(self) -> dict:
+        with self._cache_lock:
+            now = time.time()
+            if self._cache["data"] is None or now - self._cache["time"] > self.cache_ttl:
+                self._cache["data"] = self._load_unsafe()
+                self._cache["time"] = now
+            return self._cache["data"].copy()
+    
+    def _save_unsafe(self, data: dict):
+        lock = FileLock(self.lock_file, timeout=10)
+        with lock:
+            with open(self.data_file, "w") as f:
+                json.dump(data, f, indent=2)
+    
+    def persist(self):
+        self._sync_persist()
+    
+    async def persist_async(self):
+        loop = _get_running_loop()
+        if loop:
+            await loop.run_in_executor(_executor, self._sync_persist)
+        else:
+            self._sync_persist()
+    
+    def _sync_persist(self):
+        with self._cache_lock:
+            if self._cache["dirty"]:
+                self._save_unsafe(self._cache["data"])
+                self._cache["dirty"] = False
+                self._last_persist = time.time()
+    
+    def mark_dirty(self, data: dict):
+        with self._cache_lock:
+            self._cache["data"] = data
+            self._cache["dirty"] = True
+            self._cache["time"] = time.time()
+    
+    def force_persist(self):
+        self.persist()
+    
+    async def force_persist_async(self):
+        await self.persist_async()
+
+========================================
+FILE: ./core/strategies.py
+========================================
+import os
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
+from core.history import get_file_id_by_url, add_history
+from core.logger import log_download
+from core.downloader import get_formats
+from app.download import _make_progress_hook
+
+logger = logging.getLogger(__name__)
+
+
+class DownloadStrategy(ABC):
+    """Base class for download strategies using Template Method pattern."""
+    
+    @property
+    @abstractmethod
+    def download_type(self) -> str:
+        """Return the type identifier for this strategy."""
+        pass
+    
+    @property
+    @abstractmethod
+    def telegram_method(self) -> str:
+        """Return 'video', 'audio', or 'photo' for Telegram sending."""
+        pass
+    
+    def _get_caption(self, title: str, emoji: str = "🎬") -> str | None:
+        """Build caption from title."""
+        return f"{emoji} {title}" if title else None
+    
+    async def _check_cached_file(self, url: str, context: CallbackContext, user_id: int) -> str | None:
+        """Check for cached file from recent downloads."""
+        from core.history import check_recent_download
+        
+        recent = await check_recent_download(url, max_age_hours=24)
+        if recent:
+            file_path = recent.get("file_path")
+            if file_path and os.path.exists(file_path):
+                size = os.path.getsize(file_path)
+                if size <= MAX_CACHE_SIZE:
+                    logger.info(f"Using cached file for {url}: {file_path}")
+                    return file_path
+        return None
+    
+    async def _get_file_id_or_upload(self, query, url: str, filename: str, caption: str | None, user_id: int):
+        """Get existing file_id or upload new file. Template method."""
+        existing_id = await get_file_id_by_url(url)
+        
+        if existing_id:
+            logger.info(f"Using file_id for {url}: {existing_id}")
+            await self._send_from_file_id(query, existing_id, caption)
+            return existing_id
+        
+        return await self._upload_new_file(query, filename, caption, url, user_id)
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        """Override in subclass for type-specific sending."""
+        raise NotImplementedError
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        """Upload new file and save to history."""
+        raise NotImplementedError
+    
+    async def _validate_file_size(self, filename: str, processing_msg, user_id: int) -> bool:
+        """Check file size and delete if too large."""
+        from core.i18n import t
+        
+        file_size = os.path.getsize(filename)
+        if file_size > MAX_FILE_SIZE:
+            await processing_msg.edit_text(
+                t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
+            )
+            os.remove(filename)
+            return False
+        return True
+    
+    def _cleanup_temp_file(self, filename: str, cached_file: str | None):
+        """Delete temp file if not cached."""
+        if os.path.exists(filename) and not cached_file:
+            os.remove(filename)
+    
+    async def execute(self, query, url: str, processing_msg, context: CallbackContext):
+        """Main execution template - orchestrates the download flow."""
+        user_id = query.from_user.id
+        from core.i18n import t
+
+        existing_id = await get_file_id_by_url(url)
+        if existing_id:
+            logger.info(f"Using existing file_id for {url}: {existing_id}")
+            try:
+                await self._send_from_file_id(query, existing_id, caption=None)
+                log_download(query.from_user, f"{self.download_type}_cached_sent", url, "success")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to send via file_id (maybe expired): {e}. Proceeding to download.")
+                from core.history import clear_file_id_by_url
+                await clear_file_id_by_url(url)
+        
+        cached_file = await self._check_cached_file(url, context, user_id)
+        
+        if cached_file and os.path.exists(cached_file):
+            filename = cached_file
+            title = os.path.splitext(os.path.basename(filename))[0]
+            info = {"title": title}
+        else:
+            try:
+                await processing_msg.edit_text(t("downloading", user_id))
+                loop = asyncio.get_running_loop()
+                progress_hook = _make_progress_hook(processing_msg, loop)
+                filename, info = await self._do_download(url, progress_hook)
+            except Exception as e:
+                logger.error(f"Download failed: {type(e).__name__}: {e}")
+                await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+                log_download(query.from_user, f"{self.download_type}_downloaded", url, f"download_failed: {e}")
+                await add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
+                return
+            
+            if not os.path.exists(filename):
+                await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+                log_download(query.from_user, f"{self.download_type}_downloaded", url, "download_failed: File not found")
+                await add_history(query.from_user.id, url, self.download_type, 0, None, "failed")
+                return
+        
+        if not await self._validate_file_size(filename, processing_msg, user_id):
+            return
+        
+        title = info.get("title") if info else None
+        caption = self._get_caption(title) if title else None
+        
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        try:
+            file_size = os.path.getsize(filename)
+            logger.info(f"Starting upload: {self.download_type} - file: {filename}, size: {file_size} bytes")
+            
+            file_id = await self._get_file_id_or_upload(query, url, filename, caption, user_id)
+            
+            logger.info(f"Upload completed successfully: file_id={file_id}")
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", file_size)
+            await add_history(query.from_user.id, url, self.download_type, file_size, title, "success", filename, file_id)
+        except Exception as e:
+            import traceback
+            logger.error(f"Upload failed: {type(e).__name__}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
+            await add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename) if os.path.exists(filename) else 0, title, "failed")
+        
+        self._cleanup_temp_file(filename, cached_file)
+    
+    @abstractmethod
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+        """Implement actual download logic in subclass. Returns (filename, info_dict)."""
+        pass
+
+
+class VideoStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "video"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "video"
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_video(video=file_id, caption=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        logger.info(f"Opening file for upload: {filename}")
+        with open(filename, "rb") as f:
+            logger.info(f"Sending video to Telegram...")
+            sent_msg = await query.message.reply_video(video=f, caption=caption)
+        logger.info(f"Video upload response received")
+        return sent_msg.video.file_id if sent_msg.video else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_video
+        format_id = "best"
+        return await download_video(url, format_id, progress_hook)
+
+
+class AudioStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "audio"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "audio"
+    
+    def _get_caption(self, title: str, emoji: str = "🎵") -> str | None:
+        return f"{emoji} {title}" if title else None
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_audio(audio=file_id, title=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        title = os.path.splitext(os.path.basename(filename))[0]
+        logger.info(f"Opening file for upload: {filename}")
+        with open(filename, "rb") as f:
+            logger.info(f"Sending audio to Telegram...")
+            sent_msg = await query.message.reply_audio(audio=f, title=title)
+        logger.info(f"Audio upload response received")
+        return sent_msg.audio.file_id if sent_msg.audio else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_audio
+        return await download_audio(url, progress_hook)
+
+
+class SpotifyStrategy(AudioStrategy):
+    @property
+    def download_type(self) -> str:
+        return "spotify"
+    
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+        from core.downloader import download_spotify
+        return await download_spotify(url, progress_hook=progress_hook)
+
+class ThumbnailStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "thumbnail"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "photo"
+    
+    async def execute(self, query, url: str, processing_msg, context: CallbackContext):
+        user_id = query.from_user.id
+        from core.i18n import t
+        
+        await processing_msg.edit_text(t("downloading", user_id))
+        try:
+            thumbnail_url, info = await self._do_download(url, None)
+        except Exception as e:
+            logger.error(f"Thumbnail download failed: {e}")
+            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+            return
+            
+        title = info.get("title") if info else None
+        caption = self._get_caption(title) if title else None
+        
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        try:
+            logger.info(f"Starting upload: {self.download_type} - URL: {thumbnail_url}")
+            file_id = await self._get_file_id_or_upload(query, url, thumbnail_url, caption, user_id)
+            
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", 0)
+            await add_history(query.from_user.id, url, self.download_type, 0, title, "success", thumbnail_url, file_id)
+        except Exception as e:
+            await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
+            await add_history(query.from_user.id, url, self.download_type, 0, title, "failed")
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_photo(photo=file_id, caption=caption)
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        sent_msg = await query.message.reply_photo(photo=filename, caption=caption)
+        return sent_msg.photo[-1].file_id if sent_msg.photo else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import get_thumbnail
+        thumbnail_url, info = await get_thumbnail(url)
+        if not thumbnail_url:
+            raise RuntimeError("No thumbnail available")
+        return thumbnail_url, info
+
+
+class VideoFormatStrategy(VideoStrategy):
+    """Video strategy with specific format selection."""
+    
+    def __init__(self, format_id: str = "best"):
+        self._format_id = format_id
+        super().__init__()
+    
+    @property
+    def download_type(self) -> str:
+        return f"video_{self._format_id}"
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_video
+        return await download_video(url, self._format_id, progress_hook)
+
+
+# core/strategies.py — 新增 SubtitleStrategy
+
+class SubtitleStrategy(DownloadStrategy):
+
+    SUPPORTED_LANGS = ["zh-Hans", "zh-Hant", "zh", "en", "ja", "ko"]
+
+    @property
+    def download_type(self) -> str:
+        return "subtitle"
+
+    @property
+    def telegram_method(self) -> str:
+        return "document"
+
+    def _get_caption(self, title: str, emoji: str = "📝") -> str | None:
+        return f"{emoji} {title}" if title else None
+
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_document(document=file_id, caption=caption)
+
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        with open(filename, "rb") as f:
+            sent = await query.message.reply_document(document=f, caption=caption)
+        return sent.document.file_id if sent.document else None
+
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+        from core.downloader import download_subtitle
+        return await download_subtitle(url, preferred_langs=self.SUPPORTED_LANGS)
+
+
+class StrategyFactory:
+    """Factory for creating download strategies with lazy loading."""
+    
+    _strategies: dict[str, DownloadStrategy] = {}
+    _strategy_classes = {
+        "download_video": VideoStrategy,
+        "download_audio": AudioStrategy,
+        "download_thumbnail": ThumbnailStrategy,
+        "spotify": SpotifyStrategy,
+        "subtitle": SubtitleStrategy,
+    }
+    
+    @classmethod
+    def get(cls, key: str) -> DownloadStrategy | None:
+        if key not in cls._strategies:
+            if key in cls._strategy_classes:
+                cls._strategies[key] = cls._strategy_classes[key]()
+            elif key.startswith("video_"):
+                format_id = key.replace("video_", "")
+                cls._strategies[key] = VideoFormatStrategy(format_id)
+            else:
+                return None
+        return cls._strategies.get(key)
+    
+    @classmethod
+    def register(cls, key: str, strategy_class: type[DownloadStrategy]):
+        cls._strategy_classes[key] = strategy_class
+        if key in cls._strategies:
+            del cls._strategies[key]
+    
+    @classmethod
+    def clear_cache(cls):
+        """Clear cached strategy instances (useful for testing)."""
+        cls._strategies.clear()
+
+========================================
+FILE: ./core/task_store.py
+========================================
+import time
+import logging
+from typing import Optional
+from core.db import get_db
+from core.model import DownloadTask, DownloadStatus
+
+logger = logging.getLogger(__name__)
+
+
+async def persist_task(task: DownloadTask):
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO tasks (
+                task_id, user_id, url, download_type, format_id,
+                status, progress, error, file_path, file_size,
+                retry_count, created_at, started_at, completed_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status       = excluded.status,
+                progress     = excluded.progress,
+                error        = excluded.error,
+                file_path    = excluded.file_path,
+                file_size    = excluded.file_size,
+                retry_count  = excluded.retry_count,
+                started_at   = excluded.started_at,
+                completed_at = excluded.completed_at
+            """,
+            (
+                task.task_id, task.user_id, task.url, task.download_type,
+                task.format_id, task.status.value, task.progress,
+                task.error, task.file_path, task.file_size,
+                task.retry_count, task.created_at,
+                task.started_at, task.completed_at,
+            ),
+        )
+        await db.commit()
+
+
+async def get_task_record(task_id: str) -> Optional[dict]:
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_user_tasks(user_id: int, limit: int = 10) -> list[dict]:
+    async with get_db() as db:
+        async with db.execute(
+            """
+            SELECT * FROM tasks
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_incomplete_tasks(max_age_hours: int = 24) -> list[dict]:
+    since = time.time() - max_age_hours * 3600
+    async with get_db() as db:
+        async with db.execute(
+            """
+            SELECT * FROM tasks
+            WHERE status IN ('queued', 'downloading', 'processing')
+              AND created_at > ?
+            ORDER BY created_at ASC
+            """,
+            (since,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_stale_tasks_failed():
+    async with get_db() as db:
+        await db.execute(
+            """
+            UPDATE tasks
+            SET status = 'failed',
+                error  = 'Bot restarted, task interrupted',
+                completed_at = ?
+            WHERE status IN ('queued', 'downloading', 'processing')
+            """,
+            (time.time(),),
+        )
+        result = await db.execute("SELECT changes()")
+        row = await result.fetchone()
+        stale_count = row[0] if row else 0
+        await db.commit()
+
+    if stale_count:
+        logger.info(f"Marked {stale_count} stale tasks as failed on startup")
+    return stale_count
+
+
+========================================
+FILE: ./core/users.py
+========================================
+import time
+import logging
+import aiosqlite
+from core.db import DB_PATH
+
+logger = logging.getLogger(__name__)
+
+
+async def get_user_info(user_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, username, first_name, last_name, lang, added_at, last_seen FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return {}
+
+
+async def get_user_lang(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT lang FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+            return "en"
+
+
+async def set_user_lang(user_id: int, lang: str):
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO users (user_id, lang, added_at, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET lang = excluded.lang
+            """,
+            (user_id, lang, now, now)
+        )
+        await db.commit()
+
+
+async def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    now = time.time()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        existing_lang = None
+        async with db.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                existing_lang = row[0]
+        
+        set_clauses = []
+        params = []
+        
+        if username is not None:
+            set_clauses.append("username = ?")
+            params.append(username)
+        if first_name is not None:
+            set_clauses.append("first_name = ?")
+            params.append(first_name)
+        if last_name is not None:
+            set_clauses.append("last_name = ?")
+            params.append(last_name)
+        
+        set_clauses.append("last_seen = ?")
+        params.append(now)
+        
+        if existing_lang is not None:
+            set_clauses.append("lang = ?")
+            params.append(existing_lang)
+        
+        await db.execute(
+            f"""
+            INSERT INTO users (user_id, username, first_name, last_name, lang, added_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                {', '.join(set_clauses)}
+            """,
+            (user_id, username, first_name, last_name, existing_lang or "en", now, now) + tuple(params)
+        )
+        await db.commit()
+
+
+async def get_all_users() -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, username, first_name, last_name, last_seen, added_at FROM users"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+def format_user_display(user: dict) -> str:
+    parts = []
+    if user.get("username"):
+        parts.append(f"@{user['username']}")
+    if user.get("first_name"):
+        parts.append(user["first_name"])
+    if user.get("last_name"):
+        parts.append(user["last_name"])
+    
+    name = " ".join(parts) if parts else f"User {user['user_id']}"
+    return f"{name} (`{user['user_id']}`)"
+
+
+========================================
+FILE: ./core/utils.py
+========================================
+"""Common utilities for the bot - extracted to reduce duplication."""
+
+import os
+import asyncio
+from typing import Optional
+from datetime import datetime
+from functools import wraps
+from telegram import Update
+from telegram.ext import CallbackContext
+from services.user_service import get_allowed_users
+from config import ADMIN_IDS, BOT_FILE_PREFIX
+
+def is_user_allowed(user_id: int) -> bool:
+    allowed = get_allowed_users()
+    return not allowed or user_id in allowed
+
+def get_running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """Safely get the running event loop, falling back to the default loop."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            return None
+
+def format_history_item(item: dict) -> str:
+    dt = datetime.fromtimestamp(item["timestamp"])
+    status = "✅" if item.get("status") == "success" else "❌"
+    size = f" ({item['file_size'] // (1024 * 1024)}MB)" if item.get("file_size") else ""
+    title = (item.get("title") or "N/A")[:40]
+    error_msg = (item.get("error") or "")[:50]
+
+    lines = [
+        f"{status} {item['download_type']}{size}",
+        f"   {title}",
+        f"   {error_msg}",
+        f"   {dt.strftime('%Y-%m-%d %H:%M')}",
+    ]
+    return "\n".join(lines) + "\n\n"
+
+def format_history_list(history: list, header: str) -> str:
+    if not history:
+        return header + "（暂无记录）"
+    body = "".join(format_history_item(item) for item in history)
+    return header + body
+
+def format_bytes(bytes_val: int | float) -> str:
+    """Format bytes into human-readable string."""
+    if bytes_val is None:
+        return "?"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f}{unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f}PB"
+
+
+def check_admin(user_id: int) -> bool:
+    """Check if user is admin."""
+    return ADMIN_IDS and user_id in ADMIN_IDS
+
+
+def require_admin(func):
+    """Decorator to require admin access for commands."""
+    @wraps(func)
+    async def wrapper(update: Update, context: CallbackContext):
+        if not update.message:
+            return
+        user_id = update.message.from_user.id
+        if ADMIN_IDS and user_id not in ADMIN_IDS:
+            logger.warning(
+                f"Unauthorized admin command attempt: "
+                f"user_id={user_id}, command={update.message.text}"
+            )
+            await update.message.reply_text(t("not_authorized", user_id))
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def scan_temp_files(temp_dir: str) -> tuple[int, int, str | None, float | None]:
+    """
+    Scan temp directory for bot files.
+    Returns: (file_count, total_size, oldest_file, oldest_time)
+    """
+    count = 0
+    total_size = 0
+    oldest_file = None
+    oldest_time = None
+    
+    if not os.path.exists(temp_dir):
+        return count, total_size, oldest_file, oldest_time
+    
+    for fname in os.listdir(temp_dir):
+        fpath = os.path.join(temp_dir, fname)
+        if os.path.isfile(fpath):
+            if fname.startswith(BOT_FILE_PREFIX):
+                count += 1
+                try:
+                    total_size += os.path.getsize(fpath)
+                except:
+                    pass
+                mtime = os.path.getmtime(fpath)
+                if oldest_time is None or mtime < oldest_time:
+                    oldest_time = mtime
+                    oldest_file = fname
+    
+    return count, total_size, oldest_file, oldest_time
+
+========================================
+FILE: ./scripts/refresh_cookies.py
+========================================
+#!/usr/bin/env python3
+"""
+Cookie refresh script for yt-dlp.
+Supports multiple methods:
+1. Browser extraction (chrome, firefox, edge, chromium)
+2. URL download (curl/wget from a cookie provider)
+3. Custom command
+
+Usage:
+    python3 refresh_cookies.py [browser|url|custom] [args...]
+
+Examples:
+    python3 refresh_cookies.py chrome /home/ubuntu/vee/cookies.txt
+    python3 refresh_cookies.py url https://example.com/cookies.txt /home/ubuntu/vee/cookies.txt
+    python3 refresh_cookies.py custom /path/to/your/refresh.sh
+"""
+
+import sys
+import os
+import subprocess
+
+BROWSERS = {
+    "chrome": "--cookies-from-browser chrome",
+    "firefox": "--cookies-from-browser firefox",
+    "edge": "--cookies-from-browser edge",
+    "chromium": "--cookies-from-browser chromium",
+}
+
+
+def refresh_from_browser(browser, output_file):
+    if browser not in BROWSERS:
+        print(f"Error: Unknown browser '{browser}'. Choose from: {', '.join(BROWSERS.keys())}")
+        return False
+    
+    cmd = [
+        "yt-dlp",
+        "--cookies", output_file,
+        "--cookies-from-browser", browser,
+        "https://www.youtube.com",
+        "--skip-download",
+        "--quiet",
+    ]
+    
+    print(f"Extracting cookies from {browser}...")
+    print(f"Saving to: {output_file}")
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("Cookies refreshed successfully!")
+            if os.path.exists(output_file):
+                print(f"Cookie file size: {os.path.getsize(output_file)} bytes")
+            return True
+        else:
+            print(f"Error: {result.stderr}")
+            return False
+    except FileNotFoundError:
+        print("Error: yt-dlp not found. Install with: pip install yt-dlp")
+        return False
+
+
+def refresh_from_url(url, output_file):
+    print(f"Downloading cookies from: {url}")
+    print(f"Saving to: {output_file}")
+    
+    # Try curl first, then wget
+    for cmd_name, cmd_args in [("curl", ["-o", output_file, url]), ("wget", ["-O", output_file, url])]:
+        try:
+            cmd = [cmd_name] + cmd_args
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and os.path.exists(output_file):
+                print(f"Cookies downloaded successfully! ({os.path.getsize(output_file)} bytes)")
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    
+    print("Error: Failed to download cookies (tried curl and wget)")
+    return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    mode = sys.argv[1].lower()
+    
+    if mode in BROWSERS:
+        # Browser mode
+        output_file = sys.argv[2] if len(sys.argv) > 2 else "cookies.txt"
+        success = refresh_from_browser(mode, output_file)
+    elif mode == "url":
+        # URL mode
+        if len(sys.argv) < 4:
+            print("Usage: python3 refresh_cookies.py url <url> <output_file>")
+            sys.exit(1)
+        url = sys.argv[2]
+        output_file = sys.argv[3]
+        success = refresh_from_url(url, output_file)
+    elif mode == "custom":
+        # Custom command mode
+        if len(sys.argv) < 3:
+            print("Usage: python3 refresh_cookies.py custom <command>")
+            sys.exit(1)
+        cmd = " ".join(sys.argv[2:])
+        print(f"Running custom command: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("Custom command succeeded!")
+            success = True
+        else:
+            print(f"Error: {result.stderr}")
+            success = False
+    else:
+        print(f"Unknown mode: {mode}")
+        print(__doc__)
+        sys.exit(1)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+========================================
+FILE: ./services/user_service.py
+========================================
+import os
+import time
+import asyncio
+import aiosqlite
+
+from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
+from core.db import DB_PATH
+from config import (
+    ALLOWED_USERS_FILE,
+    ADMIN_IDS,
+    CACHE_TTL,
+    BOT_FILE_PREFIX,
+    TEMP_DIR,
+    TEMP_FILE_MAX_AGE_HOURS,
+)
+
+_allowed_users_cache = {"data": None, "time": 0}
+_users_db_cache = {"data": None, "time": 0}
+
+
+def track_user(user):
+    if user:
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
+        except RuntimeError:
+            asyncio.run(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
+
+
+def get_allowed_users():
+    global _allowed_users_cache
+    now = time.time()
+    if _allowed_users_cache["data"] and (now - _allowed_users_cache["time"]) < CACHE_TTL:
+        return _allowed_users_cache["data"]
+    
+    users = set()
+    if os.path.exists(ALLOWED_USERS_FILE):
+        with open(ALLOWED_USERS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and line.isdigit():
+                    users.add(int(line))
+    
+    result = users | ADMIN_IDS
+    _allowed_users_cache = {"data": result, "time": now}
+    return result
+
+
+def save_allowed_users(users):
+    with open(ALLOWED_USERS_FILE, "w") as f:
+        for uid in sorted(users):
+            f.write(f"{uid}\n")
+    global _allowed_users_cache
+    _allowed_users_cache = {"data": None, "time": 0}
+
+
+async def get_all_users_info():
+    global _users_db_cache
+    import time
+    now = time.time()
+    if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
+        return _users_db_cache["data"]
+    
+    data = await _get_all_users()
+    _users_db_cache = {"data": data, "time": now}
+    return data
+
+
+async def get_user_display_name(user_id: int) -> str:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT username, first_name FROM users WHERE user_id = ?", (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    if row[0]:
+                        return f"@{row[0]}"
+                    if row[1]:
+                        return row[1]
+    except Exception:
+        pass
+    return str(user_id)
+
+
+def cleanup_temp_files(max_age_hours: int = None):
+    if max_age_hours is None:
+        max_age_hours = TEMP_FILE_MAX_AGE_HOURS
+    if not os.path.exists(TEMP_DIR):
+        return
+    cutoff = time.time() - (max_age_hours * 3600)
+    try:
+        for fname in os.listdir(TEMP_DIR):
+            if fname.startswith(BOT_FILE_PREFIX):
+                fpath = os.path.join(TEMP_DIR, fname)
+                if os.path.getmtime(fpath) < cutoff:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+========================================
+FILE: ./vee.py
+========================================
+import logging
+import os
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
+from telegram.request import HTTPXRequest
+from telegram.error import TelegramError
+
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, CLEANUP_INTERVAL_HOURS, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES
+from services.user_service import cleanup_temp_files
+from app.commands import (
+    start_command, help_command, stats_command, history_command, myid_command,
+    allow_command, block_command, users_command, broadcast_command,
+    userhistory_command, rateinfo_command, setrate_command,
+    cleanup_command, status_command, queue_command, storage_command, failed_command,
+    lang_command, cookie_command, refresh_command, cancel_command, admin_cancel_command,
+    report_command, setdisk_command, tasks_command, settier_command,
+)
+from app.callbacks import handle_link, handle_callback
+from core.queue import download_queue
+from core.models import DownloadStatus
+from core.facades import _execute_download_task
+from core.logger import setup_logging
+from core.db import init_db
+from core.task_store import mark_stale_tasks_failed
+from core.analytics import get_daily_stats, format_daily_report
+from datetime import time as dt_time
+import pytz
+
+logger = logging.getLogger(__name__)
+
+async def set_bot_commands(app: Application):
+    bot = app.bot
+    
+    user_commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("cancel", "取消进行中的下载"),
+        BotCommand("help", "Show available commands"),
+        BotCommand("history", "View your download history"),
+        BotCommand("myid", "Get your user ID"),
+        BotCommand("lang", "Change language"),
+    ]
+    
+    admin_commands = [
+        BotCommand("stats", "Show bot statistics"),
+        BotCommand("allow", "Allow a user (admin)"),
+        BotCommand("block", "Block a user (admin)"),
+        BotCommand("users", "List allowed users"),
+        BotCommand("broadcast", "Broadcast message"),
+        BotCommand("userhistory", "View user history"),
+        BotCommand("rateinfo", "Show rate limit info"),
+        BotCommand("setrate", "Set rate limit"),
+        BotCommand("cleanup", "Clean temp files"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("queue", "Show download queue"),
+        BotCommand("storage", "Show storage info"),
+        BotCommand("failed", "Show failed downloads"),
+        BotCommand("cookie", "Update cookies"),
+        BotCommand("refresh", "Clear cached file"),
+        BotCommand("admcancel", "取消任意下载任务"),
+        BotCommand("settier",  "设置用户速率等级 [user_id] [tier]"),
+        BotCommand("setdisk",  "设置磁盘告警阈值 [warn%] [crit%]"),
+        BotCommand("report",   "查看下载统计报告 [天数]"),
+        BotCommand("tasks",    "查看自己的任务记录"),
+    ]
+        
+    await bot.set_my_commands(user_commands)
+    
+    if ADMIN_IDS:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.set_my_commands(
+                    user_commands + admin_commands,
+                    scope={"type": "chat", "chat_id": admin_id}
+                )
+            except Exception as e:
+                logger.warning(f"Could not set commands for admin {admin_id}: {e}")
+
+
+class AdminFilter(filters.BaseFilter):
+    def filter(self, message):
+        return bool(ADMIN_IDS) and message.from_user.id in ADMIN_IDS
+
+
+class CookieFilter(AdminFilter):
+    def filter(self, message):
+        return message.document is not None and super().filter(message)
+
+
+async def handle_cookie_file(update: Update, context: CallbackContext):
+    from config import COOKIE_FILE, COOKIES_DIR
+    document = update.message.document
+    if not document:
+        return
+    
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("Please send a .txt file (cookies.txt)")
+        return
+    
+    import re
+    filename = document.file_name
+    match = re.match(r'([^_]+)_cookies\.txt', filename)
+    
+    if match:
+        site_domain = match.group(1)
+        site_cookie_file = os.path.join(COOKIES_DIR, f"{site_domain}_cookies.txt")
+        try:
+            file = await document.get_file()
+            await file.download_to_drive(custom_path=site_cookie_file)
+            await update.message.reply_text(f"Cookies saved for {site_domain}!")
+        except Exception as e:
+            logger.error(
+                f"Failed to save cookie file '{document.file_name}' "
+                f"for user {update.message.from_user.id}: {e}",
+                exc_info=True
+            )
+            await update.message.reply_text(
+                "❌ Failed to save the cookie file. Please try again or contact the admin."
+            )
+    else:
+        if COOKIE_FILE:
+            try:
+                file = await document.get_file()
+                await file.download_to_drive(custom_path=COOKIE_FILE)
+                await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
+            except Exception as e:
+                await update.message.reply_text(f"Error saving cookie file: {e}")
+        else:
+            await update.message.reply_text("Invalid filename. Use format: domain_cookies.txt (e.g., www.youtube.com_cookies.txt)")
+
+
+async def cleanup_job(context):
+    cleanup_temp_files(max_age_hours=24)
+
+_last_alert_level: str = "ok"   
+async def storage_alert_job(context):
+    global _last_alert_level
+
+    if not ADMIN_IDS:
+        return
+
+    disk = psutil.disk_usage("/")
+    percent = disk.percent
+
+    if percent >= DISK_CRIT_THRESHOLD:
+        current_level = "critical"
+    elif percent >= DISK_WARN_THRESHOLD:
+        current_level = "warn"
+    else:
+        current_level = "ok"
+
+    if current_level == _last_alert_level:
+        return
+    if current_level == "ok" and _last_alert_level == "ok":
+        return
+
+    _last_alert_level = current_level
+
+    if current_level == "critical":
+        msg = (
+            f"🚨 CRITICAL: 磁盘使用率 {percent:.1f}%，已超过 {DISK_CRIT_THRESHOLD}%！\n"
+            f"剩余空间：{disk.free // (1024**3):.1f} GB\n"
+            f"请立即清理，否则下载功能将失败。"
+        )
+    elif current_level == "warn":
+        msg = (
+            f"⚠️ WARNING: 磁盘使用率 {percent:.1f}%，已超过 {DISK_WARN_THRESHOLD}%\n"
+            f"剩余空间：{disk.free // (1024**3):.1f} GB"
+        )
+    else:  # 从告警恢复
+        msg = f"✅ 磁盘已恢复正常，当前使用率 {percent:.1f}%"
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=msg)
+        except Exception as e:
+            logger.warning(f"Failed to send storage alert to {admin_id}: {e}")
+
+
+async def daily_report_job(context):
+    if not ADMIN_IDS:
+        return
+    stats = await get_daily_stats(days=1)
+    msg = format_daily_report(stats, period="昨日")
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=msg)
+        except Exception as e:
+            logger.warning(f"Failed to send daily report to {admin_id}: {e}")
+
+
+def main():
+    setup_logging()
+    
+    request = HTTPXRequest(
+        write_timeout=600,
+        connect_timeout=30,
+        read_timeout=600,
+        pool_timeout=30
+    )
+    
+    if LOCAL_MODE:
+        from telegram.ext import ExtBot
+        bot = ExtBot(
+            token=TOKEN,
+            local_mode=LOCAL_MODE,
+            base_url=BOT_API_URL,
+            request=request
+        )
+        app = Application.builder().bot(bot).build()
+    else:
+        app = (
+            Application.builder()
+            .token(TOKEN)
+            .request(request)
+            .build()
+        )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("lang", lang_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("tasks", tasks_command))
+    
+    if ADMIN_IDS:
+        app.add_handler(CommandHandler("stats", stats_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("allow", allow_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("block", block_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("users", users_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("broadcast", broadcast_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("userhistory", userhistory_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("rateinfo", rateinfo_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("setrate", setrate_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cleanup", cleanup_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("status", status_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("queue", queue_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("storage", storage_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("failed", failed_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cookie", cookie_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("refresh", refresh_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("admcancel", admin_cancel_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("report", report_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("setdisk", setdisk_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("settier",  settier_command,  filters=AdminFilter()))
+
+    
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
+
+    if CLEANUP_INTERVAL_HOURS > 0:
+        app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60)
+    
+    if DISK_CHECK_INTERVAL_MINUTES > 0:
+        app.job_queue.run_repeating(storage_alert_job,interval=DISK_CHECK_INTERVAL_MINUTES * 60,first=300,name="storage_alert",)
+
+    tz = pytz.timezone("Asia/Shanghai")
+    app.job_queue.run_daily(daily_report_job, time=dt_time(hour=9, minute=0, tzinfo=tz),name="daily_report",)
+
+    async def post_init_callback(app: Application):
+        await init_db()
+        await mark_stale_tasks_failed()
+        download_queue.set_executor(_execute_download_task)
+        await download_queue.start()
+        await set_bot_commands(app)
+
+    app.post_init = post_init_callback
+    
+    async def post_shutdown(context):
+        await download_queue.stop()
+
+    app.post_shutdown = post_shutdown
+    
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+

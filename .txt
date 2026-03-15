@@ -1,0 +1,3601 @@
+========================================
+FILE: ./app/__init__.py
+========================================
+
+========================================
+FILE: ./app/callbacks.py
+========================================
+import os
+import asyncio
+import logging
+import re
+from urllib.parse import urlparse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackContext
+
+logger = logging.getLogger(__name__)
+
+from config import track_user, get_allowed_users, MAX_CACHE_SIZE, MAX_FILE_SIZE
+from core.ratelimit import rate_limiter
+from core.logger import log_user, log_download
+from core.history import check_recent_download, get_file_id_by_url, add_history, get_user_history
+from core.i18n import t
+from core.downloader import get_formats, download_video, download_audio, get_thumbnail, download_spotify, is_spotify_url
+from app.download import _make_progress_hook
+
+URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+
+SUPPORTED_DOMAINS = {
+    "youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com",
+    "instagram.com", "twitter.com", "x.com",
+    "tiktok.com", "facebook.com", "reddit.com",
+    "vk.com", "snapchat.com", "tumblr.com",
+    "pin.it", "threads.net",
+    "bilibili.com", "b23.tv",
+    "spotify.com", "open.spotify.com",
+}
+
+ALLOWED_URL_PATTERN = re.compile(
+    r'^https?://'
+    r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'
+    r'localhost|'
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+    r'(?::\d+)?'
+    r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
+
+def extract_url(text: str) -> str | None:
+    """Extract first URL from text message."""
+    match = URL_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
+def is_valid_url(url: str) -> bool:
+    if not ALLOWED_URL_PATTERN.match(url):
+        return False
+    try:
+        domain = urlparse(url).netloc.lower()
+        domain = domain.replace("www.", "")
+        if not any(domain.endswith(d) or domain == d for d in SUPPORTED_DOMAINS):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def handle_link(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    
+    user = update.message.from_user
+    user_id = user.id
+    track_user(user)
+    
+    allowed = get_allowed_users()
+    if allowed and user_id not in allowed:
+        await update.message.reply_text(t("not_authorized", user_id))
+        return
+    
+    allowed, reason = rate_limiter.check_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(t("rate_limit_exceeded", user_id))
+        return
+    
+    text = update.message.text.strip()
+    url = extract_url(text)
+    
+    if not url or not is_valid_url(url):
+        await update.message.reply_text(t("unsupported_url", user_id))
+        return
+    
+    log_user(update.message.from_user, "sent_link")
+
+    recent_download = check_recent_download(url, max_age_hours=24)
+    cached_file_path = None
+    if recent_download:
+        file_path = recent_download.get("file_path")
+        file_size = os.path.getsize(file_path) if file_path and os.path.exists(file_path) else 0
+        if file_size <= MAX_CACHE_SIZE:
+            cached_file_path = file_path
+    
+    context.user_data[f"pending_url_{user_id}"] = url
+    context.user_data[f"cached_file_{user_id}"] = cached_file_path
+
+    cached_msg = f"\n\n{t('cached_file_used', user_id)}" if cached_file_path else ""
+    
+    is_spotify = is_spotify_url(url)
+    
+    if is_spotify:
+        keyboard = [
+            [InlineKeyboardButton("🎵 Download MP3 (320k)", callback_data="download_audio")],
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton(t("video", user_id), callback_data="download_video"),
+                InlineKeyboardButton(t("audio", user_id), callback_data="download_audio"),
+            ],
+            [InlineKeyboardButton(t("thumbnail", user_id), callback_data="download_thumbnail")],
+        ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        t("what_download", user_id) + cached_msg,
+        reply_markup=reply_markup
+    )
+
+
+async def handle_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data.startswith("lang_"):
+        from core.i18n import set_user_lang, LANGUAGES, t
+        lang_code = query.data.replace("lang_", "")
+        if lang_code in LANGUAGES:
+            set_user_lang(user_id, lang_code)
+            await query.edit_message_text(t("language_changed", user_id))
+        return
+    
+    if query.data.startswith("uh_"):
+        from config import ADMIN_IDS
+        if ADMIN_IDS and user_id not in ADMIN_IDS:
+            await query.answer("Admin only.", show_alert=True)
+            return
+        target_id = int(query.data.replace("uh_", ""))
+        history = get_user_history(target_id, limit=20)
+        if not history:
+            await query.edit_message_text(f"No history for user {target_id}.")
+            return
+        msg = f"Download history for user {target_id}:\n\n"
+        from datetime import datetime
+        for item in history:
+            dt = datetime.fromtimestamp(item["timestamp"])
+            status = "✅" if item.get("status") == "success" else "❌"
+            size = ""
+            if item.get("file_size"):
+                size = f" ({item['file_size'] // (1024*1024)}MB)"
+            msg += f"{status} {item['type']}{size}\n"
+            msg += f"   {item.get('title', 'N/A')[:40]}\n"
+            msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+        await query.edit_message_text(msg)
+        return
+    
+    allowed = get_allowed_users()
+    if allowed and user_id not in allowed:
+        await query.answer(t("not_authorized", user_id), show_alert=True)
+        return
+
+    log_user(query.from_user, query.data)
+    
+    url = context.user_data.get(f"pending_url_{user_id}")
+    if not url:
+        try:
+            await query.edit_message_text(t("session_expired", user_id))
+        except Exception:
+            pass
+        return
+
+    try:
+        if query.data == "download_video":
+            await show_quality_options(query, url)
+        elif query.data.startswith("quality_"):
+            format_id = query.data.replace("quality_", "")
+            try:
+                processing_msg = await query.edit_message_text("Processing... Please wait.")
+            except Exception:
+                processing_msg = query.message
+            asyncio.create_task(send_video_with_format(query, url, processing_msg, format_id, context))
+        elif query.data in ("download_audio", "download_thumbnail"):
+            from core.strategies import StrategyFactory
+            strategy_key = "spotify" if (query.data == "download_audio" and is_spotify_url(url)) else query.data
+            strategy = StrategyFactory.get(strategy_key)
+            if strategy:
+                try:
+                    processing_msg = await query.edit_message_text("Processing... Please wait.")
+                except Exception:
+                    processing_msg = query.message
+                asyncio.create_task(strategy.execute(query, url, processing_msg, context))
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error: {e}")
+        try:
+            if "No video could be found" in error_msg or "No video" in error_msg:
+                await query.edit_message_text(t("no_video_found", user_id))
+            else:
+                await query.edit_message_text(f"Error: {error_msg[:200]}")
+        except:
+            pass
+
+
+async def show_quality_options(query, url):
+    user_id = query.from_user.id
+    try:
+        await query.edit_message_text(t("loading_quality", user_id))
+    except:
+        pass
+    
+    formats, info = await get_formats(url)
+    logger.error(f"Available formats: {[(f.get('format_id'), f.get('height'), f.get('ext'), f.get('acodec')) for f in formats[:30]]}")
+
+    resolutions = {}
+    for f in formats:
+        height = f.get("height")
+        filesize = f.get("filesize") or f.get("filesize_approx", 0)
+        acodec = f.get("acodec", "none")
+        has_audio = acodec and acodec != "none"
+        if height and height in [2160, 1440, 1080, 720, 480, 360, 240]:
+            if height not in resolutions:
+                resolutions[height] = (f.get("format_id"), has_audio)
+            elif filesize and filesize < MAX_FILE_SIZE:
+                current = resolutions.get(height)
+                if current and not current[1] and has_audio:
+                    resolutions[height] = (f.get("format_id"), has_audio)
+
+    keyboard = []
+    priority = [1080, 720, 480, 360, 240, 2160, 1440]
+    
+    for height in priority:
+        if height in resolutions:
+            format_data = resolutions[height]
+            format_id = format_data[0] if isinstance(format_data, tuple) else format_data
+            label = f"{height}p HD" if height >= 720 else f"{height}p"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"quality_{format_id}")])
+    
+    keyboard.append([InlineKeyboardButton("⭐ Best Quality (Auto)", callback_data="quality_best")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    title = info.get("title") or "this video"
+    try:
+        await query.edit_message_text(t("select_quality", user_id, title=title[:50]), reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+
+
+async def send_video_with_format(query, url, processing_msg, format_id, context):
+    """Handle video download with format selection - uses Strategy pattern."""
+    from core.strategies import VideoStrategy
+    
+    user_id = query.from_user.id
+    cached_file = context.user_data.get(f"cached_file_{user_id}")
+    
+    if cached_file and os.path.exists(cached_file):
+        logger.info(f"Using cached file for {url}: {cached_file}")
+        filename = cached_file
+        title = os.path.splitext(os.path.basename(filename))[0]
+        info = {"title": title}
+    else:
+        try:
+            await processing_msg.edit_text(t("downloading", user_id))
+            formats, info = await get_formats(url)
+            available_ids = [f.get("format_id") for f in formats]
+            logger.error(f"Requested format: {format_id}, Available: {available_ids[:20]}")
+            
+            from core.downloader import download_video
+            progress_hook = _make_progress_hook(processing_msg)
+            filename, info = await download_video(url, format_id, progress_hook)
+        except Exception as e:
+            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+            return
+
+        if not os.path.exists(filename):
+            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+            return
+    
+    file_size = os.path.getsize(filename)
+    if file_size > MAX_FILE_SIZE:
+        await processing_msg.edit_text(
+            t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
+        )
+        if not cached_file and os.path.exists(filename):
+            os.remove(filename)
+        return
+
+    title = info.get("title")
+    caption = f"🎬 {title}" if title else None
+    
+    await processing_msg.edit_text(t("uploading", user_id))
+    try:
+        existing_file_id = get_file_id_by_url(url)
+        
+        if existing_file_id:
+            logger.info(f"Using file_id for {url}: {existing_file_id}")
+            await query.message.reply_video(video=existing_file_id, caption=caption)
+            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            await processing_msg.delete()
+            log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
+            add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, existing_file_id)
+        else:
+            with open(filename, "rb") as f:
+                sent_msg = await query.message.reply_video(video=f, caption=caption)
+            
+            new_file_id = sent_msg.video.file_id if sent_msg.video else None
+            await processing_msg.delete()
+            log_download(query.from_user, "video_downloaded", url, "success", file_size, format_id)
+            add_history(query.from_user.id, url, "video", file_size, info.get("title"), "success", filename, new_file_id)
+    except Exception as e:
+        await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+        log_download(query.from_user, "video_downloaded", url, f"upload_failed: {e}", file_size, format_id)
+        add_history(query.from_user.id, url, "video", file_size, info.get("title"), "failed")
+    
+    if os.path.exists(filename) and not cached_file:
+        os.remove(filename)
+
+
+async def send_audio(query, url, processing_msg, context):
+    """Handle audio download - now delegates to Strategy pattern."""
+    from core.strategies import StrategyFactory
+    
+    strategy = StrategyFactory.get("download_audio")
+    if strategy:
+        asyncio.create_task(strategy.execute(query, url, processing_msg, context))
+    else:
+        await _send_audio_legacy(query, url, processing_msg, context)
+
+
+async def _send_audio_legacy(query, url, processing_msg, context):
+    user_id = query.from_user.id
+    cached_file = context.user_data.get(f"cached_file_{user_id}")
+    
+    if cached_file and os.path.exists(cached_file) and cached_file.endswith('.mp3'):
+        logger.info(f"Using cached audio file for {url}: {cached_file}")
+        filename = cached_file
+        title = os.path.splitext(os.path.basename(filename))[0]
+    else:
+        try:
+            await processing_msg.edit_text(t("downloading", user_id))
+            progress_hook = _make_progress_hook(processing_msg)
+            filename, info = await download_audio(url, progress_hook)
+        except Exception as e:
+            await processing_msg.edit_text(t("download_failed", user_id, error=str(e)))
+            return
+
+        if not os.path.exists(filename):
+            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+            log_download(query.from_user, "audio_downloaded", url, "file_not_found")
+            add_history(query.from_user.id, url, "audio", None, info.get("title"), "failed")
+            return
+
+        title = info.get("title")
+
+    file_size = os.path.getsize(filename)
+    
+    await processing_msg.edit_text(t("uploading", user_id))
+    try:
+        existing_file_id = get_file_id_by_url(url)
+        
+        if existing_file_id:
+            logger.info(f"Using file_id for audio {url}: {existing_file_id}")
+            await query.message.reply_audio(audio=existing_file_id, title=title)
+            msg = await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            await processing_msg.delete()
+            log_download(query.from_user, "audio_downloaded", url, "success", file_size)
+            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, existing_file_id)
+        else:
+            with open(filename, "rb") as f:
+                sent_msg = await query.message.reply_audio(audio=f, title=title)
+            
+            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
+            await processing_msg.delete()
+            log_download(query.from_user, "audio_downloaded", url, "success", file_size)
+            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
+    except Exception as e:
+        await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+        log_download(query.from_user, "audio_downloaded", url, f"upload_failed: {e}", file_size)
+        add_history(query.from_user.id, url, "audio", file_size, title, "failed")
+    
+    if os.path.exists(filename) and not cached_file:
+        os.remove(filename)
+
+
+async def send_thumbnail(query, url, processing_msg):
+    user_id = query.from_user.id
+    try:
+        thumbnail_url, info = await get_thumbnail(url)
+    except Exception as e:
+        await processing_msg.edit_text(f"Error: {str(e)}")
+        return
+
+    if not thumbnail_url:
+        await processing_msg.edit_text(t("no_thumbnail", user_id))
+        return
+
+    title = info.get("title")
+    caption = f"🖼️ {title}" if title else None
+
+    await processing_msg.edit_text(t("fetching_thumbnail", user_id))
+    await query.message.reply_photo(photo=thumbnail_url, caption=caption)
+    await processing_msg.delete()
+
+
+async def _download_spotify(query, url, processing_msg):
+    """Handle Spotify download."""
+    user_id = query.from_user.id
+    
+    try:
+        await processing_msg.edit_text("🎵 Downloading from Spotify via YouTube...")
+        
+        filename, info = await download_spotify(url)
+        
+        if not os.path.exists(filename):
+            await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+            return
+        
+        file_size = os.path.getsize(filename)
+        
+        if file_size > MAX_FILE_SIZE:
+            await processing_msg.edit_text(
+                t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
+            )
+            os.remove(filename)
+            return
+        
+        title = info.get("title")
+        caption = f"🎵 {title}" if title else None
+        
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        existing_file_id = get_file_id_by_url(url)
+        
+        if existing_file_id:
+            logger.info(f"Using file_id for {url}: {existing_file_id}")
+            await query.message.reply_audio(audio=existing_file_id, caption=caption)
+            msg = await query.message.reply_text("✅ Sent via file ID")
+            await processing_msg.delete()
+        else:
+            with open(filename, "rb") as f:
+                sent_msg = await query.message.reply_audio(audio=f, title=title)
+            
+            new_file_id = sent_msg.audio.file_id if sent_msg.audio else None
+            await processing_msg.delete()
+            add_history(query.from_user.id, url, "audio", file_size, title, "success", filename, new_file_id)
+        
+        if os.path.exists(filename):
+            os.remove(filename)
+            
+    except Exception as e:
+        logger.error(f"Spotify download error: {e}")
+        await processing_msg.edit_text(f"Error: {str(e)[:200]}")
+
+========================================
+FILE: ./app/commands.py
+========================================
+import os
+import psutil
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from config import ADMIN_IDS, get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, get_config, cleanup_temp_files, TEMP_DIR, BOT_FILE_PREFIX
+from core.logger import log_user, get_user_stats
+from core.history import get_user_history, get_all_users_count, get_total_downloads, get_failed_downloads
+from core.ratelimit import rate_limiter, save_rate_limit
+from core.i18n import t, set_user_lang, LANGUAGES
+
+
+async def start_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    track_user(update.message.from_user)
+    log_user(update.message.from_user, "start")
+    user = update.message.from_user
+    await update.message.reply_text(t("welcome", user.id))
+
+
+async def myid_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user = update.message.from_user
+    await update.message.reply_text(t("your_id", user.id, username=user.username or "N/A", name=f"{user.first_name} {user.last_name or ''}"), parse_mode="Markdown")
+
+
+async def help_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    is_admin = user_id in ADMIN_IDS if ADMIN_IDS else False
+    
+    if is_admin:
+        await update.message.reply_text(t("admin_commands", user_id))
+    else:
+        await update.message.reply_text(t("available_commands", user_id))
+
+
+async def stats_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    from core.utils import check_admin
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    stats = get_user_stats()
+    users_count = get_all_users_count()
+    total_downloads = get_total_downloads()
+    msg = f"{stats}\n\nTotal registered users: {users_count}\nTotal downloads: {total_downloads}"
+    await update.message.reply_text(msg)
+
+
+async def history_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    history = get_user_history(user_id, limit=10)
+    
+    if not history:
+        await update.message.reply_text("No download history.")
+        return
+    
+    msg = "Your download history:\n\n"
+    for item in history:
+        from datetime import datetime
+        dt = datetime.fromtimestamp(item["timestamp"])
+        status = "✅" if item.get("status") == "success" else "❌"
+        msg += f"{status} {item['type']} - {item.get('title', 'Unknown')[:30]}...\n"
+        msg += f"   {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    await update.message.reply_text(msg)
+
+
+async def allow_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    from core.utils import check_admin
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /allow <user_id>")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Must be a number.")
+        return
+    
+    users = get_allowed_users()
+    users.add(target_id)
+    save_allowed_users(users)
+    
+    await update.message.reply_text(f"User {target_id} has been allowed.")
+
+
+async def block_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    from core.utils import check_admin
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /block <user_id>")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Must be a number.")
+        return
+    
+    users = get_allowed_users()
+    users.discard(target_id)
+    save_allowed_users(users)
+    
+    await update.message.reply_text(f"User {target_id} has been blocked.")
+
+
+async def users_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    users_info = get_all_users_info()
+    allowed = get_allowed_users()
+    
+    if not users_info:
+        await update.message.reply_text("No users yet.")
+        return
+    
+    msg = "Allowed users:\n\n"
+    for user in sorted(users_info, key=lambda x: x.get("last_seen", 0), reverse=True):
+        if user["id"] in allowed:
+            name = get_user_display_name(user["id"])
+            msg += f"• {name}\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def broadcast_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    
+    message = " ".join(context.args)
+    users = get_allowed_users() - ADMIN_IDS
+    
+    bot = context.bot
+    success = 0
+    failed = 0
+    
+    for uid in users:
+        try:
+            await bot.send_message(chat_id=uid, text=message)
+            success += 1
+        except Exception:
+            failed += 1
+    
+    await update.message.reply_text(f"Broadcast sent to {success} users. Failed: {failed}")
+
+
+async def userhistory_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    users = get_allowed_users() - ADMIN_IDS
+    
+    if not users:
+        await update.message.reply_text("No users to show.")
+        return
+    
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = []
+    for uid in sorted(users):
+        name = get_user_display_name(uid)
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"uh_{uid}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Select a user to view history:", reply_markup=reply_markup)
+
+
+async def rateinfo_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    status = rate_limiter.get_status()
+    status_text = "Enabled" if status["enabled"] else "Disabled"
+    msg = f"Rate Limit Status:\n"
+    msg += f"- Status: {status_text}\n"
+    msg += f"- Max downloads/hour: {status['max_downloads_per_hour']}\n"
+    msg += f"- Active users tracked: {status['active_users']}"
+    await update.message.reply_text(msg)
+
+
+async def setrate_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /setrate <max_per_hour> [on/off]")
+        return
+    
+    try:
+        max_per_hour = int(context.args[0])
+        if max_per_hour < 1 or max_per_hour > 100:
+            await update.message.reply_text("Value must be between 1-100")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid number.")
+        return
+    
+    enabled = True
+    if len(context.args) > 1:
+        enabled = context.args[1].lower() in ["on", "true", "1"]
+    
+    save_rate_limit(max_per_hour, enabled)
+    rate_limiter.reload()
+    
+    status = "enabled" if enabled else "disabled"
+    await update.message.reply_text(f"Rate limit updated: {max_per_hour}/hour, {status}")
+
+
+async def cleanup_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    cleanup_temp_files()
+    await update.message.reply_text("Temp files cleaned up.")
+
+
+async def status_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    from core.utils import check_admin, scan_temp_files
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    import psutil
+    
+    config = get_config()
+    rate_status = rate_limiter.get_status()
+    
+    temp_files, temp_size, _, _ = scan_temp_files(config["temp_dir"])
+    
+    msg = "📊 Bot Status\n\n"
+    msg += f"CPU: {psutil.cpu_percent()}%\n"
+    mem = psutil.virtual_memory()
+    msg += f"Memory: {mem.percent}% ({mem.available // (1024*1024)}MB available)\n\n"
+    msg += f"Temp files: {temp_files}\n"
+    msg += f"Temp size: {temp_size // (1024*1024)}MB\n\n"
+    msg += f"Rate limit: {rate_status['max_downloads_per_hour']}/hour\n"
+    msg += f"Rate enabled: {rate_status['enabled']}\n"
+    msg += f"Cleanup interval: {config['cleanup_interval_hours']}h\n"
+    msg += f"Temp file max age: {config['temp_file_max_age_hours']}h\n"
+    msg += f"Max cache size: {config.get('max_cache_size', 500*1024*1024) // (1024*1024)}MB"
+    
+    await update.message.reply_text(msg)
+
+
+async def queue_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    from core.queue import download_queue
+    
+    active = download_queue.active_tasks
+    queued = download_queue.queue.qsize()
+    
+    msg = "📥 Download Queue\n\n"
+    msg += f"Active downloads: {len(active)}\n"
+    msg += f"Queued: {queued}\n\n"
+    
+    if active:
+        msg += "Active:\n"
+        for tid, task in list(active.items())[:10]:
+            user_name = get_user_display_name(task.user_id)
+            status_emoji = {
+                "downloading": "⬇️",
+                "processing": "⚙️",
+                "uploading": "📤",
+            }.get(task.status.value, "⏳")
+            msg += f"{status_emoji} {task.download_type} - {user_name}\n"
+    
+    await update.message.reply_text(msg)
+
+
+async def storage_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    from core.utils import check_admin, scan_temp_files, format_bytes
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    config = get_config()
+    temp_dir = config["temp_dir"]
+    
+    disk = psutil.disk_usage("/")
+    total, used, free = disk.total, disk.used, disk.free
+    temp_files, temp_size, oldest_file, oldest_time = scan_temp_files(temp_dir)
+    
+    disk_percent = (used / total) * 100
+    alert = ""
+    if disk_percent > 90:
+        alert = "\n⚠️ WARNING: Disk usage above 90%!"
+    elif disk_percent > 80:
+        alert = "\n⚠️ CAUTION: Disk usage above 80%"
+    
+    msg = f"💾 Storage Status{alert}\n\n"
+    msg += f"Total disk: {format_bytes(total)}\n"
+    msg += f"Used: {format_bytes(used)} ({disk_percent:.1f}%)\n"
+    msg += f"Free: {format_bytes(free)}\n\n"
+    msg += f"Temp directory ({temp_dir}):\n"
+    msg += f"Files: {temp_files}\n"
+    msg += f"Size: {format_bytes(temp_size)}\n"
+    if oldest_file:
+        from datetime import datetime
+        msg += f"Oldest: {oldest_file}\n"
+        msg += f"   {datetime.fromtimestamp(oldest_time).strftime('%Y-%m-%d %H:%M')}"
+    
+    await update.message.reply_text(msg)
+
+
+async def failed_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /failed [user_id]")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    
+    history = get_user_history(target_id, limit=50)
+    failed = [h for h in history if h.get("status") == "failed"]
+    
+    if not failed:
+        await update.message.reply_text(f"No failed downloads for user {target_id}.")
+        return
+    
+    msg = f"❌ Failed downloads for user {target_id}:\n\n"
+    for item in failed[:20]:
+        from datetime import datetime
+        dt = datetime.fromtimestamp(item["timestamp"])
+        msg += f"• {item['type']} - {item.get('title', 'N/A')[:30]}\n"
+        if item.get("error"):
+            msg += f"  Error: {item['error'][:50]}\n"
+        msg += f"  {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    await update.message.reply_text(msg)
+
+
+def _format_bytes(bytes_val):
+    """Deprecated: Use core.utils.format_bytes instead."""
+    from core.utils import format_bytes
+    return format_bytes(bytes_val)
+
+
+async def lang_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    
+    if not context.args:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = []
+        for code, name in LANGUAGES.items():
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"lang_{code}")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(t("select_language", user_id), reply_markup=reply_markup)
+        return
+    
+    lang_code = context.args[0].lower()
+    if lang_code not in LANGUAGES:
+        await update.message.reply_text("Invalid language. Use: en, zh, or ja")
+        return
+    
+    set_user_lang(user_id, lang_code)
+    await update.message.reply_text(t("language_changed", user_id))
+
+
+async def cookie_command(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text(
+        "Send me your cookies.txt file to update the bot's cookies.\n\n"
+        "To generate cookies:\n"
+        "1. On your PC: `yt-dlp --cookies-from-browser chrome https://www.youtube.com --skip-download -o cookies.txt`\n\n"
+        "For site-specific cookies, use filename format:\n"
+        "• `www.youtube.com_cookies.txt` for YouTube\n"
+        "• `www.bilibili.com_cookies.txt` for Bilibili\n\n"
+        "The bot will automatically use the appropriate cookie file based on the URL being downloaded."
+    )
+
+
+async def refresh_command(update: Update, context: CallbackContext):
+    """Force re-download by clearing cached file_id for a URL."""
+    if not update.message:
+        return
+    from core.utils import check_admin
+    user_id = update.message.from_user.id
+    if not check_admin(user_id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /refresh <url>\n\nClears cached file ID so the video will be re-downloaded.")
+        return
+    
+    url = " ".join(context.args)
+    from core.history import clear_file_id_by_url
+    clear_file_id_by_url(url)
+    await update.message.reply_text(f"✅ Cleared cached file ID for:\n{url}\n\nThe next download will fetch a fresh file.")
+
+========================================
+FILE: ./app/download.py
+========================================
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+download_executor = ThreadPoolExecutor(max_workers=10)
+
+
+def _format_size(bytes_val):
+    if bytes_val is None:
+        return "?"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f}{unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f}TB"
+
+
+class ProgressTracker:
+    def __init__(self, processing_msg):
+        self.msg = processing_msg
+        self.last_text = None
+        self.last_update = 0
+        self.loop = asyncio.get_event_loop()
+    
+    def update(self, text):
+        now = time.time()
+        if text != self.last_text and now - self.last_update > 2:
+            self.last_text = text
+            self.last_update = now
+            try:
+                self.loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    self.msg.edit_text(text)
+                )
+            except Exception:
+                pass
+
+
+def _make_progress_hook(processing_msg):
+    tracker = ProgressTracker(processing_msg)
+    def progress_hook(d):
+        if d.get('status') == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            downloaded = d.get('downloaded_bytes', 0)
+            speed = d.get('speed', 0)
+            
+            if total > 0:
+                percent = int(downloaded * 100 / total)
+                bar_length = 10
+                filled = int(bar_length * downloaded / total)
+                bar = "█" * filled + "░" * (bar_length - filled)
+                
+                speed_str = _format_size(speed) + "/s" if speed else ""
+                text = f"⬇️ Downloading...\n{bar} {percent}%\n{_format_size(downloaded)} / {_format_size(total)}"
+                if speed_str:
+                    text += f" • {speed_str}"
+                
+                tracker.update(text)
+        elif d.get('status') == 'finished':
+            tracker.update("✅ Download complete! Processing...")
+    return progress_hook
+
+========================================
+FILE: ./config.py
+========================================
+import os
+import sys
+import time
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    print("Error: TELEGRAM_BOT_TOKEN not set in .env")
+    sys.exit(1)
+
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2 * 1024 * 1024 * 1024))
+
+BOT_API_URL = os.getenv("BOT_API_URL", "http://127.0.0.1:8082/bot")
+LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
+
+COOKIE_FILE = os.getenv("COOKIE_FILE", "")
+COOKIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
+if not os.path.exists(COOKIES_DIR):
+    os.makedirs(COOKIES_DIR)
+COOKIE_REFRESH_CMD = os.getenv("COOKIE_REFRESH_CMD", "")
+COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", 12))
+ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
+ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "/home/ubuntu/vee/allowed_users.txt")
+
+TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
+TEMP_FILE_MAX_AGE_HOURS = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", 24))
+CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", 1))
+
+USE_ARIA2 = os.getenv("USE_ARIA2", "false").lower() == "true"
+ARIA2_CONNECTIONS = int(os.getenv("ARIA2_CONNECTIONS", "16"))
+
+MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", 500 * 1024 * 1024))
+
+CACHE_TTL = 60
+
+_allowed_users_cache = {"data": None, "time": 0}
+_users_db_cache = {"data": None, "time": 0}
+
+from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info, force_persist as _force_persist_users
+from core.history import force_persist as _force_persist_history
+
+
+def track_user(user):
+    if user:
+        _update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name)
+
+
+def get_allowed_users():
+    global _allowed_users_cache
+    now = time.time()
+    if _allowed_users_cache["data"] and (now - _allowed_users_cache["time"]) < CACHE_TTL:
+        return _allowed_users_cache["data"]
+    
+    users = set()
+    if os.path.exists(ALLOWED_USERS_FILE):
+        with open(ALLOWED_USERS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and line.isdigit():
+                    users.add(int(line))
+    
+    result = users | ADMIN_IDS
+    _allowed_users_cache = {"data": result, "time": now}
+    return result
+
+
+def save_allowed_users(users):
+    with open(ALLOWED_USERS_FILE, "w") as f:
+        for uid in sorted(users):
+            f.write(f"{uid}\n")
+    global _allowed_users_cache
+    _allowed_users_cache = {"data": None, "time": 0}
+
+
+def get_all_users_info():
+    global _users_db_cache
+    now = time.time()
+    if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
+        return _users_db_cache["data"]
+    
+    data = _get_all_users()
+    _users_db_cache = {"data": data, "time": now}
+    return data
+
+
+def get_user_display_name(user_id: int) -> str:
+    info = _get_user_info(user_id)
+    if info:
+        if info.get("username"):
+            return f"@{info['username']}"
+        if info.get("first_name"):
+            return info["first_name"]
+    return str(user_id)
+
+
+def get_config() -> dict:
+    return {
+        "max_file_size": MAX_FILE_SIZE,
+        "max_cache_size": MAX_CACHE_SIZE,
+        "temp_dir": TEMP_DIR,
+        "temp_file_max_age_hours": TEMP_FILE_MAX_AGE_HOURS,
+        "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
+    }
+
+
+BOT_FILE_PREFIX = "vee_"
+
+
+def get_temp_template():
+    return os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}%(title)s.%(ext)s")
+
+
+def cleanup_temp_files(max_age_hours: int = 24):
+    import time
+    if max_age_hours is None:
+        max_age_hours = TEMP_FILE_MAX_AGE_HOURS
+    if not os.path.exists(TEMP_DIR):
+        return
+    cutoff = time.time() - (max_age_hours * 3600)
+    try:
+        for fname in os.listdir(TEMP_DIR):
+            if fname.startswith(BOT_FILE_PREFIX):
+                fpath = os.path.join(TEMP_DIR, fname)
+                if os.path.getmtime(fpath) < cutoff:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+
+def persist_all_data():
+    _force_persist_users()
+    _force_persist_history()
+
+========================================
+FILE: ./core/__init__.py
+========================================
+
+========================================
+FILE: ./core/downloader.py
+========================================
+import os
+import logging
+import asyncio
+import subprocess
+import time
+import yt_dlp
+import httpx
+from functools import lru_cache
+from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS, COOKIES_DIR
+
+logger = logging.getLogger(__name__)
+
+_cookie_last_refresh = 0
+
+
+class YtDlpHelper:
+    """Helper class to reduce duplicate yt-dlp configuration code."""
+    
+    def __init__(self, url: str = None):
+        self.url = url
+        self.opts = self._build_opts()
+    
+    def _build_opts(self):
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extractor_retries": 3,
+            "fragment_retries": 3,
+            "js_runtimes": {"node": {}},
+        }
+        if self.url:
+            cookie_file = self._get_cookie_file(self.url)
+            if cookie_file:
+                opts["cookiefile"] = cookie_file
+            opts = self._add_extractor_headers(self.url, opts)
+        return opts
+    
+    def _get_cookie_file(self, url: str) -> str:
+        if "youtube.com" in url:
+            site_cookie = os.path.join(COOKIES_DIR, "www.youtube.com_cookies.txt")
+            if os.path.exists(site_cookie):
+                return site_cookie
+        elif "bilibili.com" in url or "b23.tv" in url:
+            site_cookie = os.path.join(COOKIES_DIR, "www.bilibili.com_cookies.txt")
+            if os.path.exists(site_cookie):
+                return site_cookie
+        
+        if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+            return COOKIE_FILE
+        return ""
+    
+    def _add_extractor_headers(self, url, opts):
+        if "bilibili.com" in url:
+            opts["http_headers"] = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            }
+        return opts
+    
+    def get_opts(self):
+        return self.opts
+    
+    def merge_opts(self, **kwargs):
+        self.opts.update(kwargs)
+        return self.opts
+    
+    @staticmethod
+    def prepare_url(url: str) -> str:
+        """Common URL preprocessing: resolve short URLs and refresh cookies."""
+        refresh_cookies()
+        return resolve_short_url(url)
+
+
+def resolve_short_url(url: str) -> str:
+    """Resolve short URLs (b23.tv, youtu.be, etc.) to full URLs."""
+    short_domains = {"b23.tv", "youtu.be"}
+    try:
+        domain = url.split("/")[2].lower() if "://" in url else url.split("/")[0].lower()
+        if any(d in domain for d in short_domains):
+            logger.info(f"Resolving short URL: {url}")
+            response = httpx.head(url, follow_redirects=True, timeout=10)
+            resolved = str(response.url)
+            logger.info(f"Resolved to: {resolved}")
+            return resolved
+    except Exception as e:
+        logger.warning(f"Failed to resolve short URL {url}: {e}")
+    return url
+
+
+def _get_bilibili_info(url: str) -> dict:
+    """Get video info from Bilibili API directly."""
+    import re
+    
+    bvid = None
+    if "b23.tv" in url:
+        resolved = resolve_short_url(url)
+        match = re.search(r'BV[\w]+', resolved)
+        if match:
+            bvid = match.group(0)
+    else:
+        match = re.search(r'BV[\w]+', url)
+        if match:
+            bvid = match.group(0)
+    
+    if not bvid:
+        return None
+    
+    api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.bilibili.com/",
+    }
+    
+    try:
+        response = httpx.get(api_url, headers=headers, timeout=10)
+        data = response.json()
+        if data.get("code") == 0:
+            return data.get("data")
+    except Exception as e:
+        logger.error(f"Bilibili API error: {e}")
+    
+    return None
+
+
+def refresh_cookies():
+    global _cookie_last_refresh
+    if not COOKIE_REFRESH_CMD or not COOKIE_FILE:
+        return False
+    
+    if time.time() - _cookie_last_refresh < (COOKIE_REFRESH_INTERVAL_HOURS * 3600):
+        return False
+    
+    try:
+        logger.info("Refreshing cookies...")
+        result = subprocess.run(
+            COOKIE_REFRESH_CMD,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        _cookie_last_refresh = time.time()
+        logger.info(f"Cookies refreshed successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to refresh cookies: {e.stderr}")
+        return False
+
+
+def _use_intl_api(url):
+    """Convert Bilibili URL to use international API."""
+    if "bilibili.com" in url and "b23.tv" not in url:
+        return url
+    return url
+
+
+@lru_cache(maxsize=32)
+def _cached_get_formats(url: str):
+    """Cached version of format extraction - useful when same URL is queried multiple times."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(get_formats(url))
+        return result
+    finally:
+        loop.close()
+
+
+async def get_formats_cached(url):
+    """Get formats with caching for improved performance."""
+    try:
+        return _cached_get_formats(url)
+    except Exception:
+        return await get_formats(url)
+
+
+async def get_formats(url):
+    url = YtDlpHelper.prepare_url(url)
+    
+    loop = asyncio.get_event_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts['logger'] = logging.getLogger('yt_dlp')
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            logger.error(f"URL: {url}, Format count: {len(formats)}, First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}")
+            return formats, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def download_video(url, format_id, progress_hook=None):
+    url = YtDlpHelper.prepare_url(url)
+    
+    needs_merging = format_id == "best" or "+" in str(format_id)
+    
+    if USE_ARIA2 and is_aria2_available() and format_id == "best" and not needs_merging:
+        try:
+            return await download_video_aria2(url, format_id, progress_hook)
+        except Exception as e:
+            logger.warning(f"aria2 failed, falling back to yt-dlp: {e}")
+    
+    loop = asyncio.get_event_loop()
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        
+        if "twitter.com" in url or "x.com" in url:
+            ydl_opts["extractor_args"] = {
+                "twitter": {"lang": "en"}
+            }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats", [])
+            
+            selected_format = None
+            if format_id != "best":
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        selected_format = f
+                        break
+            
+            acodec = selected_format.get("acodec") if selected_format else None
+            has_audio = acodec not in (None, "none") if acodec else False
+            
+            logger.error(f"Format {format_id} selected: acodec={acodec}, has_audio={has_audio}")
+            
+            if has_audio:
+                ydl_opts["format"] = format_id
+                ydl_opts.pop("merge_output_format", None)
+            elif format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+            else:
+                ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                ydl_opts["merge_output_format"] = "mp4"
+        
+        ydl_opts["outtmpl"] = get_temp_template()
+        if progress_hook:
+            ydl_opts["progress_hooks"] = [progress_hook]
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+        return filename, info
+    return await loop.run_in_executor(None, _download)
+
+
+async def download_audio(url, progress_hook=None):
+    url = YtDlpHelper.prepare_url(url)
+    
+    loop = asyncio.get_event_loop()
+    def _download():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": get_temp_template(),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+            }],
+            "progress_hooks": [progress_hook] if progress_hook else None,
+        })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            filename = os.path.splitext(filename)[0] + ".mp3"
+        return filename, info
+    return await loop.run_in_executor(None, _download)
+
+
+async def get_thumbnail(url):
+    url = YtDlpHelper.prepare_url(url)
+    loop = asyncio.get_event_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            thumbnail_url = info.get("thumbnail")
+        return thumbnail_url, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def get_images(url):
+    url = YtDlpHelper.prepare_url(url)
+    loop = asyncio.get_event_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        with yt_dlp.YoutubeDL(helper.get_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            images = info.get("thumbnail") or []
+            if isinstance(images, str):
+                images = [images]
+            
+            additional_thumbnails = info.get("additional_thumbnails") or []
+            if additional_thumbnails:
+                for t in additional_thumbnails:
+                    if t.get("url"):
+                        images.append(t.get("url"))
+            
+            title = info.get("title", "Image")
+        return images, title
+    return await loop.run_in_executor(None, _get)
+
+
+def is_aria2_available():
+    try:
+        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+async def download_with_aria2(url, filename, progress_hook=None, connections=16):
+    if not is_aria2_available():
+        raise RuntimeError("aria2c is not installed")
+
+    cmd = [
+        "aria2c",
+        "-x", str(connections),
+        "-s", str(connections),
+        "-d", os.path.dirname(filename),
+        "-o", os.path.basename(filename),
+        "--continue=true",
+        "--retry-wait=3",
+        "--max-tries=5",
+        url
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        logger.error(f"aria2c failed: {stderr.decode()}")
+        raise RuntimeError(f"aria2c download failed: {stderr.decode()}")
+
+    return filename
+
+
+async def get_direct_url(url, format_id=None):
+    url = YtDlpHelper.prepare_url(url)
+    
+    loop = asyncio.get_event_loop()
+    def _get():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        if format_id:
+            ydl_opts["format"] = f"{format_id}+bestaudio/best"
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            
+            if format_id:
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        return f.get("url"), info
+                return formats[0].get("url"), info if formats else (None, info)
+            else:
+                best = formats[-1] if formats else None
+                return best.get("url") if best else None, info
+    return await loop.run_in_executor(None, _get)
+
+
+async def download_video_aria2(url, format_id, progress_hook=None):
+    url = YtDlpHelper.prepare_url(url)
+    
+    if not is_aria2_available():
+        raise RuntimeError("aria2c is not installed")
+
+    loop = asyncio.get_event_loop()
+    
+    def _get_info():
+        helper = YtDlpHelper(url)
+        ydl_opts = helper.get_opts()
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
+            
+            target_format = None
+            
+            if format_id == "best":
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                for f in reversed(formats):
+                    if f.get("url") and f.get("ext") in ("mp4", "m4a", "webm"):
+                        target_format = f
+                        break
+            else:
+                for f in formats:
+                    if str(f.get("format_id")) == str(format_id):
+                        target_format = f
+                        break
+                
+                if target_format:
+                    acodec = target_format.get("acodec")
+                    has_audio = acodec not in (None, "none") if acodec else False
+                    logger.error(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
+                    if has_audio:
+                        ydl_opts["format"] = format_id
+                    else:
+                        ydl_opts["format"] = f"{format_id}+bestaudio/best"
+                else:
+                    ydl_opts["format"] = f"{format_id}+bestaudio/best"
+            
+            if not target_format and formats:
+                target_format = formats[-1]
+            
+            direct_url = target_format.get("url") if target_format else None
+            
+            title = info.get("title", "video")
+            ext = target_format.get("ext", "mp4") if target_format else "mp4"
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:50]
+            
+            filename = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}{safe_title}.{ext}")
+            
+            return direct_url, filename, info
+    
+    direct_url, filename, info = await loop.run_in_executor(None, _get_info)
+    
+    if not direct_url:
+        raise RuntimeError("Could not extract direct URL from video")
+
+    cmd = [
+        "aria2c",
+        "-x", str(ARIA2_CONNECTIONS),
+        "-s", str(ARIA2_CONNECTIONS),
+        "-d", os.path.dirname(filename),
+        "-o", os.path.basename(filename),
+        "--continue=true",
+        "--retry-wait=3",
+        "--max-tries=5",
+        direct_url
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        logger.error(f"aria2c failed: {stderr.decode()}")
+        raise RuntimeError(f"aria2c download failed: {stderr.decode()}")
+
+    return filename, info
+
+
+def is_spotify_url(url: str) -> bool:
+    return "spotify.com" in url.lower()
+
+
+async def download_spotify(url, progress_hook=None):
+    """Download Spotify track using spotDL."""
+    loop = asyncio.get_event_loop()
+    
+    def _download():
+        output_template = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}%(title)s.%(ext)s")
+        
+        cmd = [
+            "spotdl",
+            url,
+            "--output", TEMP_DIR,
+            "--format", "mp3",
+            "--bitrate", "320k",
+            "--overwrite", "force",
+        ]
+        
+        logger.info(f"Running spotdl: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=TEMP_DIR
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"spotdl failed: {result.stderr}")
+            raise RuntimeError(f"spotdl failed: {result.stderr}")
+        
+        import glob
+        pattern = os.path.join(TEMP_DIR, f"{BOT_FILE_PREFIX}*.mp3")
+        files = glob.glob(pattern)
+        
+        if not files:
+            raise RuntimeError("spotdl didn't produce any output files")
+        
+        filename = max(files, key=os.path.getmtime)
+        
+        with open(filename, "rb") as f:
+            pass
+        
+        title = os.path.splitext(os.path.basename(filename))[0]
+        info = {"title": title, "url": url}
+        
+        return filename, info
+    
+    return await loop.run_in_executor(None, _download)
+
+========================================
+FILE: ./core/file_handler.py
+========================================
+"""
+File Handler Service - Decoupled file operations for Telegram uploads.
+
+Handles all file-related operations: caching, uploading, cleanup.
+This separates file I/O from download logic.
+"""
+
+import os
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
+from core.history import check_recent_download, get_file_id_by_url, add_history
+from core.logger import log_download
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FileUploadResult:
+    """Result of a file upload operation."""
+    success: bool
+    file_id: str | None = None
+    error: str | None = None
+
+
+class FileHandler:
+    """Handles file caching, upload, and cleanup operations."""
+    
+    def __init__(self):
+        pass
+    
+    def check_cache(self, url: str, max_age_hours: int = 24) -> tuple[str | None, int]:
+        """
+        Check if there's a cached file for this URL.
+        Returns: (file_path, file_size) or (None, 0)
+        """
+        recent = check_recent_download(url, max_age_hours=max_age_hours)
+        if recent:
+            file_path = recent.get("file_path")
+            if file_path and os.path.exists(file_path):
+                try:
+                    size = os.path.getsize(file_path)
+                    if size <= MAX_CACHE_SIZE:
+                        logger.info(f"Cache hit for {url}: {file_path}")
+                        return file_path, size
+                except OSError:
+                    pass
+        return None, 0
+    
+    def check_file_id(self, url: str) -> str | None:
+        """Check if there's a cached file_id for this URL."""
+        return get_file_id_by_url(url)
+    
+    async def upload_video(
+        self,
+        query,
+        filename: str,
+        caption: str | None = None,
+        file_id: str | None = None
+    ) -> FileUploadResult:
+        """Upload video file to Telegram."""
+        try:
+            if file_id:
+                await query.message.reply_video(video=file_id, caption=caption)
+                await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            else:
+                with open(filename, "rb") as f:
+                    sent_msg = await query.message.reply_video(video=f, caption=caption)
+                file_id = sent_msg.video.file_id if sent_msg.video else None
+            
+            return FileUploadResult(success=True, file_id=file_id)
+        except Exception as e:
+            logger.error(f"Video upload failed: {e}")
+            return FileUploadResult(success=False, error=str(e))
+    
+    async def upload_audio(
+        self,
+        query,
+        filename: str,
+        title: str | None = None,
+        caption: str | None = None,
+        file_id: str | None = None
+    ) -> FileUploadResult:
+        """Upload audio file to Telegram."""
+        try:
+            if file_id:
+                await query.message.reply_audio(audio=file_id, title=title, caption=caption)
+                await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+            else:
+                with open(filename, "rb") as f:
+                    sent_msg = await query.message.reply_audio(audio=f, title=title, caption=caption)
+                file_id = sent_msg.audio.file_id if sent_msg.audio else None
+            
+            return FileUploadResult(success=True, file_id=file_id)
+        except Exception as e:
+            logger.error(f"Audio upload failed: {e}")
+            return FileUploadResult(success=False, error=str(e))
+    
+    async def upload_photo(
+        self,
+        query,
+        filename: str | None = None,
+        photo_url: str | None = None,
+        caption: str | None = None,
+        file_id: str | None = None
+    ) -> FileUploadResult:
+        """Upload photo to Telegram (from file or URL)."""
+        try:
+            if file_id:
+                await query.message.reply_photo(photo=file_id, caption=caption)
+            elif photo_url:
+                await query.message.reply_photo(photo=photo_url, caption=caption)
+            elif filename:
+                with open(filename, "rb") as f:
+                    sent_msg = await query.message.reply_photo(photo=f, caption=caption)
+                file_id = sent_msg.photo[-1].file_id if sent_msg.photo else None
+            
+            return FileUploadResult(success=True, file_id=file_id)
+        except Exception as e:
+            logger.error(f"Photo upload failed: {e}")
+            return FileUploadResult(success=False, error=str(e))
+    
+    def cleanup(self, filename: str | None, cached_file: str | None = None):
+        """Remove temp file if not cached."""
+        if filename and os.path.exists(filename) and filename != cached_file:
+            try:
+                os.remove(filename)
+                logger.info(f"Cleaned up temp file: {filename}")
+            except OSError as e:
+                logger.warning(f"Failed to cleanup {filename}: {e}")
+    
+    def log_download(
+        self,
+        user,
+        url: str,
+        download_type: str,
+        status: str,
+        file_size: int = 0,
+        format_id: str = None,
+        title: str = None,
+        filename: str = None,
+        file_id: str = None
+    ):
+        """Log download and add to history."""
+        log_download(user, f"{download_type}_downloaded", url, status, file_size, format_id)
+        
+        add_history(
+            user.id,
+            url,
+            download_type,
+            file_size,
+            title,
+            status,
+            filename,
+            file_id
+        )
+
+
+file_handler = FileHandler()
+
+========================================
+FILE: ./core/history.py
+========================================
+import os
+import json
+import time
+import fcntl
+import threading
+from datetime import datetime
+from typing import Optional
+
+
+HISTORY_FILE = "/home/ubuntu/vee/download_history.json"
+LOCK_FILE = "/home/ubuntu/vee/history.lock"
+MAX_ENTRIES_PER_USER = 100
+MAX_TOTAL_ENTRIES = 5000
+
+_cache = {"data": {}, "dirty": False, "time": 0}
+_cache_lock = threading.Lock()
+_persist_interval = 30
+_last_persist = 0
+
+
+def _load_history_unsafe() -> dict:
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_history() -> dict:
+    global _cache, _last_persist
+    with _cache_lock:
+        now = time.time()
+        if _cache["data"] is None or now - _cache["time"] > 5:
+            _cache["data"] = _load_history_unsafe()
+            _cache["time"] = now
+        return _cache["data"].copy()
+
+
+def _save_history_unsafe(history: dict):
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _persist_history():
+    global _cache, _last_persist
+    with _cache_lock:
+        if _cache["dirty"]:
+            _save_history_unsafe(_cache["data"])
+            _cache["dirty"] = False
+            _last_persist = time.time()
+
+
+def _schedule_persist():
+    global _cache
+    with _cache_lock:
+        _cache["dirty"] = True
+
+
+def add_history(user_id: int, url: str, download_type: str, file_size: Optional[int] = None, 
+                title: Optional[str] = None, status: str = "success", file_path: Optional[str] = None,
+                file_id: Optional[str] = None):
+    global _cache
+    history = _load_history()
+    str_id = str(user_id)
+    
+    if str_id not in history:
+        history[str_id] = []
+    
+    entry = {
+        "timestamp": time.time(),
+        "url": url,
+        "type": download_type,
+        "status": status,
+    }
+    if file_size:
+        entry["file_size"] = file_size
+    if title:
+        entry["title"] = title
+    if file_path:
+        entry["file_path"] = file_path
+    if file_id:
+        entry["file_id"] = file_id
+    
+    history[str_id].append(entry)
+    
+    if len(history[str_id]) > MAX_ENTRIES_PER_USER:
+        history[str_id] = history[str_id][-MAX_ENTRIES_PER_USER:]
+    
+    total_entries = sum(len(entries) for entries in history.values())
+    if total_entries > MAX_TOTAL_ENTRIES:
+        oldest_users = sorted(history.items(), key=lambda x: x[1][0]["timestamp"] if x[1] else 0)
+        for uid, entries in oldest_users[:len(history) // 4]:
+            history[uid] = history[uid][-MAX_ENTRIES_PER_USER // 2:]
+    
+    with _cache_lock:
+        _cache["data"] = history
+        _cache["dirty"] = True
+        _cache["time"] = time.time()
+
+
+def get_user_history(user_id: int, limit: int = 10) -> list:
+    history = _load_history()
+    str_id = str(user_id)
+    entries = history.get(str_id, [])
+    return sorted(entries, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+
+
+def clear_user_history(user_id: int):
+    global _cache
+    history = _load_history()
+    str_id = str(user_id)
+    if str_id in history:
+        del history[str_id]
+        with _cache_lock:
+            _cache["data"] = history
+            _cache["dirty"] = True
+            _cache["time"] = time.time()
+
+
+def get_all_users_count() -> int:
+    history = _load_history()
+    return len(history)
+
+
+def get_total_downloads() -> int:
+    history = _load_history()
+    return sum(len(entries) for entries in history.values())
+
+
+def get_failed_downloads(user_id: Optional[int] = None, limit: int = 20) -> list:
+    history = _load_history()
+    failed = []
+    
+    if user_id:
+        str_id = str(user_id)
+        entries = history.get(str_id, [])
+        for entry in entries:
+            if entry.get("status") == "failed":
+                failed.append(entry)
+    else:
+        for uid, entries in history.items():
+            for entry in entries:
+                if entry.get("status") == "failed":
+                    entry["user_id"] = int(uid)
+                    failed.append(entry)
+    
+    return sorted(failed, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+
+
+def force_persist():
+    _persist_history()
+
+
+def check_recent_download(url: str, max_age_hours: int = 24) -> Optional[dict]:
+    """Check if URL was recently downloaded and file still exists."""
+    history = _load_history()
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    for user_entries in history.values():
+        for entry in reversed(user_entries):
+            if entry.get("url") == url:
+                entry_time = entry.get("timestamp", 0)
+                if now - entry_time < max_age_seconds:
+                    if entry.get("status") == "success" and (entry.get("file_path") or entry.get("file_id")):
+                        if entry.get("file_path") and os.path.exists(entry["file_path"]):
+                            return entry
+                        if entry.get("file_id"):
+                            return entry
+    return None
+
+
+def get_file_id_by_url(url: str, max_age_hours: int = 168) -> Optional[str]:
+    """Get file_id by URL (up to 7 days). Returns file_id if available."""
+    history = _load_history()
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    for user_entries in history.values():
+        for entry in reversed(user_entries):
+            if entry.get("url") == url:
+                entry_time = entry.get("timestamp", 0)
+                if now - entry_time < max_age_seconds:
+                    if entry.get("status") == "success" and entry.get("file_id"):
+                        return entry["file_id"]
+    return None
+
+
+def clear_file_id_by_url(url: str):
+    """Remove file_id from history entries for a URL, forcing re-download."""
+    global _cache
+    history = _load_history()
+    modified = False
+    
+    for user_entries in history.values():
+        for entry in user_entries:
+            if entry.get("url") == url:
+                if "file_id" in entry:
+                    del entry["file_id"]
+                    modified = True
+    
+    if modified:
+        with _cache_lock:
+            _cache["data"] = history
+            _cache["dirty"] = True
+            _cache["time"] = time.time()
+        _persist_history()
+
+========================================
+FILE: ./core/i18n.py
+========================================
+import json
+import os
+import threading
+from typing import Optional
+
+LANG_FILE = "/home/ubuntu/vee/users_db.json"
+LOCALES_DIR = "/home/ubuntu/vee/locales"
+_lock = threading.Lock()
+_cache = {"data": {}, "translations": {}, "time": 0}
+CACHE_TTL = 5
+
+DEFAULT_LANG = "en"
+
+LANGUAGES = {
+    "en": "English",
+    "zh": "中文",
+    "ja": "日本語",
+    "ko": "한국어",
+}
+
+
+def _load_translations(lang: str) -> dict:
+    global _cache
+    
+    if lang in _cache["translations"]:
+        return _cache["translations"][lang]
+    
+    file_path = os.path.join(LOCALES_DIR, f"{lang}.json")
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                _cache["translations"][lang] = json.load(f)
+                return _cache["translations"][lang]
+        except Exception:
+            pass
+    
+    if lang != DEFAULT_LANG:
+        return _load_translations(DEFAULT_LANG)
+    
+    return {}
+
+
+def _load_users_db():
+    global _cache
+    import time
+    now = time.time()
+    if _cache["data"] is not None and (now - _cache["time"]) < CACHE_TTL:
+        return _cache["data"]
+    
+    if os.path.exists(LANG_FILE):
+        try:
+            with open(LANG_FILE, "r") as f:
+                _cache["data"] = json.load(f)
+                _cache["time"] = now
+                return _cache["data"]
+        except:
+            pass
+    return {}
+
+
+def _save_users_db(data):
+    global _cache
+    with _lock:
+        try:
+            with open(LANG_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            _cache["data"] = data
+            _cache["time"] = time.time()
+        except:
+            pass
+
+
+import time
+
+
+def get_user_lang(user_id: int) -> str:
+    db = _load_users_db()
+    user_id_str = str(user_id)
+    if user_id_str in db and isinstance(db[user_id_str], dict):
+        return db[user_id_str].get("lang", DEFAULT_LANG)
+    return DEFAULT_LANG
+
+
+def set_user_lang(user_id: int, lang: str):
+    db = _load_users_db()
+    user_id_str = str(user_id)
+    if user_id_str not in db:
+        db[user_id_str] = {}
+    if not isinstance(db[user_id_str], dict):
+        db[user_id_str] = {}
+    db[user_id_str]["lang"] = lang
+    _save_users_db(db)
+
+
+def _get_nested(translations: dict, key: str) -> Optional[str]:
+    keys = key.split(".")
+    value = translations
+    for k in keys:
+        if isinstance(value, dict):
+            value = value.get(k)
+        else:
+            return None
+    return value if isinstance(value, str) else None
+
+
+def _get_plural(translations: dict, key: str, count: int) -> Optional[str]:
+    if count == 1:
+        plural_key = key
+    else:
+        plural_key = f"{key}_plural"
+    
+    result = translations.get(plural_key)
+    if result and "{count}" in result:
+        return result.replace("{count}", str(count))
+    return result if result else str(count)
+
+
+def detect_system_lang(lang_code: str) -> str:
+    lang_code = lang_code.lower().replace("-", "_")
+    
+    if lang_code in LANGUAGES:
+        return lang_code
+    
+    primary = lang_code.split("_")[0]
+    if primary in LANGUAGES:
+        return primary
+    
+    lang_map = {
+        "zh": "zh", "zhcn": "zh", "zhtw": "zh", "zhhk": "zh",
+        "ja": "ja",
+        "ko": "ko",
+        "es": "es", "sp": "es",
+        "fr": "fr",
+        "de": "de",
+        "pt": "pt", "ptbr": "pt", "ptpt": "pt",
+        "ru": "ru",
+        "ar": "ar",
+        "hi": "hi",
+        "id": "id", "in": "id",
+        "vi": "vi",
+        "th": "th",
+    }
+    
+    return lang_map.get(primary, DEFAULT_LANG)
+
+
+def t(key: str, user_id: Optional[int] = None, lang: Optional[str] = None, **kwargs) -> str:
+    if lang:
+        pass
+    elif user_id:
+        lang = get_user_lang(user_id)
+        kwargs['user_id'] = user_id
+    else:
+        lang = DEFAULT_LANG
+    
+    translations = _load_translations(lang)
+    
+    nested = _get_nested(translations, key)
+    if nested:
+        text = nested
+    else:
+        default_translations = _load_translations(DEFAULT_LANG)
+        text = default_translations.get(key, key)
+    
+    return text.format(**kwargs)
+
+
+def tp(key: str, count: int, user_id: Optional[int] = None, **kwargs) -> str:
+    if user_id:
+        lang = get_user_lang(user_id)
+    else:
+        lang = DEFAULT_LANG
+    
+    translations = _load_translations(lang)
+    
+    plural_text = _get_plural(translations, key, count)
+    
+    if plural_text and "{count}" in plural_text:
+        return plural_text.replace("{count}", str(count))
+    elif plural_text:
+        return plural_text
+    
+    fallback = _get_plural(_load_translations(DEFAULT_LANG), key, count)
+    if fallback and "{count}" in fallback:
+        return fallback.replace("{count}", str(count))
+    elif fallback:
+        return fallback
+    
+    return str(count)
+
+========================================
+FILE: ./core/logger.py
+========================================
+import os
+from datetime import datetime
+
+LOG_FILE = "/home/ubuntu/vee/bot_users.log"
+
+def log_user(user, action, extra=None):
+    if not user:
+        return
+    
+    user_id = user.id
+    username = user.username or "N/A"
+    name = f"{user.first_name} {user.last_name or ''}".strip()
+    
+    extra_info = f" | {extra}" if extra else ""
+    entry = f"{datetime.now()} | ID: {user_id} | @{username} | {name} | {action}{extra_info}\n"
+    
+    with open(LOG_FILE, "a") as f:
+        f.write(entry)
+
+
+def log_download(user, action, url, status, file_size=None, format_id=None):
+    extra = f"url={url[:50]}... | status={status}"
+    if file_size:
+        mb = file_size / (1024 * 1024)
+        extra += f" | size={mb:.1f}MB"
+    if format_id:
+        extra += f" | format={format_id}"
+    log_user(user, action, extra)
+
+
+def get_user_stats():
+    if not os.path.exists(LOG_FILE):
+        return "No users yet."
+    
+    users = {}
+    with open(LOG_FILE, "r") as f:
+        for line in f:
+            parts = line.split("|")
+            if len(parts) >= 4:
+                user_id = parts[1].strip().replace("ID: ", "")
+                action = parts[-1].strip()
+                if user_id not in users:
+                    users[user_id] = {"count": 0, "actions": set()}
+                users[user_id]["count"] += 1
+                users[user_id]["actions"].add(action)
+    
+    if not users:
+        return "No users yet."
+    
+    msg = f"Total users: {len(users)}\n\n"
+    for uid, data in list(users.items())[:10]:
+        msg += f"ID: {uid} - {data['count']} actions: {', '.join(data['actions'])}\n"
+    
+    return msg
+
+========================================
+FILE: ./core/queue.py
+========================================
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Callable, Any
+from telegram import Bot
+
+
+class DownloadStatus(Enum):
+    QUEUED = "queued"
+    DOWNLOADING = "downloading"
+    PROCESSING = "processing"
+    UPLOADING = "uploading"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class DownloadTask:
+    task_id: str
+    user_id: int
+    url: str
+    download_type: str
+    format_id: Optional[str] = None
+    status: DownloadStatus = DownloadStatus.QUEUED
+    progress: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+
+
+class DownloadQueue:
+    def __init__(self, max_concurrent: int = 3, max_completed_tasks: int = 100):
+        self.max_concurrent = max_concurrent
+        self.max_completed_tasks = max_completed_tasks
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.active_tasks: dict[str, DownloadTask] = {}
+        self.completed_tasks: dict[str, DownloadTask] = {}
+        self.user_downloads: dict[int, set[str]] = {}
+        self._workers: list[asyncio.Task] = []
+        self._running = False
+        self._cancel_event: Optional[asyncio.Event] = None
+
+    async def start(self):
+        self._running = True
+        self._cancel_event = asyncio.Event()
+        self._workers = [
+            asyncio.create_task(self._worker(i))
+            for i in range(self.max_concurrent)
+        ]
+
+    async def stop(self):
+        self._running = False
+        if self._cancel_event:
+            self._cancel_event.set()
+        for worker in self._workers:
+            worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+
+    async def _worker(self, worker_id: int):
+        while self._running:
+            try:
+                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                await self._process_task(task)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    async def _process_task(self, task: DownloadTask):
+        task.status = DownloadStatus.DOWNLOADING
+        task.started_at = time.time()
+        self.active_tasks[task.task_id] = task
+
+    async def add_task(self, task: DownloadTask) -> str:
+        await self.queue.put(task)
+        if task.user_id not in self.user_downloads:
+            self.user_downloads[task.user_id] = set()
+        self.user_downloads[task.user_id].add(task.task_id)
+        return task.task_id
+
+    def get_task(self, task_id: str) -> Optional[DownloadTask]:
+        return self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
+
+    def get_user_tasks(self, user_id: int) -> list[DownloadTask]:
+        task_ids = self.user_downloads.get(user_id, set())
+        tasks = []
+        for tid in task_ids:
+            task = self.get_task(tid)
+            if task:
+                tasks.append(task)
+        return sorted(tasks, key=lambda t: t.created_at, reverse=True)
+
+    def cancel_task(self, task_id: str) -> bool:
+        task = self.active_tasks.get(task_id)
+        if task and task.status == DownloadStatus.QUEUED:
+            task.status = DownloadStatus.CANCELLED
+            task.completed_at = time.time()
+            self.completed_tasks[task_id] = task
+            del self.active_tasks[task_id]
+            self._cleanup_completed()
+            return True
+        return False
+
+    def complete_task(self, task: DownloadTask):
+        task.status = DownloadStatus.COMPLETED
+        task.completed_at = time.time()
+        self.completed_tasks[task.task_id] = task
+        if task.task_id in self.active_tasks:
+            del self.active_tasks[task.task_id]
+        self._cleanup_completed()
+
+    def fail_task(self, task: DownloadTask, error: str):
+        task.status = DownloadStatus.FAILED
+        task.error = error
+        task.completed_at = time.time()
+        self.completed_tasks[task.task_id] = task
+        if task.task_id in self.active_tasks:
+            del self.active_tasks[task.task_id]
+        self._cleanup_completed()
+
+    def _cleanup_completed(self):
+        if len(self.completed_tasks) > self.max_completed_tasks:
+            sorted_tasks = sorted(
+                self.completed_tasks.items(),
+                key=lambda x: x[1].completed_at or 0
+            )
+            to_remove = sorted_tasks[:len(sorted_tasks) - self.max_completed_tasks]
+            for task_id, _ in to_remove:
+                del self.completed_tasks[task_id]
+                for user_tasks in self.user_downloads.values():
+                    user_tasks.discard(task_id)
+
+
+download_queue = DownloadQueue(max_concurrent=3)
+
+========================================
+FILE: ./core/ratelimit.py
+========================================
+import os
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+
+RATE_LIMIT_FILE = "/home/ubuntu/vee/rate_limit.json"
+
+
+def load_rate_limit() -> dict:
+    if os.path.exists(RATE_LIMIT_FILE):
+        import json
+        with open(RATE_LIMIT_FILE, "r") as f:
+            return json.load(f)
+    return {"max_downloads_per_hour": 10, "enabled": True}
+
+
+def save_rate_limit(max_downloads: int, enabled: bool):
+    import json
+    with open(RATE_LIMIT_FILE, "w") as f:
+        json.dump({"max_downloads_per_hour": max_downloads, "enabled": enabled}, f)
+
+
+class RateLimiter:
+    def __init__(self):
+        config = load_rate_limit()
+        self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
+        self.enabled = config.get("enabled", True)
+        self.user_downloads: dict[int, list] = {}
+
+    def reload(self):
+        config = load_rate_limit()
+        self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
+        self.enabled = config.get("enabled", True)
+
+    def check_limit(self, user_id: int) -> tuple[bool, Optional[str]]:
+        if not self.enabled:
+            return True, None
+            
+        now = time.time()
+        window = 3600
+        
+        if user_id not in self.user_downloads:
+            self.user_downloads[user_id] = []
+        
+        recent = [t for t in self.user_downloads[user_id] if now - t < window]
+        self.user_downloads[user_id] = recent
+        
+        if len(recent) >= self.max_downloads_per_hour:
+            wait_time = int(window - (now - recent[0]) + 60)
+            return False, f"Rate limit exceeded. Try again in {wait_time // 60} minutes."
+        
+        self.user_downloads[user_id].append(now)
+        return True, None
+
+    def get_remaining(self, user_id: int) -> int:
+        if not self.enabled:
+            return 999
+        now = time.time()
+        window = 3600
+        recent = self.user_downloads.get(user_id, [])
+        recent = [t for t in recent if now - t < window]
+        return max(0, self.max_downloads_per_hour - len(recent))
+
+    def reset(self, user_id: int):
+        if user_id in self.user_downloads:
+            del self.user_downloads[user_id]
+
+    def get_status(self) -> dict:
+        return {
+            "max_downloads_per_hour": self.max_downloads_per_hour,
+            "enabled": self.enabled,
+            "active_users": len(self.user_downloads)
+        }
+
+
+rate_limiter = RateLimiter()
+
+========================================
+FILE: ./core/services.py
+========================================
+"""
+Download Service - Abstraction layer to decouple download logic from consumers.
+
+This module provides a clean interface for downloading media, independent of
+the underlying implementation (yt-dlp, aria2, spotdl, etc.).
+"""
+
+import os
+import asyncio
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DownloadResult:
+    """Result of a download operation."""
+    success: bool
+    filename: str | None = None
+    info: dict[str, Any] | None = None
+    error: str | None = None
+    file_size: int = 0
+    file_id: str | None = None
+
+
+@dataclass
+class FormatInfo:
+    """Information about available formats."""
+    format_id: str
+    height: int | None
+    ext: str
+    filesize: int | None
+    has_audio: bool
+
+
+class DownloadService(ABC):
+    """Abstract base class for download services."""
+    
+    @property
+    @abstractmethod
+    def service_name(self) -> str:
+        """Identifier for this download service."""
+        pass
+    
+    @abstractmethod
+    async def get_formats(self, url: str) -> tuple[list[FormatInfo], dict]:
+        """Get available formats for a URL."""
+        pass
+    
+    @abstractmethod
+    async def download(
+        self, 
+        url: str, 
+        format_id: str = "best",
+        progress_hook: callable = None
+    ) -> DownloadResult:
+        """Download media from URL."""
+        pass
+    
+    @abstractmethod
+    async def get_thumbnail(self, url: str) -> tuple[str | None, dict]:
+        """Get thumbnail URL and info."""
+        pass
+    
+    @property
+    def priority(self) -> int:
+        """Service priority (lower = checked first)."""
+        return 100
+
+
+class YtDlpService(DownloadService):
+    """YouTube-dl/yt-dlp based download service."""
+    
+    def __init__(self):
+        import httpx
+        from config import COOKIE_FILE, COOKIES_DIR
+        
+        self._cookie_file = COOKIE_FILE
+        self._cookies_dir = COOKIES_DIR
+        self._resolved_urls: dict[str, str] = {}
+    
+    @property
+    def service_name(self) -> str:
+        return "yt_dlp"
+    
+    @property
+    def priority(self) -> int:
+        return 10
+    
+    async def get_formats(self, url: str) -> tuple[list[FormatInfo], dict]:
+        from core.downloader import get_formats as _get_formats
+        formats, info = await _get_formats(url)
+        
+        format_list = []
+        for f in formats:
+            acodec = f.get("acodec", "none")
+            has_audio = acodec not in (None, "none")
+            format_list.append(FormatInfo(
+                format_id=f.get("format_id", ""),
+                height=f.get("height"),
+                ext=f.get("ext", ""),
+                filesize=f.get("filesize") or f.get("filesize_approx"),
+                has_audio=has_audio
+            ))
+        
+        return format_list, info
+    
+    async def download(
+        self, 
+        url: str, 
+        format_id: str = "best",
+        progress_hook: callable = None
+    ) -> DownloadResult:
+        from core.downloader import download_video as _download_video
+        
+        try:
+            filename, info = await _download_video(url, format_id, progress_hook)
+            file_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
+            
+            return DownloadResult(
+                success=True,
+                filename=filename,
+                info=info,
+                file_size=file_size
+            )
+        except Exception as e:
+            return DownloadResult(success=False, error=str(e))
+    
+    async def get_thumbnail(self, url: str) -> tuple[str | None, dict]:
+        from core.downloader import get_thumbnail as _get_thumbnail
+        return await _get_thumbnail(url)
+
+
+class AudioService(DownloadService):
+    """Audio download service."""
+    
+    @property
+    def service_name(self) -> str:
+        return "audio"
+    
+    @property
+    def priority(self) -> int:
+        return 20
+    
+    async def get_formats(self, url: str) -> tuple[list[FormatInfo], dict]:
+        return [], {}
+    
+    async def download(
+        self, 
+        url: str, 
+        format_id: str = "best",
+        progress_hook: callable = None
+    ) -> DownloadResult:
+        from core.downloader import download_audio as _download_audio
+        from core.downloader import is_spotify_url
+        
+        try:
+            if is_spotify_url(url):
+                from core.downloader import download_spotify
+                filename, info = await download_spotify(url, progress_hook)
+            else:
+                filename, info = await _download_audio(url, progress_hook)
+            
+            file_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
+            
+            return DownloadResult(
+                success=True,
+                filename=filename,
+                info=info,
+                file_size=file_size
+            )
+        except Exception as e:
+            return DownloadResult(success=False, error=str(e))
+    
+    async def get_thumbnail(self, url: str) -> tuple[str | None, dict]:
+        return None, {}
+
+
+class ThumbnailService(DownloadService):
+    """Thumbnail/image download service."""
+    
+    @property
+    def service_name(self) -> str:
+        return "thumbnail"
+    
+    @property
+    def priority(self) -> int:
+        return 30
+    
+    async def get_formats(self, url: str) -> tuple[list[FormatInfo], dict]:
+        return [], {}
+    
+    async def download(
+        self, 
+        url: str, 
+        format_id: str = "best",
+        progress_hook: callable = None
+    ) -> DownloadResult:
+        from core.downloader import get_thumbnail as _get_thumbnail
+        
+        try:
+            thumbnail_url, info = await _get_thumbnail(url)
+            if not thumbnail_url:
+                return DownloadResult(success=False, error="No thumbnail available")
+            
+            return DownloadResult(
+                success=True,
+                filename=thumbnail_url,
+                info=info
+            )
+        except Exception as e:
+            return DownloadResult(success=False, error=str(e))
+    
+    async def get_thumbnail(self, url: str) -> tuple[str | None, dict]:
+        return await self.download(url).filename, {}
+
+
+class DownloadServiceRegistry:
+    """Registry for download services with auto-detection."""
+    
+    _services: dict[str, DownloadService] = {}
+    _initialized = False
+    
+    @classmethod
+    def register(cls, service: DownloadService):
+        """Register a download service."""
+        cls._services[service.service_name] = service
+    
+    @classmethod
+    def get(cls, name: str) -> DownloadService | None:
+        """Get service by name."""
+        if not cls._initialized:
+            cls._init_default_services()
+        return cls._services.get(name)
+    
+    @classmethod
+    def get_for_url(cls, url: str) -> DownloadService | None:
+        """Auto-detect appropriate service for URL."""
+        if not cls._initialized:
+            cls._init_default_services()
+        
+        from core.downloader import is_spotify_url
+        
+        if is_spotify_url(url):
+            return cls._services.get("audio")
+        
+        return cls._services.get("yt_dlp")
+    
+    @classmethod
+    def _init_default_services(cls):
+        """Initialize default services."""
+        cls.register(YtDlpService())
+        cls.register(AudioService())
+        cls.register(ThumbnailService())
+        cls._initialized = True
+    
+    @classmethod
+    def list_services(cls) -> list[str]:
+        """List all registered services."""
+        if not cls._initialized:
+            cls._init_default_services()
+        return list(cls._services.keys())
+
+========================================
+FILE: ./core/strategies.py
+========================================
+import os
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
+from core.history import get_file_id_by_url, add_history
+from core.logger import log_download
+from core.downloader import get_formats
+from app.download import _make_progress_hook
+
+logger = logging.getLogger(__name__)
+
+
+class DownloadStrategy(ABC):
+    """Base class for download strategies using Template Method pattern."""
+    
+    @property
+    @abstractmethod
+    def download_type(self) -> str:
+        """Return the type identifier for this strategy."""
+        pass
+    
+    @property
+    @abstractmethod
+    def telegram_method(self) -> str:
+        """Return 'video', 'audio', or 'photo' for Telegram sending."""
+        pass
+    
+    def _get_caption(self, title: str, emoji: str = "🎬") -> str | None:
+        """Build caption from title."""
+        return f"{emoji} {title}" if title else None
+    
+    def _check_cached_file(self, url: str, context: CallbackContext, user_id: int) -> str | None:
+        """Check for cached file from recent downloads."""
+        from core.history import check_recent_download
+        
+        recent = check_recent_download(url, max_age_hours=24)
+        if recent:
+            file_path = recent.get("file_path")
+            if file_path and os.path.exists(file_path):
+                size = os.path.getsize(file_path)
+                if size <= MAX_CACHE_SIZE:
+                    logger.info(f"Using cached file for {url}: {file_path}")
+                    return file_path
+        return None
+    
+    async def _get_file_id_or_upload(self, query, url: str, filename: str, caption: str | None, user_id: int):
+        """Get existing file_id or upload new file. Template method."""
+        existing_id = get_file_id_by_url(url)
+        
+        if existing_id:
+            logger.info(f"Using file_id for {url}: {existing_id}")
+            await self._send_from_file_id(query, existing_id, caption)
+            return existing_id
+        
+        return await self._upload_new_file(query, filename, caption, url, user_id)
+    
+    def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        """Override in subclass for type-specific sending."""
+        raise NotImplementedError
+    
+    def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        """Upload new file and save to history."""
+        raise NotImplementedError
+    
+    def _validate_file_size(self, filename: str, processing_msg, user_id: int) -> bool:
+        """Check file size and delete if too large."""
+        from core.i18n import t
+        
+        file_size = os.path.getsize(filename)
+        if file_size > MAX_FILE_SIZE:
+            processing_msg.edit_text(
+                t("file_too_large", user_id, size=f"{file_size // (1024*1024)}MB")
+            )
+            os.remove(filename)
+            return False
+        return True
+    
+    def _cleanup_temp_file(self, filename: str, cached_file: str | None):
+        """Delete temp file if not cached."""
+        if os.path.exists(filename) and not cached_file:
+            os.remove(filename)
+    
+    async def execute(self, query, url: str, processing_msg, context: CallbackContext):
+        """Main execution template - orchestrates the download flow."""
+        user_id = query.from_user.id
+        
+        cached_file = self._check_cached_file(url, context, user_id)
+        
+        if cached_file and os.path.exists(cached_file):
+            filename = cached_file
+            title = os.path.splitext(os.path.basename(filename))[0]
+            info = {"title": title}
+        else:
+            from core.i18n import t
+            await processing_msg.edit_text(t("downloading", user_id))
+            progress_hook = _make_progress_hook(processing_msg)
+            filename, info = await self._do_download(url, progress_hook)
+            
+            if not os.path.exists(filename):
+                from core.i18n import t
+                await processing_msg.edit_text(t("download_failed", user_id, error="File not found"))
+                return
+        
+        if not self._validate_file_size(filename, processing_msg, user_id):
+            return
+        
+        title = info.get("title")
+        caption = self._get_caption(title)
+        
+        from core.i18n import t
+        await processing_msg.edit_text(t("uploading", user_id))
+        
+        try:
+            file_size = os.path.getsize(filename)
+            logger.info(f"Starting upload: {self.download_type} - file: {filename}, size: {file_size} bytes")
+            
+            file_id = await self._get_file_id_or_upload(query, url, filename, caption, user_id)
+            
+            logger.info(f"Upload completed successfully: file_id={file_id}")
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, "success", file_size)
+            add_history(query.from_user.id, url, self.download_type, file_size, title, "success", filename, file_id)
+        except Exception as e:
+            import traceback
+            logger.error(f"Upload failed: {type(e).__name__}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            from core.i18n import t
+            await processing_msg.edit_text(t("upload_failed", user_id, error=str(e)))
+            log_download(query.from_user, f"{self.download_type}_downloaded", url, f"upload_failed: {e}")
+            add_history(query.from_user.id, url, self.download_type, os.path.getsize(filename) if os.path.exists(filename) else 0, title, "failed")
+        
+        self._cleanup_temp_file(filename, cached_file)
+    
+    @abstractmethod
+    async def _do_download(self, url: str, progress_hook):
+        """Implement actual download logic in subclass."""
+        pass
+
+
+class VideoStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "video"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "video"
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_video(video=file_id, caption=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        logger.info(f"Opening file for upload: {filename}")
+        with open(filename, "rb") as f:
+            logger.info(f"Sending video to Telegram...")
+            sent_msg = await query.message.reply_video(video=f, caption=caption)
+        logger.info(f"Video upload response received")
+        return sent_msg.video.file_id if sent_msg.video else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_video
+        format_id = "best"
+        return await download_video(url, format_id, progress_hook)
+
+
+class AudioStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "audio"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "audio"
+    
+    def _get_caption(self, title: str, emoji: str = "🎵") -> str | None:
+        return f"{emoji} {title}" if title else None
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_audio(audio=file_id, title=caption)
+        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        title = os.path.splitext(os.path.basename(filename))[0]
+        logger.info(f"Opening file for upload: {filename}")
+        with open(filename, "rb") as f:
+            logger.info(f"Sending audio to Telegram...")
+            sent_msg = await query.message.reply_audio(audio=f, title=title)
+        logger.info(f"Audio upload response received")
+        return sent_msg.audio.file_id if sent_msg.audio else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_audio
+        return await download_audio(url, progress_hook)
+
+
+class SpotifyStrategy(AudioStrategy):
+    @property
+    def download_type(self) -> str:
+        return "spotify"
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_spotify
+        return await download_spotify(url, progress_hook)
+
+
+class ThumbnailStrategy(DownloadStrategy):
+    @property
+    def download_type(self) -> str:
+        return "thumbnail"
+    
+    @property
+    def telegram_method(self) -> str:
+        return "photo"
+    
+    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        await query.message.reply_photo(photo=file_id, caption=caption)
+    
+    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+        with open(filename, "rb") as f:
+            sent_msg = await query.message.reply_photo(photo=f, caption=caption)
+        return sent_msg.photo[-1].file_id if sent_msg.photo else None
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import get_thumbnail
+        thumbnail_url, info = await get_thumbnail(url)
+        if not thumbnail_url:
+            raise RuntimeError("No thumbnail available")
+        return thumbnail_url, info
+
+
+class VideoFormatStrategy(VideoStrategy):
+    """Video strategy with specific format selection."""
+    
+    def __init__(self, format_id: str = "best"):
+        self._format_id = format_id
+        super().__init__()
+    
+    @property
+    def download_type(self) -> str:
+        return f"video_{self._format_id}"
+    
+    async def _do_download(self, url: str, progress_hook):
+        from core.downloader import download_video
+        return await download_video(url, self._format_id, progress_hook)
+
+
+class StrategyFactory:
+    """Factory for creating download strategies with lazy loading."""
+    
+    _strategies: dict[str, DownloadStrategy] = {}
+    _strategy_classes = {
+        "download_video": VideoStrategy,
+        "download_audio": AudioStrategy,
+        "download_thumbnail": ThumbnailStrategy,
+        "spotify": SpotifyStrategy,
+    }
+    
+    @classmethod
+    def get(cls, key: str) -> DownloadStrategy | None:
+        if key not in cls._strategies:
+            if key in cls._strategy_classes:
+                cls._strategies[key] = cls._strategy_classes[key]()
+            elif key.startswith("video_"):
+                format_id = key.replace("video_", "")
+                cls._strategies[key] = VideoFormatStrategy(format_id)
+            else:
+                return None
+        return cls._strategies.get(key)
+    
+    @classmethod
+    def register(cls, key: str, strategy_class: type[DownloadStrategy]):
+        cls._strategy_classes[key] = strategy_class
+        if key in cls._strategies:
+            del cls._strategies[key]
+    
+    @classmethod
+    def clear_cache(cls):
+        """Clear cached strategy instances (useful for testing)."""
+        cls._strategies.clear()
+========================================
+FILE: ./core/users.py
+========================================
+import os
+import json
+import time
+import fcntl
+import threading
+
+
+USERS_FILE = "/home/ubuntu/vee/users_db.json"
+LOCK_FILE = "/home/ubuntu/vee/users_db.lock"
+
+_cache = {"data": {}, "dirty": False, "time": 0}
+_cache_lock = threading.Lock()
+_persist_interval = 30
+_last_persist = 0
+
+
+def _load_users_unsafe() -> dict:
+    if not os.path.exists(USERS_FILE):
+        return {}
+    try:
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_users() -> dict:
+    global _cache, _last_persist
+    with _cache_lock:
+        now = time.time()
+        if _cache["data"] is None or now - _cache["time"] > 5:
+            _cache["data"] = _load_users_unsafe()
+            _cache["time"] = now
+        return _cache["data"].copy()
+
+
+def _save_users_unsafe(users: dict):
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(USERS_FILE, "w") as f:
+                json.dump(users, f, indent=2)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _persist_users():
+    global _cache, _last_persist
+    with _cache_lock:
+        if _cache["dirty"]:
+            _save_users_unsafe(_cache["data"])
+            _cache["dirty"] = False
+            _last_persist = time.time()
+
+
+def _schedule_persist():
+    global _cache
+    with _cache_lock:
+        _cache["dirty"] = True
+
+
+def get_user_info(user_id: int) -> dict:
+    users = _load_users()
+    return users.get(str(user_id), {}).copy()
+
+
+def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    global _cache
+    users = _load_users()
+    str_id = str(user_id)
+    
+    if str_id not in users:
+        users[str_id] = {"id": user_id, "added_at": time.time()}
+    
+    if username:
+        users[str_id]["username"] = username
+    if first_name:
+        users[str_id]["first_name"] = first_name
+    if last_name:
+        users[str_id]["last_name"] = last_name
+    
+    users[str_id]["last_seen"] = time.time()
+    
+    with _cache_lock:
+        _cache["data"] = users
+        _cache["dirty"] = True
+        _cache["time"] = time.time()
+
+
+def get_all_users() -> list:
+    users = _load_users()
+    return [
+        {
+            "id": int(uid),
+            "username": data.get("username"),
+            "first_name": data.get("first_name"),
+            "last_name": data.get("last_name"),
+            "last_seen": data.get("last_seen", 0),
+            "added_at": data.get("added_at", 0)
+        }
+        for uid, data in users.items()
+    ]
+
+
+def format_user_display(user: dict) -> str:
+    parts = []
+    if user.get("username"):
+        parts.append(f"@{user['username']}")
+    if user.get("first_name"):
+        parts.append(user["first_name"])
+    if user.get("last_name"):
+        parts.append(user["last_name"])
+    
+    name = " ".join(parts) if parts else f"User {user['id']}"
+    return f"{name} (`{user['id']}`)"
+
+
+def force_persist():
+    _persist_users()
+
+========================================
+FILE: ./core/utils.py
+========================================
+"""Common utilities for the bot - extracted to reduce duplication."""
+
+import os
+from functools import wraps
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from config import ADMIN_IDS, BOT_FILE_PREFIX
+
+
+def format_bytes(bytes_val: int | float) -> str:
+    """Format bytes into human-readable string."""
+    if bytes_val is None:
+        return "?"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f}{unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f}PB"
+
+
+def check_admin(user_id: int) -> bool:
+    """Check if user is admin."""
+    return ADMIN_IDS and user_id in ADMIN_IDS
+
+
+def require_admin(func):
+    """Decorator to require admin access for commands."""
+    @wraps(func)
+    async def wrapper(update: Update, context: CallbackContext):
+        if not update.message:
+            return
+        user_id = update.message.from_user.id
+        if ADMIN_IDS and user_id not in ADMIN_IDS:
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def scan_temp_files(temp_dir: str) -> tuple[int, int, str | None, float | None]:
+    """
+    Scan temp directory for bot files.
+    Returns: (file_count, total_size, oldest_file, oldest_time)
+    """
+    count = 0
+    total_size = 0
+    oldest_file = None
+    oldest_time = None
+    
+    if not os.path.exists(temp_dir):
+        return count, total_size, oldest_file, oldest_time
+    
+    for fname in os.listdir(temp_dir):
+        fpath = os.path.join(temp_dir, fname)
+        if os.path.isfile(fpath):
+            if fname.startswith(BOT_FILE_PREFIX):
+                count += 1
+                try:
+                    total_size += os.path.getsize(fpath)
+                except:
+                    pass
+                mtime = os.path.getmtime(fpath)
+                if oldest_time is None or mtime < oldest_time:
+                    oldest_time = mtime
+                    oldest_file = fname
+    
+    return count, total_size, oldest_file, oldest_time
+========================================
+FILE: ./scripts/refresh_cookies.py
+========================================
+#!/usr/bin/env python3
+"""
+Cookie refresh script for yt-dlp.
+Supports multiple methods:
+1. Browser extraction (chrome, firefox, edge, chromium)
+2. URL download (curl/wget from a cookie provider)
+3. Custom command
+
+Usage:
+    python3 refresh_cookies.py [browser|url|custom] [args...]
+
+Examples:
+    python3 refresh_cookies.py chrome /home/ubuntu/vee/cookies.txt
+    python3 refresh_cookies.py url https://example.com/cookies.txt /home/ubuntu/vee/cookies.txt
+    python3 refresh_cookies.py custom /path/to/your/refresh.sh
+"""
+
+import sys
+import os
+import subprocess
+
+BROWSERS = {
+    "chrome": "--cookies-from-browser chrome",
+    "firefox": "--cookies-from-browser firefox",
+    "edge": "--cookies-from-browser edge",
+    "chromium": "--cookies-from-browser chromium",
+}
+
+
+def refresh_from_browser(browser, output_file):
+    if browser not in BROWSERS:
+        print(f"Error: Unknown browser '{browser}'. Choose from: {', '.join(BROWSERS.keys())}")
+        return False
+    
+    cmd = [
+        "yt-dlp",
+        "--cookies", output_file,
+        "--cookies-from-browser", browser,
+        "https://www.youtube.com",
+        "--skip-download",
+        "--quiet",
+    ]
+    
+    print(f"Extracting cookies from {browser}...")
+    print(f"Saving to: {output_file}")
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("Cookies refreshed successfully!")
+            if os.path.exists(output_file):
+                print(f"Cookie file size: {os.path.getsize(output_file)} bytes")
+            return True
+        else:
+            print(f"Error: {result.stderr}")
+            return False
+    except FileNotFoundError:
+        print("Error: yt-dlp not found. Install with: pip install yt-dlp")
+        return False
+
+
+def refresh_from_url(url, output_file):
+    print(f"Downloading cookies from: {url}")
+    print(f"Saving to: {output_file}")
+    
+    # Try curl first, then wget
+    for cmd_name, cmd_args in [("curl", ["-o", output_file, url]), ("wget", ["-O", output_file, url])]:
+        try:
+            cmd = [cmd_name] + cmd_args
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and os.path.exists(output_file):
+                print(f"Cookies downloaded successfully! ({os.path.getsize(output_file)} bytes)")
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    
+    print("Error: Failed to download cookies (tried curl and wget)")
+    return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    mode = sys.argv[1].lower()
+    
+    if mode in BROWSERS:
+        # Browser mode
+        output_file = sys.argv[2] if len(sys.argv) > 2 else "cookies.txt"
+        success = refresh_from_browser(mode, output_file)
+    elif mode == "url":
+        # URL mode
+        if len(sys.argv) < 4:
+            print("Usage: python3 refresh_cookies.py url <url> <output_file>")
+            sys.exit(1)
+        url = sys.argv[2]
+        output_file = sys.argv[3]
+        success = refresh_from_url(url, output_file)
+    elif mode == "custom":
+        # Custom command mode
+        if len(sys.argv) < 3:
+            print("Usage: python3 refresh_cookies.py custom <command>")
+            sys.exit(1)
+        cmd = " ".join(sys.argv[2:])
+        print(f"Running custom command: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("Custom command succeeded!")
+            success = True
+        else:
+            print(f"Error: {result.stderr}")
+            success = False
+    else:
+        print(f"Unknown mode: {mode}")
+        print(__doc__)
+        sys.exit(1)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+========================================
+FILE: ./vee.py
+========================================
+import logging
+import os
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, JobQueue, PicklePersistence, CallbackContext
+from telegram.request import HTTPXRequest
+
+from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, cleanup_temp_files, CLEANUP_INTERVAL_HOURS, persist_all_data
+from app.commands import (
+    start_command, help_command, stats_command, history_command, myid_command,
+    allow_command, block_command, users_command, broadcast_command,
+    userhistory_command, rateinfo_command, setrate_command,
+    cleanup_command, status_command, queue_command, storage_command, failed_command,
+    lang_command, cookie_command, refresh_command
+)
+from app.callbacks import handle_link, handle_callback
+
+
+async def set_bot_commands(app: Application):
+    bot = app.bot
+    
+    user_commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show available commands"),
+        BotCommand("history", "View your download history"),
+        BotCommand("myid", "Get your user ID"),
+        BotCommand("lang", "Change language"),
+    ]
+    
+    admin_commands = [
+        BotCommand("stats", "Show bot statistics"),
+        BotCommand("allow", "Allow a user (admin)"),
+        BotCommand("block", "Block a user (admin)"),
+        BotCommand("users", "List allowed users"),
+        BotCommand("broadcast", "Broadcast message"),
+        BotCommand("userhistory", "View user history"),
+        BotCommand("rateinfo", "Show rate limit info"),
+        BotCommand("setrate", "Set rate limit"),
+        BotCommand("cleanup", "Clean temp files"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("queue", "Show download queue"),
+        BotCommand("storage", "Show storage info"),
+        BotCommand("failed", "Show failed downloads"),
+        BotCommand("cookie", "Update cookies"),
+        BotCommand("refresh", "Clear cached file"),
+    ]
+    
+    await bot.set_my_commands(user_commands)
+    if ADMIN_IDS:
+        await bot.set_my_commands(user_commands + admin_commands, scope={"type": "chat", "chat_id": list(ADMIN_IDS)[0]})
+
+
+class CookieFilter(filters.BaseFilter):
+    def filter(self, message):
+        if not message.document:
+            return False
+        if not ADMIN_IDS:
+            return False
+        return message.from_user.id in ADMIN_IDS
+
+
+async def handle_cookie_file(update: Update, context: CallbackContext):
+    from config import COOKIE_FILE, COOKIES_DIR
+    document = update.message.document
+    if not document:
+        return
+    
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("Please send a .txt file (cookies.txt)")
+        return
+    
+    import re
+    filename = document.file_name
+    match = re.match(r'([^_]+)_cookies\.txt', filename)
+    
+    if match:
+        site_domain = match.group(1)
+        site_cookie_file = os.path.join(COOKIES_DIR, f"{site_domain}_cookies.txt")
+        try:
+            file = await document.get_file()
+            await file.download_to_drive(custom_path=site_cookie_file)
+            await update.message.reply_text(f"Cookies saved for {site_domain}!")
+        except Exception as e:
+            await update.message.reply_text(f"Error saving cookie file: {e}")
+    else:
+        if COOKIE_FILE:
+            try:
+                file = await document.get_file()
+                await file.download_to_drive(custom_path=COOKIE_FILE)
+                await update.message.reply_text(f"Cookies updated! Saved to {COOKIE_FILE}")
+            except Exception as e:
+                await update.message.reply_text(f"Error saving cookie file: {e}")
+        else:
+            await update.message.reply_text("Invalid filename. Use format: domain_cookies.txt (e.g., www.youtube.com_cookies.txt)")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
+class AdminFilter(filters.BaseFilter):
+    def filter(self, message):
+        return message.from_user.id in ADMIN_IDS
+
+
+async def cleanup_job(context):
+    cleanup_temp_files(max_age_hours=24)
+
+
+async def persist_job(context):
+    persist_all_data()
+
+
+async def storage_alert_job(context):
+    import psutil
+    from config import ADMIN_IDS
+    
+    if not ADMIN_IDS:
+        return
+    
+    disk = psutil.disk_usage("/")
+    total, used, free, percent = disk.total, disk.used, disk.free, disk.percent
+    
+    if percent > 90:
+        msg = f"⚠️ CRITICAL: Disk usage at {percent:.1f}%"
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=msg)
+            except:
+                pass
+
+
+def main():
+    request = HTTPXRequest(
+        write_timeout=600,
+        connect_timeout=30,
+        read_timeout=600,
+        pool_timeout=30
+    )
+    
+    if LOCAL_MODE:
+        from telegram.ext import ExtBot
+        bot = ExtBot(
+            token=TOKEN,
+            local_mode=LOCAL_MODE,
+            base_url=BOT_API_URL,
+            request=request
+        )
+        app = Application.builder().bot(bot).build()
+    else:
+        app = (
+            Application.builder()
+            .token(TOKEN)
+            .request(request)
+            .build()
+        )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("lang", lang_command))
+    
+    if ADMIN_IDS:
+        app.add_handler(CommandHandler("stats", stats_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("allow", allow_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("block", block_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("users", users_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("broadcast", broadcast_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("userhistory", userhistory_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("rateinfo", rateinfo_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("setrate", setrate_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cleanup", cleanup_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("status", status_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("queue", queue_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("storage", storage_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("failed", failed_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("cookie", cookie_command, filters=AdminFilter()))
+        app.add_handler(CommandHandler("refresh", refresh_command, filters=AdminFilter()))
+    
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
+
+    if CLEANUP_INTERVAL_HOURS > 0:
+        app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60)
+
+    app.job_queue.run_repeating(persist_job, interval=60, first=30)
+    
+    if ADMIN_IDS:
+        app.job_queue.run_repeating(storage_alert_job, interval=3600, first=300)
+
+    async def post_init_callback(app: Application):
+        await set_bot_commands(app)
+
+    app.post_init = post_init_callback
+    
+    async def post_shutdown(context):
+        persist_all_data()
+
+    app.post_shutdown = post_shutdown
+    
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+

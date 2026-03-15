@@ -64,7 +64,7 @@ def log_download(user, action, url, status, file_size=None, format_id=None):
 
 
 async def get_user_stats():
-    from core.history import get_all_users_count, get_total_downloads, get_failed_downloads
+    from database.history import get_all_users_count, get_total_downloads, get_failed_downloads
 
     total_users = await get_all_users_count()
     total_dl = await get_total_downloads()

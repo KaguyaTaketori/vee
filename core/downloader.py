@@ -11,7 +11,7 @@ import httpx
 import re as _re
 from functools import lru_cache
 from urllib.parse import urlparse
-from core.utils import get_running_loop as _get_running_loop
+from utils.utils import get_running_loop as _get_running_loop
 from config import MAX_FILE_SIZE, COOKIE_FILE, get_temp_template, TEMP_DIR, BOT_FILE_PREFIX, USE_ARIA2, ARIA2_CONNECTIONS, COOKIE_REFRESH_CMD, COOKIE_REFRESH_INTERVAL_HOURS, COOKIES_DIR
 
 logger = logging.getLogger(__name__)

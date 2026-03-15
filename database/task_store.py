@@ -1,8 +1,8 @@
 import time
 import logging
 from typing import Optional
-from core.db import get_db
-from core.model import DownloadTask, DownloadStatus
+from database.db import get_db
+from models.domain_models import DownloadTask, DownloadStatus
 
 logger = logging.getLogger(__name__)
 

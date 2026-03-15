@@ -7,10 +7,10 @@ from telegram import Update
 from telegram.ext import CallbackContext
 
 from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
-from core.history import get_file_id_by_url, add_history
-from core.logger import log_download
+from database.history import get_file_id_by_url, add_history
+from utils.logger import log_download
 from core.downloader import get_formats
-from app.download import _make_progress_hook
+from bot.download import _make_progress_hook
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class DownloadStrategy(ABC):
     
     async def _check_cached_file(self, url: str, context: CallbackContext, user_id: int) -> str | None:
         """Check for cached file from recent downloads."""
-        from core.history import check_recent_download
+        from database.history import check_recent_download
         
         recent = await check_recent_download(url, max_age_hours=24)
         if recent:
@@ -69,7 +69,7 @@ class DownloadStrategy(ABC):
     
     async def _validate_file_size(self, filename: str, processing_msg, user_id: int) -> bool:
         """Check file size and delete if too large."""
-        from core.i18n import t
+        from utils.i18n import t
         
         file_size = os.path.getsize(filename)
         if file_size > MAX_FILE_SIZE:
@@ -88,7 +88,7 @@ class DownloadStrategy(ABC):
     async def execute(self, query, url: str, processing_msg, context: CallbackContext):
         """Main execution template - orchestrates the download flow."""
         user_id = query.from_user.id
-        from core.i18n import t
+        from utils.i18n import t
 
         existing_id = await get_file_id_by_url(url)
         if existing_id:
@@ -99,7 +99,7 @@ class DownloadStrategy(ABC):
                 return
             except Exception as e:
                 logger.warning(f"Failed to send via file_id (maybe expired): {e}. Proceeding to download.")
-                from core.history import clear_file_id_by_url
+                from database.history import clear_file_id_by_url
                 await clear_file_id_by_url(url)
         
         cached_file = await self._check_cached_file(url, context, user_id)
@@ -237,7 +237,7 @@ class ThumbnailStrategy(DownloadStrategy):
     
     async def execute(self, query, url: str, processing_msg, context: CallbackContext):
         user_id = query.from_user.id
-        from core.i18n import t
+        from utils.i18n import t
         
         await processing_msg.edit_text(t("downloading", user_id))
         try:

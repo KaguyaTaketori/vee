@@ -7,7 +7,7 @@ from telegram.error import TelegramError
 
 from config import TOKEN, BOT_API_URL, LOCAL_MODE, ADMIN_IDS, CLEANUP_INTERVAL_HOURS, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES
 from services.user_service import cleanup_temp_files
-from app.commands import (
+from bot.commands import (
     start_command, help_command, stats_command, history_command, myid_command,
     allow_command, block_command, users_command, broadcast_command,
     userhistory_command, rateinfo_command, setrate_command,
@@ -15,14 +15,14 @@ from app.commands import (
     lang_command, cookie_command, refresh_command, cancel_command, admin_cancel_command,
     report_command, setdisk_command, tasks_command, settier_command,
 )
-from app.callbacks import handle_link, handle_callback
-from core.queue import download_queue
-from core.models import DownloadStatus
-from core.facades import _execute_download_task
-from core.logger import setup_logging
-from core.db import init_db
-from core.task_store import mark_stale_tasks_failed
-from core.analytics import get_daily_stats, format_daily_report
+from bot.callbacks import handle_link, handle_callback
+from services.queue import download_queue
+from models.domain_models import DownloadStatus
+from services.facades import _execute_download_task
+from utils.logger import setup_logging
+from database.db import init_db
+from database.task_store import mark_stale_tasks_failed
+from services.analytics import get_daily_stats, format_daily_report
 from datetime import time as dt_time
 import pytz
 

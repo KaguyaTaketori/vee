@@ -1,7 +1,7 @@
 import time
 import logging
 import aiosqlite
-from core.db import DB_PATH
+from database.db import DB_PATH
 
 logger = logging.getLogger(__name__)
 

@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable, TypedDict, Any
 from telegram import Bot
-from core.task_store import persist_task
-from core.models import DownloadTask, DownloadStatus, STATUS_EMOJI, TaskContext
+from database.task_store import persist_task
+from models.domain_models import DownloadTask, DownloadStatus, STATUS_EMOJI, TaskContext
 
 logger = logging.getLogger(__name__)
 

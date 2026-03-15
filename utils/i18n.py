@@ -3,7 +3,7 @@ import json
 import sqlite3
 from typing import Optional
 
-from core.db import DB_PATH
+from database.db import DB_PATH
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +46,7 @@ def get_user_lang(user_id: int) -> str:
     return _lang_cache.get(user_id, DEFAULT_LANG)
 
 async def warm_user_lang(user_id: int) -> str:
-    from core.db import get_db
+    from database.db import get_db
     async with get_db() as db:
         async with db.execute(
             "SELECT lang FROM users WHERE user_id = ?", (user_id,)

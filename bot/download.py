@@ -1,6 +1,6 @@
 import asyncio
 import time
-from core.utils import format_bytes as _format_size
+from utils.utils import format_bytes as _format_size
 from concurrent.futures import ThreadPoolExecutor
 
 download_executor = ThreadPoolExecutor(max_workers=10)

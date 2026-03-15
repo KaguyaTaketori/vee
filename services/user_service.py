@@ -3,8 +3,8 @@ import time
 import asyncio
 import aiosqlite
 
-from core.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
-from core.db import DB_PATH
+from database.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
+from database.db import DB_PATH
 from config import (
     ALLOWED_USERS_FILE,
     ADMIN_IDS,

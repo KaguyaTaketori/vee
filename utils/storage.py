@@ -7,7 +7,7 @@ import asyncio
 from filelock import FileLock
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
-from core.utils import get_running_loop as _get_running_loop
+from utils.utils import get_running_loop as _get_running_loop
 
 
 _executor = ThreadPoolExecutor(max_workers=4)

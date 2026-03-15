@@ -7,14 +7,14 @@ from functools import wraps
 
 from config import ADMIN_IDS, get_config, TEMP_DIR, BOT_FILE_PREFIX
 from services.user_service import get_allowed_users, save_allowed_users, track_user, get_all_users_info, get_user_display_name, cleanup_temp_files
-from core.db import get_db
-from core.logger import log_user, get_user_stats
-from core.history import clear_file_id_by_url,  get_user_history, get_user_history_page, get_all_users_count, get_total_downloads, get_failed_downloads
-from core.queue import download_queue
-from core.models import DownloadStatus, STATUS_EMOJI
-from core.ratelimit import rate_limiter, save_rate_limit
-from core.i18n import t, set_user_lang, LANGUAGES
-from core.utils import require_admin, check_admin, scan_temp_files, format_bytes, format_history_list, format_history_item
+from database.db import get_db
+from utils.logger import log_user, get_user_stats
+from database.history import clear_file_id_by_url,  get_user_history, get_user_history_page, get_all_users_count, get_total_downloads, get_failed_downloads
+from services.queue import download_queue
+from models.domain_models import DownloadStatus, STATUS_EMOJI
+from services.ratelimit import rate_limiter, save_rate_limit
+from utils.i18n import t, set_user_lang, LANGUAGES
+from utils.utils import require_admin, check_admin, scan_temp_files, format_bytes, format_history_list, format_history_item
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ async def tasks_command(update: Update, context: CallbackContext):
     if not update.message:
         return
     user_id = update.message.from_user.id
-    from core.task_store import get_user_tasks
+    from database.task_store import get_user_tasks
 
     records = await get_user_tasks(user_id, limit=10)
     if not records:
@@ -159,7 +159,7 @@ async def settier_command(update: Update, context: CallbackContext):
         return
 
     from config import RATE_TIER_LIMITS
-    from core.ratelimit import get_user_tier, get_user_limit, set_user_tier
+    from services.ratelimit import get_user_tier, get_user_limit, set_user_tier
 
     VALID_TIERS = list(RATE_TIER_LIMITS.keys())
 
@@ -254,7 +254,7 @@ async def report_command(update: Update, context: CallbackContext):
         except ValueError:
             pass
 
-    from core.analytics import get_daily_stats, format_daily_report
+    from services.analytics import get_daily_stats, format_daily_report
     stats = await get_daily_stats(days=days)
     period = f"近 {days} 天" if days > 1 else "今日"
     await update.message.reply_text(format_daily_report(stats, period=period))
