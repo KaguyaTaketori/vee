@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import os
 import logging
 
 from .base import DownloadStrategy
+from .sender import BotSender
 from integrations.downloaders import ytdlp_client
 from utils.i18n import t
 
@@ -9,30 +12,37 @@ logger = logging.getLogger(__name__)
 
 
 class AudioStrategy(DownloadStrategy):
+
     @property
     def download_type(self) -> str:
         return "audio"
-    
-    @property
-    def telegram_method(self) -> str:
-        return "audio"
-    
+
     def _get_caption(self, title: str, emoji: str = "🎵") -> str | None:
         return f"{emoji} {title}" if title else None
-    
-    async def _send_from_file_id(self, query, file_id: str, caption: str | None):
-        user_id = query.from_user.id
-        await query.message.reply_audio(audio=file_id, title=caption)
-        await query.message.reply_text(t("sent_via_file_id_no_reupload", user_id))
-    
-    async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
+
+    async def _send_from_file_id(
+        self,
+        sender: BotSender,
+        file_id: str,
+        caption: str | None,
+    ) -> None:
+        await sender.send_audio(file_id, title=caption)
+        await sender.send_message(
+            t("sent_via_file_id_no_reupload", sender.user_id)
+        )
+
+    async def _upload_new_file(
+        self,
+        sender: BotSender,
+        filename: str,
+        caption: str | None,
+    ) -> str | None:
         title = os.path.splitext(os.path.basename(filename))[0]
-        logger.info(f"Opening file for upload: {filename}")
+        logger.info("Opening audio file for upload: %s", filename)
         with open(filename, "rb") as f:
-            logger.info(f"Sending audio to Telegram...")
-            sent_msg = await query.message.reply_audio(audio=f, title=title)
-        logger.info(f"Audio upload response received")
-        return sent_msg.audio.file_id if sent_msg.audio else None
-    
-    async def _do_download(self, url: str, progress_hook):
+            file_id = await sender.send_audio(f, title=title)
+        logger.info("Audio upload completed")
+        return file_id
+
+    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
         return await ytdlp_client.download_audio(url, progress_hook)
