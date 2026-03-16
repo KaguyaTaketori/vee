@@ -1,10 +1,10 @@
 import os
 import time
 import asyncio
-import aiosqlite
 
+from utils.cache import TTLCache
 from database.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
-from database.db import DB_PATH
+from database.db import get_db
 from config import (
     ALLOWED_USERS_FILE,
     ADMIN_IDS,
@@ -14,9 +14,8 @@ from config import (
     TEMP_FILE_MAX_AGE_HOURS,
 )
 
-_allowed_users_cache = {"data": None, "time": 0}
-_users_db_cache = {"data": None, "time": 0}
-
+_allowed_users_cache: TTLCache = TTLCache(ttl=CACHE_TTL)
+_users_db_cache: TTLCache      = TTLCache(ttl=CACHE_TTL)
 
 def track_user(user):
     if user:
@@ -27,12 +26,11 @@ def track_user(user):
             asyncio.run(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
 
 
-def get_allowed_users():
-    global _allowed_users_cache
-    now = time.time()
-    if _allowed_users_cache["data"] and (now - _allowed_users_cache["time"]) < CACHE_TTL:
-        return _allowed_users_cache["data"]
-    
+def get_allowed_users() -> set:
+    cached = _allowed_users_cache.get()
+    if cached is not TTLCache._MISSING:
+        return cached                       # ✅ 空 set() 也能正确命中
+
     users = set()
     if os.path.exists(ALLOWED_USERS_FILE):
         with open(ALLOWED_USERS_FILE, "r") as f:
@@ -40,47 +38,61 @@ def get_allowed_users():
                 line = line.strip()
                 if line and line.isdigit():
                     users.add(int(line))
-    
+
     result = users | ADMIN_IDS
-    _allowed_users_cache = {"data": result, "time": now}
+    _allowed_users_cache.set(result)
     return result
 
 
-def save_allowed_users(users):
+def save_allowed_users(users: set):
     with open(ALLOWED_USERS_FILE, "w") as f:
         for uid in sorted(users):
             f.write(f"{uid}\n")
-    global _allowed_users_cache
-    _allowed_users_cache = {"data": None, "time": 0}
+    _allowed_users_cache.invalidate()
 
 
-async def get_all_users_info():
-    global _users_db_cache
-    import time
-    now = time.time()
-    if _users_db_cache["data"] and (now - _users_db_cache["time"]) < CACHE_TTL:
-        return _users_db_cache["data"]
-    
+async def get_all_users_info() -> list:
+    cached = _users_db_cache.get()
+    if cached is not TTLCache._MISSING:
+        return cached
+
     data = await _get_all_users()
-    _users_db_cache = {"data": data, "time": now}
+    _users_db_cache.set(data)
     return data
 
 
 async def get_user_display_name(user_id: int) -> str:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             async with db.execute(
                 "SELECT username, first_name FROM users WHERE user_id = ?", (user_id,)
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    if row[0]:
-                        return f"@{row[0]}"
-                    if row[1]:
-                        return row[1]
+                    return f"@{row['username']}" if row["username"] else (row["first_name"] or str(user_id))
     except Exception:
         pass
     return str(user_id)
+
+
+async def get_user_display_names_bulk(user_ids: list[int]) -> dict[int, str]:
+    if not user_ids:
+        return {}
+
+    async with get_db() as db:
+        placeholders = ",".join("?" * len(user_ids))
+        async with db.execute(
+            f"SELECT user_id, username, first_name, last_name "
+            f"FROM users WHERE user_id IN ({placeholders})",
+            user_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+
+    result = {}
+    for row in rows:
+        r = dict(row)
+        result[r["user_id"]] = format_user_display(r)
+    return result
 
 
 def cleanup_temp_files(max_age_hours: int = None):

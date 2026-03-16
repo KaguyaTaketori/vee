@@ -3,6 +3,7 @@ import logging
 
 from .base import DownloadStrategy
 from integrations.downloaders import ytdlp_client
+from utils.i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,9 @@ class AudioStrategy(DownloadStrategy):
         return f"{emoji} {title}" if title else None
     
     async def _send_from_file_id(self, query, file_id: str, caption: str | None):
+        user_id = query.from_user.id
         await query.message.reply_audio(audio=file_id, title=caption)
-        await query.message.reply_text("✅ Sent via file ID (no re-upload)")
+        await query.message.reply_text(t("sent_via_file_id_no_reupload", user_id))
     
     async def _upload_new_file(self, query, filename: str, caption: str | None, url: str, user_id: int):
         title = os.path.splitext(os.path.basename(filename))[0]

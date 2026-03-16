@@ -1,14 +1,13 @@
 import time
 import logging
 import aiosqlite
-from database.db import DB_PATH
+from database.db import get_db
 
 logger = logging.getLogger(__name__)
 
 
 async def get_user_info(user_id: int) -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_db() as db:
         async with db.execute(
             "SELECT user_id, username, first_name, last_name, lang, added_at, last_seen FROM users WHERE user_id = ?",
             (user_id,)
@@ -19,8 +18,8 @@ async def get_user_info(user_id: int) -> dict:
             return {}
 
 
-async def get_user_lang(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def fetch_user_lang_from_db(user_id: int) -> str:
+    async with get_db() as db:
         async with db.execute(
             "SELECT lang FROM users WHERE user_id = ?",
             (user_id,)
@@ -33,7 +32,7 @@ async def get_user_lang(user_id: int) -> str:
 
 async def set_user_lang(user_id: int, lang: str):
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute(
             """
             INSERT INTO users (user_id, lang, added_at, last_seen)
@@ -45,51 +44,32 @@ async def set_user_lang(user_id: int, lang: str):
         await db.commit()
 
 
-async def update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+async def update_user(user_id: int, username: str = None,
+                      first_name: str = None, last_name: str = None):
+    """
+    Upsert user info. Only provided (non-None) fields are updated.
+    The user's language preference is always preserved via COALESCE.
+    """
     now = time.time()
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        existing_lang = None
-        async with db.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                existing_lang = row[0]
-        
-        set_clauses = []
-        params = []
-        
-        if username is not None:
-            set_clauses.append("username = ?")
-            params.append(username)
-        if first_name is not None:
-            set_clauses.append("first_name = ?")
-            params.append(first_name)
-        if last_name is not None:
-            set_clauses.append("last_name = ?")
-            params.append(last_name)
-        
-        set_clauses.append("last_seen = ?")
-        params.append(now)
-        
-        if existing_lang is not None:
-            set_clauses.append("lang = ?")
-            params.append(existing_lang)
-        
+    async with get_db() as db:
         await db.execute(
-            f"""
+            """
             INSERT INTO users (user_id, username, first_name, last_name, lang, added_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'en', ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                {', '.join(set_clauses)}
+                username   = COALESCE(excluded.username,   users.username),
+                first_name = COALESCE(excluded.first_name, users.first_name),
+                last_name  = COALESCE(excluded.last_name,  users.last_name),
+                last_seen  = excluded.last_seen
+                -- lang 列故意不在这里更新，由 set_user_lang 单独管理
             """,
-            (user_id, username, first_name, last_name, existing_lang or "en", now, now) + tuple(params)
+            (user_id, username, first_name, last_name, now, now),
         )
         await db.commit()
 
 
 async def get_all_users() -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with get_db() as db:
         async with db.execute(
             "SELECT user_id, username, first_name, last_name, last_seen, added_at FROM users"
         ) as cursor:

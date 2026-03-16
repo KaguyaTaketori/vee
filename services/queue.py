@@ -10,11 +10,16 @@ from models.domain_models import DownloadTask, DownloadStatus, STATUS_EMOJI, Tas
 
 logger = logging.getLogger(__name__)
 
+@dataclass(order=True)
+class PrioritizedTask:
+    priority: int
+    task: "DownloadTask" = field(compare=False)
+
 class DownloadQueue:
     def __init__(self, max_concurrent: int = 3, max_completed_tasks: int = 100):
         self.max_concurrent = max_concurrent
         self.max_completed_tasks = max_completed_tasks
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self.active_tasks: dict[str, DownloadTask] = {}
         self.completed_tasks: dict[str, DownloadTask] = {}
         self.user_downloads: dict[int, set[str]] = {}
@@ -24,6 +29,7 @@ class DownloadQueue:
         self._executor: Optional[Callable] = None
         self._pending_user_tasks: dict[int, list[str]] = {}
         self._task_contexts: dict[str, TaskContext] = {}
+        self._cancelled_ids: set[str] = set()
     
     def set_executor(self, executor: Callable):
         """Set the async function to execute when processing a task.
@@ -66,6 +72,7 @@ class DownloadQueue:
         task.completed_at = time.time()
         if error:
             task.error = error
+
         self.completed_tasks[task.task_id] = task
         self.active_tasks.pop(task.task_id, None)
         self._task_contexts.pop(task.task_id, None)
@@ -74,7 +81,19 @@ class DownloadQueue:
 
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(persist_task(task))
+            persist_coro = loop.create_task(persist_task(task))
+            def _on_persist_done(fut: asyncio.Future):
+                if fut.cancelled():
+                    return
+                exc = fut.exception()
+                if exc:
+                    logger.error(
+                        f"[CRITICAL] Failed to persist task {task.task_id} "
+                        f"(status={status.value}): {exc}",
+                        exc_info=exc,
+                    )
+
+            persist_coro.add_done_callback(_on_persist_done)
         except RuntimeError:
             pass
 
@@ -132,8 +151,8 @@ class DownloadQueue:
         logger.error(f"Task {task.task_id} failed after {task.max_retries} retries: {last_error}")
         self._finalize_task(task, DownloadStatus.FAILED, f"Failed after {task.max_retries} retries: {last_error}")
 
-    async def add_task(self, task: DownloadTask, telegram_ctx: TaskContext = None) -> str:
-        await self.queue.put(task)
+    async def add_task(self, task: DownloadTask, telegram_ctx: TaskContext = None, priority: int = 10) -> str:
+        await self.queue.put(PrioritizedTask(priority=priority, task=task))
         if task.user_id not in self.user_downloads:
             self.user_downloads[task.user_id] = set()
         self.user_downloads[task.user_id].add(task.task_id)
@@ -186,32 +205,32 @@ class DownloadQueue:
         return True
 
     async def cancel_queued_task(self, task_id: str) -> bool:
-        remaining = []
-        cancelled = False
-        
-        while not self.queue.empty():
+        for pending_list in self._pending_user_tasks.values():
+            if task_id in pending_list:
+                self._cancelled_ids.add(task_id)
+                pending_list.remove(task_id)
+                fake_task = DownloadTask(
+                    task_id=task_id, user_id=0, url="", download_type="",
+                    status=DownloadStatus.CANCELLED
+                )
+                self.completed_tasks[task_id] = fake_task
+                return True
+        return False
+
+    async def _worker(self, worker_id: int):
+        while self._running:
             try:
-                task = self.queue.get_nowait()
-                if task.task_id == task_id:
-                    task.status = DownloadStatus.CANCELLED
-                    task.completed_at = time.time()
-                    self.completed_tasks[task_id] = task
-                    self._task_contexts.pop(task_id, None)
-                    cancelled = True
-                else:
-                    remaining.append(task)
-            except asyncio.QueueEmpty:
+                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                task = item.task
+                if task.task_id in self._cancelled_ids:
+                    self._cancelled_ids.discard(task.task_id)
+                    logger.info(f"Task {task.task_id} was cancelled before execution, skipping.")
+                    continue
+                await self._process_task(task)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
                 break
-    
-        for t in remaining:
-            await self.queue.put(t)
-    
-        if cancelled:
-            user_pending = self._pending_user_tasks.get(task.user_id, [])
-            if task_id in user_pending:
-                user_pending.remove(task_id)
-    
-        return cancelled
 
     async def cancel_task(self, task_id: str) -> bool:
         if task_id in self.active_tasks:
@@ -220,21 +239,10 @@ class DownloadQueue:
         return await self.cancel_queued_task(task_id)
 
     def complete_task(self, task: DownloadTask):
-        task.status = DownloadStatus.COMPLETED
-        task.completed_at = time.time()
-        self.completed_tasks[task.task_id] = task
-        if task.task_id in self.active_tasks:
-            del self.active_tasks[task.task_id]
-        self._cleanup_completed()
+        self._finalize_task(task, DownloadStatus.COMPLETED)
 
     def fail_task(self, task: DownloadTask, error: str):
-        task.status = DownloadStatus.FAILED
-        task.error = error
-        task.completed_at = time.time()
-        self.completed_tasks[task.task_id] = task
-        if task.task_id in self.active_tasks:
-            del self.active_tasks[task.task_id]
-        self._cleanup_completed()
+        self._finalize_task(task, DownloadStatus.FAILED, error)
 
     def _cleanup_completed(self):
         if len(self.completed_tasks) > self.max_completed_tasks:

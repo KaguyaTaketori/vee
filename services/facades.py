@@ -1,9 +1,11 @@
 import logging
 import asyncio
 import uuid
-
+import traceback
+from typing import Protocol, Any
 from services.user_service import get_allowed_users
 from services.ratelimit import rate_limiter
+from services.query_adapters import SilentMessageQuery
 from utils.logger import log_user
 from integrations.strategies.factory import StrategyFactory
 from services.queue import download_queue
@@ -145,7 +147,7 @@ class DownloadFacade:
             return False, "unknown_download_type"
         
         try:
-            task_id = str(uuid.uuid4())[:8]
+            task_id = uuid.uuid4().hex[:16]
             download_type = strategy_key
             
             task = DownloadTask(
@@ -177,7 +179,6 @@ class DownloadFacade:
             
         except Exception as e:
             logger.error(f"Failed to queue task: {type(e).__name__}: {e}")
-            import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False, "download_failed"
     
@@ -194,15 +195,16 @@ class DownloadFacade:
             "spotify" -> "spotify"
         """
         if callback_data == "download_audio" or is_spotify_url(url):
-            return "spotify" if is_spotify_url(url) else "audio"
+            return "spotify" if is_spotify_url(url) else "download_audio"
         if callback_data == "download_thumbnail":
             return "thumbnail"
         if callback_data == "download_subtitle":
             return "subtitle"
         if callback_data.startswith("quality_"):
-            return "video"
+            format_id = callback_data.replace("quality_", "")
+            return f"video_{format_id}"
         if callback_data == "download_video":
-            return "video"
+            return "download_video"
         return None
 
     @staticmethod
@@ -214,7 +216,7 @@ class DownloadFacade:
             await status_msg.edit_text(f"❌ Unsupported type: {download_type}")
             return
 
-        task_id = str(uuid.uuid4())[:8]
+        task_id = uuid.uuid4().hex[:16]
         task = DownloadTask(
             task_id=task_id,
             user_id=user_id,
@@ -222,18 +224,9 @@ class DownloadFacade:
             download_type=download_type,
         )
 
-        class _SilentQuery:
-            from_user = user
-            message = status_msg
-
-            async def edit_message_text(self, text, **kwargs):
-                try:
-                    await status_msg.edit_text(text, **kwargs)
-                except Exception:
-                    pass
-
+        query = SilentMessageQuery(user, status_msg)
         task_ctx = {
-            "query": _SilentQuery(),
+            "query": query,
             "processing_msg": status_msg,
             "context": context,
         }

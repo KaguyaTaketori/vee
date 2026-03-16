@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import asyncio
 import logging
@@ -17,6 +18,7 @@ async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
     tmp_dir = tempfile.mkdtemp(dir=TEMP_DIR, prefix=f"{BOT_FILE_PREFIX}spotify_")
 
     cmd = [
+        sys.executable, "-m",  
         "spotdl", url,
         "--output", tmp_dir,
         "--format", "mp3",

@@ -17,6 +17,7 @@ Examples:
 
 import sys
 import os
+import shlex
 import subprocess
 
 BROWSERS = {
@@ -102,9 +103,20 @@ def main():
         if len(sys.argv) < 3:
             print("Usage: python3 refresh_cookies.py custom <command>")
             sys.exit(1)
-        cmd = " ".join(sys.argv[2:])
-        print(f"Running custom command: {cmd}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd_str = " ".join(sys.argv[2:])
+        try:
+            cmd_list = shlex.split(cmd_str)
+        except ValueError as e:
+            print(f"Error: Invalid command syntax: {e}")
+            sys.exit(1)
+
+        result = subprocess.run(
+            cmd_list,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         if result.returncode == 0:
             print("Custom command succeeded!")
             success = True

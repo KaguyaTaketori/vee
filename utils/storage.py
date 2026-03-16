@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import fcntl
 import threading
 import asyncio
 from filelock import FileLock
@@ -78,9 +77,8 @@ class JsonStore:
             self._cache["data"] = data
             self._cache["dirty"] = True
             self._cache["time"] = time.time()
+            if time.time() - self._last_persist >= self._persist_interval:
+                self._save_unsafe(data)
+                self._cache["dirty"] = False
+                self._last_persist = time.time()
     
-    def force_persist(self):
-        self.persist()
-    
-    async def force_persist_async(self):
-        await self.persist_async()

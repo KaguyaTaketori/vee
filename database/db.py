@@ -2,11 +2,10 @@ import os
 import logging
 import aiosqlite
 from contextlib import asynccontextmanager
+from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "bot_data.db")
 
 @asynccontextmanager
 async def get_db():

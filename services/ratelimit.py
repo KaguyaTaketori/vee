@@ -1,31 +1,29 @@
 import os
 import time
+import json
 import asyncio
 import logging
 import aiosqlite
 from dataclasses import dataclass
 from typing import Optional
-from config import RATE_TIER_LIMITS, ADMIN_IDS
+from config import RATE_TIER_LIMITS, ADMIN_IDS, BASE_DIR
 from database.db import get_db
 
 logger = logging.getLogger(__name__)
 
+_RATE_LIMIT_CONFIG_FILE = os.path.join(BASE_DIR, "rate_limit_config.json")
+RATE_UNLIMITED = -1
 
 def load_rate_limit() -> dict:
-    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rate_limit_config.json")
-    if os.path.exists(config_path):
-        import json
-        with open(config_path, "r") as f:
+    if os.path.exists(_RATE_LIMIT_CONFIG_FILE):
+        with open(_RATE_LIMIT_CONFIG_FILE, "r") as f:
             return json.load(f)
     return {"max_downloads_per_hour": 10, "enabled": True}
 
 
 def save_rate_limit(max_downloads: int, enabled: bool):
-    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rate_limit_config.json")
-    import json
-    with open(config_path, "w") as f:
+    with open(_RATE_LIMIT_CONFIG_FILE, "w") as f:
         json.dump({"max_downloads_per_hour": max_downloads, "enabled": enabled}, f)
-
 
 async def get_user_tier(user_id: int) -> str:
     """查询用户等级，默认 normal。"""
@@ -39,7 +37,7 @@ async def get_user_tier(user_id: int) -> str:
 
 async def get_user_limit(user_id: int) -> int:
     if ADMIN_IDS and user_id in ADMIN_IDS:
-        return 999999
+        return RATE_UNLIMITED
 
     async with get_db() as db:
         async with db.execute(
@@ -58,7 +56,6 @@ async def get_user_limit(user_id: int) -> int:
 
 
 async def set_user_tier(user_id: int, tier: str, note: str = "", set_by: int = None, custom_max: int = None):
-    import time
     async with get_db() as db:
         await db.execute(
             """
@@ -93,7 +90,7 @@ class RateLimiter:
 
         user_max = await get_user_limit(user_id)
 
-        if user_max == 999999:
+        if user_max == RATE_UNLIMITED:
             return True, None
         if user_max == 0:
             return False, "Your account has been suspended."
@@ -102,7 +99,7 @@ class RateLimiter:
         window = 3600
 
         async with get_db() as db:
-            await db.execute("BEGIN IMMEDIATE")   # 独占锁，消除竞态
+            await db.execute("BEGIN IMMEDIATE")
             try:
                 await db.execute(
                     "DELETE FROM rate_limit WHERE timestamp < ?", (now - window,)
@@ -116,8 +113,13 @@ class RateLimiter:
 
                 if count >= user_max:
                     await db.execute("ROLLBACK")
-                    remaining_secs = int(window - (now - (now - window)))
-                    return False, f"Rate limit exceeded ({count}/{user_max} per hour)."
+                    async with db.execute(
+                        "SELECT MIN(timestamp) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
+                        (user_id, now - window)
+                    ) as cur:
+                        oldest = (await cur.fetchone())[0] or now
+                    remaining_secs = int(oldest + window - now)
+                    return False, f"Rate limit exceeded. Try again in {remaining_secs}s."
 
                 await db.execute(
                     "INSERT INTO rate_limit (user_id, timestamp) VALUES (?, ?)",
@@ -128,22 +130,6 @@ class RateLimiter:
             except Exception:
                 await db.execute("ROLLBACK")
                 raise
-
-    async def get_remaining(self, user_id: int) -> int:
-        if not self.enabled:
-            return 999
-        now = time.time()
-        window = 3600
-        
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
-                (user_id, now - window)
-            ) as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
-        
-        return max(0, self.max_downloads_per_hour - count)
 
     async def reset(self, user_id: int):
         async with get_db() as db:
@@ -159,7 +145,7 @@ class RateLimiter:
 
     async def get_remaining(self, user_id: int) -> int:
         user_max = await get_user_limit(user_id)
-        if user_max >= 999999:
+        if user_max == RATE_UNLIMITED:
             return 999
         if user_max == 0:
             return 0

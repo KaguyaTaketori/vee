@@ -1,10 +1,12 @@
 import os
 import json
-import sqlite3
+import logging
 from typing import Optional
-
+from cachetools import LRUCache
 from database.db import DB_PATH
+from database.users import fetch_user_lang_from_db
 
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCALES_DIR = os.path.join(BASE_DIR, "locales")
@@ -40,26 +42,30 @@ def _load_translations(lang: str) -> dict:
     
     return {}
 
-_lang_cache: dict[int, str] = {}
+
+_lang_cache: LRUCache[int, str] = LRUCache(maxsize=10_000) 
+
 
 def get_user_lang(user_id: int) -> str:
     return _lang_cache.get(user_id, DEFAULT_LANG)
 
+
+async def get_user_lang_async(user_id: int) -> str:
+    if user_id in _lang_cache:
+        return _lang_cache[user_id]
+    return await warm_user_lang(user_id)
+
+
 async def warm_user_lang(user_id: int) -> str:
-    from database.db import get_db
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT lang FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            lang = row[0] if row and row[0] else DEFAULT_LANG
+    lang = await fetch_user_lang_from_db(user_id)
     _lang_cache[user_id] = lang
     return lang
 
+
 async def set_user_lang(user_id: int, lang: str):
     _lang_cache[user_id] = lang
-    from core import users
-    await users.set_user_lang(user_id, lang)
+    from database.users import set_user_lang
+    await set_user_lang(user_id, lang)
 
 
 def _get_nested(translations: dict, key: str) -> Optional[str]:
@@ -116,7 +122,10 @@ def detect_system_lang(lang_code: str) -> str:
 
 def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -> str:
     if not lang:
-        lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
+        if user_id:
+            lang = get_user_lang(user_id)
+        else:
+            lang = DEFAULT_LANG
 
     if user_id:
         kwargs.setdefault('user_id', user_id)
@@ -125,33 +134,66 @@ def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -
     text = _get_nested(translations, key)
 
     if not text:
-        text = _get_nested(_load_translations(DEFAULT_LANG), key) or key
+        text = _get_nested(_load_translations(DEFAULT_LANG), key)
+        if text and lang != DEFAULT_LANG:
+            logger.info(f"Missing translation for '{key}' in {lang}, falling back to {DEFAULT_LANG}")
+
+    if not text:
+        logger.warning(f"Missing translation key: '{key}'")
+        return key
 
     try:
         return text.format(**kwargs)
     except KeyError as e:
-        logger.warning(f"Missing i18n placeholder {e} for key '{key}'")
+        logger.warning(f"Missing i18n placeholder {e} for key '{key}' in lang '{lang}' (got kwargs: {list(kwargs.keys())})")
         return text
 
-def tp(key: str, count: int, user_id: Optional[int] = None, **kwargs) -> str:
-    if user_id:
-        lang = get_user_lang(user_id)
-    else:
-        lang = DEFAULT_LANG
+    
+def tp(key: str, count: int, user_id: Optional[int] = None, lang: Optional[str] = None, **kwargs) -> str:
+    if not lang:
+        lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
     
     translations = _load_translations(lang)
     
     plural_text = _get_plural(translations, key, count)
     
-    if plural_text and "{count}" in plural_text:
-        return plural_text.replace("{count}", str(count))
-    elif plural_text:
+    if plural_text:
+        if "{count}" in plural_text:
+            return plural_text.replace("{count}", str(count))
         return plural_text
     
-    fallback = _get_plural(_load_translations(DEFAULT_LANG), key, count)
-    if fallback and "{count}" in fallback:
-        return fallback.replace("{count}", str(count))
-    elif fallback:
-        return fallback
+    if lang != DEFAULT_LANG:
+        fallback = _get_plural(_load_translations(DEFAULT_LANG), key, count)
+        if fallback:
+            if "{count}" in fallback:
+                return fallback.replace("{count}", str(count))
+            return fallback
     
     return str(count)
+
+
+def get_command_description(command: str, scope: str, lang: str) -> str:
+    translations = _load_translations(lang)
+
+    desc = (
+        translations
+        .get("commands", {})
+        .get(scope, {})
+        .get(command)
+    )
+
+    if desc:
+        return desc
+
+    if lang != DEFAULT_LANG:
+        fallback = _load_translations(DEFAULT_LANG)
+        desc = (
+            fallback
+            .get("commands", {})
+            .get(scope, {})
+            .get(command)
+        )
+        if desc:
+            return desc
+
+    return command

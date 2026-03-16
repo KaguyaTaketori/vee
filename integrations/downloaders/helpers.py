@@ -27,30 +27,43 @@ def _should_refresh_cookies() -> bool:
     return time.time() - _cookie_last_refresh >= (COOKIE_REFRESH_INTERVAL_HOURS * 3600)
 
 
-def refresh_cookies() -> bool:
-    global _cookie_last_refresh
+def _get_refresh_cmd() -> list[str] | None:
     if not _should_refresh_cookies():
-        return False
-
+        return None
     try:
-        logger.info("Refreshing cookies...")
-        cmd = shlex.split(COOKIE_REFRESH_CMD)
-        result = subprocess.run(
-            cmd,
-            shell=False,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=120
-        )
+        return shlex.split(COOKIE_REFRESH_CMD)
+    except ValueError as e:
+        logger.error(f"Invalid COOKIE_REFRESH_CMD syntax: {e}")
+        return None
+
+
+def _handle_refresh_result(success: bool, returncode: int = 0, stderr: str = "") -> bool:
+    global _cookie_last_refresh
+    if success:
         _cookie_last_refresh = time.time()
         logger.info("Cookies refreshed successfully")
         return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Cookie refresh failed (exit {e.returncode}): {e.stderr[:200]}")
+    logger.error(f"Cookie refresh failed (exit {returncode}): {stderr[:200]}")
+    return False
+
+
+def refresh_cookies() -> bool:
+    cmd = _get_refresh_cmd()
+    if cmd is None:
         return False
+    try:
+        result = subprocess.run(
+            cmd, shell=False, capture_output=True,
+            text=True, check=True, timeout=120
+        )
+        return _handle_refresh_result(True)
+    except subprocess.CalledProcessError as e:
+        return _handle_refresh_result(False, e.returncode, e.stderr)
     except subprocess.TimeoutExpired:
         logger.error("Cookie refresh timed out after 120s")
+        return False
+    except FileNotFoundError:
+        logger.error(f"Cookie refresh command not found: {cmd[0]}")
         return False
     except Exception as e:
         logger.error(f"Cookie refresh unexpected error: {e}")
@@ -58,25 +71,17 @@ def refresh_cookies() -> bool:
 
 
 async def refresh_cookies_async() -> bool:
-    global _cookie_last_refresh
-    if not _should_refresh_cookies():
+    cmd = _get_refresh_cmd()
+    if cmd is None:
         return False
-
     try:
-        logger.info("Refreshing cookies (async)...")
-        cmd = shlex.split(COOKIE_REFRESH_CMD)
-
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
-
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=120
-            )
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
         except asyncio.TimeoutError:
             process.kill()
             await process.communicate()
@@ -84,16 +89,11 @@ async def refresh_cookies_async() -> bool:
             return False
 
         if process.returncode != 0:
-            logger.error(f"Cookie refresh failed (exit {process.returncode}): "
-                         f"{stderr.decode()[:200]}")
-            return False
-
-        _cookie_last_refresh = time.time()
-        logger.info("Cookies refreshed successfully (async)")
-        return True
+            return _handle_refresh_result(False, process.returncode, stderr.decode())
+        return _handle_refresh_result(True)
 
     except FileNotFoundError:
-        logger.error(f"Cookie refresh command not found: {shlex.split(COOKIE_REFRESH_CMD)[0]}")
+        logger.error(f"Cookie refresh command not found: {cmd[0]}")
         return False
     except Exception as e:
         logger.error(f"Cookie refresh (async) unexpected error: {e}")

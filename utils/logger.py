@@ -54,7 +54,9 @@ def log_user(user, action, extra=None):
 
 
 def log_download(user, action, url, status, file_size=None, format_id=None):
-    extra = f"url={url[:50]}... | status={status}"
+    _MAX_URL_LEN = 50
+    url_display = url[:_MAX_URL_LEN] + ("..." if len(url) > _MAX_URL_LEN else "")
+    extra = f"url={url_display} | status={status}"
     if file_size:
         mb = file_size / (1024 * 1024)
         extra += f" | size={mb:.1f}MB"

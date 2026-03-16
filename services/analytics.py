@@ -1,6 +1,6 @@
 import time
 from database.db import get_db
-
+from utils.utils import format_bytes
 async def get_daily_stats(days: int = 1) -> dict:
     since = time.time() - days * 86400
 
@@ -58,8 +58,6 @@ async def get_daily_stats(days: int = 1) -> dict:
 
 
 def format_daily_report(stats: dict, period: str = "今日") -> str:
-    from utils.utils import format_bytes
-
     success_rate = (
         f"{stats['success'] / stats['total'] * 100:.1f}%"
         if stats["total"] > 0 else "N/A"
