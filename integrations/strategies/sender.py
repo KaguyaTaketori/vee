@@ -115,7 +115,9 @@ class TelegramSender:
         file: str | BinaryIO,
         caption: str | None = None,
     ) -> str | None:
+        logger.info("send_video: file=%s, caption=%s", file, caption)
         sent = await self._query.message.reply_video(video=file, caption=caption)
+        logger.info("send_video: sent=%s, file_id=%s", sent, sent.video.file_id if sent and sent.video else None)
         return sent.video.file_id if sent and sent.video else None
 
     async def send_audio(
@@ -123,7 +125,9 @@ class TelegramSender:
         file: str | BinaryIO,
         title: str | None = None,
     ) -> str | None:
+        logger.info("send_audio: file=%s, title=%s", file, title)
         sent = await self._query.message.reply_audio(audio=file, title=title)
+        logger.info("send_audio: sent=%s, file_id=%s", sent, sent.audio.file_id if sent and sent.audio else None)
         return sent.audio.file_id if sent and sent.audio else None
 
     async def send_document(
@@ -131,7 +135,9 @@ class TelegramSender:
         file: str | BinaryIO,
         caption: str | None = None,
     ) -> str | None:
+        logger.info("send_document: file=%s, caption=%s", file, caption)
         sent = await self._query.message.reply_document(document=file, caption=caption)
+        logger.info("send_document: sent=%s, file_id=%s", sent, sent.document.file_id if sent and sent.document else None)
         return sent.document.file_id if sent and sent.document else None
 
     async def send_photo(
@@ -139,7 +145,9 @@ class TelegramSender:
         source: str,
         caption: str | None = None,
     ) -> str | None:
+        logger.info("send_photo: source=%s, caption=%s", source, caption)
         sent = await self._query.message.reply_photo(photo=source, caption=caption)
+        logger.info("send_photo: sent=%s, file_id=%s", sent, sent.photo[-1].file_id if sent and sent.photo else None)
         return sent.photo[-1].file_id if sent and sent.photo else None
 
     # ----------------------------------------------------------------- logging

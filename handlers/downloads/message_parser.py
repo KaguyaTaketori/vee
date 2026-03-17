@@ -270,7 +270,8 @@ async def _show_quality_options(query, url: str) -> None:
     resolutions: dict[int, tuple] = {}
     for f in formats:
         height   = f.get("height")
-        filesize = f.get("filesize") or f.get("filesize_approx", 0)
+        filesize_val = f.get("filesize") or f.get("filesize_approx", 0)
+        filesize = int(filesize_val) if isinstance(filesize_val, (int, float)) else 0
         acodec   = f.get("acodec", "none")
         has_audio = acodec and acodec != "none"
         if height and height in [2160, 1440, 1080, 720, 480, 360, 240]:

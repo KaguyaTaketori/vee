@@ -35,6 +35,8 @@ class HistoryRepository(BaseRepository):
         file_path: Optional[str] = None,
         file_id: Optional[str] = None,
     ) -> None:
+        logger.info("history_repo.add: user_id=%s, url=%s, download_type=%s, file_size=%s (type=%s), title=%s",
+            user_id, url, download_type, file_size, type(file_size), title)
         now = time.time()
         async with self._db() as db:
             await db.execute(
@@ -64,6 +66,10 @@ class HistoryRepository(BaseRepository):
             # Trim global rows
             async with db.execute("SELECT COUNT(*) FROM history") as cur:
                 total = (await cur.fetchone())[0]
+            try:
+                total = int(total) if total else 0
+            except (TypeError, ValueError):
+                total = 0
             if total > _MAX_TOTAL_ENTRIES:
                 await db.execute(
                     """

@@ -37,9 +37,6 @@ class TaskStrategy(ABC):
         """Unique string key for this strategy (e.g. "audio", "video_1080")."""
         ...
 
-    # ── backward-compat shim ────────────────────────────────────────────────
-    # 保留 download_type 作为只读别名，方便渐进迁移期间已有代码不报错。
-    # 所有新代码请使用 task_type。
     @property
     def download_type(self) -> str:
         return self.task_type
@@ -73,7 +70,6 @@ class TaskStrategy(ABC):
         """Return False (and clean up) if the file exceeds MAX_FILE_SIZE."""
         if not filename or not os.path.isfile(filename):
             return True
-        file_size = os.path.getsize(filename)
         file_size = int(os.path.getsize(filename))
         max_size = int(MAX_FILE_SIZE)
         if file_size > max_size:
@@ -131,8 +127,9 @@ class TaskStrategy(ABC):
         url: str,
         filename: str,
         caption: str | None,
+        title: str | None = None,
     ) -> str | None:
-        file_id = await get_file_id_by_url(url, self.task_type)
+        file_id = await get_file_id_by_url(url, download_type=self.task_type)
         if file_id:
             await self._send_from_file_id(sender, file_id, caption)
             return file_id
@@ -145,7 +142,8 @@ class TaskStrategy(ABC):
             await add_history(
                 sender.user_id, url, self.task_type,
                 file_size,
-                caption, "success", filename, new_id,
+                title, 
+                "success", filename, new_id,
             )
         return new_id
 
@@ -153,6 +151,8 @@ class TaskStrategy(ABC):
         """Main entry point called by the task runner."""
         user_id = sender.user_id
         await sender.edit_status(t("processing", user_id))
+
+        logger.info("execute: url=%s, task_type=%s", url, self.task_type)
 
         cached_file = await self._check_cached_file(url, user_id)
         loop = asyncio.get_event_loop()
@@ -164,15 +164,19 @@ class TaskStrategy(ABC):
             progress_hook = None
 
         if cached_file:
+            logger.info("execute: using cached file=%s", cached_file)
             filename, info = cached_file, {}
         else:
+            logger.info("execute: starting _do_execute for url=%s", url)
             try:
                 filename, info = await self._do_execute(url, progress_hook)
+                logger.info("execute: _do_execute completed, filename=%s, info keys=%s", filename, list(info.keys()) if info else [])
             except Exception as exc:
-                logger.error("Task execution failed (%s): %s", self.task_type, exc)
+                logger.error("execute: _do_execute failed: %s", exc, exc_info=True)
                 await sender.edit_status(t("download_failed", user_id, error=str(exc)))
                 raise
 
+        logger.info("execute: validating file size for %s", filename)
         if not await self._validate_file_size(filename, sender):
             return
 
@@ -181,9 +185,11 @@ class TaskStrategy(ABC):
 
         await sender.edit_status(t("uploading", user_id))
         try:
-            await self._get_file_id_or_upload(sender, url, filename, caption)
+            logger.info("execute: calling _get_file_id_or_upload for url=%s", url)
+            await self._get_file_id_or_upload(sender, url, filename, caption, title)
+            logger.info("execute: _get_file_id_or_upload completed")
         except Exception as exc:
-            logger.error("Upload failed: %s", exc)
+            logger.error("Upload failed: %s", exc, exc_info=True)
             await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
             exc._status_already_edited = True
             raise
