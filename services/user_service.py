@@ -4,7 +4,7 @@ import asyncio
 
 from utils.cache import TTLCache
 from database.users import (
-    update_user as _update_user,
+    upsert_user as _update_user,
     get_all_users as _get_all_users,
     get_user_info as _get_user_info,
     fetch_user_lang_from_db,

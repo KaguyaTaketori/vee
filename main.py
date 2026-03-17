@@ -11,8 +11,10 @@ from config import (
     CLEANUP_INTERVAL_HOURS, DISK_CHECK_INTERVAL_MINUTES,
     init_config,
 )
+from services.task_manager import TaskManager, IO_CHANNEL
+from services.event_bus import bus
+from repositories import TaskRepository
 from services.container import services
-from services.queue import DownloadQueue
 from services.ratelimit import RateLimiter
 from services.user_service import cleanup_temp_files
 from services.facades import _execute_download_task
@@ -132,21 +134,49 @@ def main():
         init_config()
         await init_db()
         await mark_stale_tasks_failed()
-
-        # ── 2. Instantiate core services exactly once, store in container ─
-        #       Every module that needs these accesses services.queue /
-        #       services.limiter via `from services.container import services`.
-        services.queue   = DownloadQueue(max_concurrent=3)
-        services.limiter = RateLimiter()
-
-        # ── 3. Wire the download executor into the queue ──────────────────
-        services.queue.set_executor(_execute_download_task)
-        await services.queue.start()
-
-        # ── 4. Bot-level setup ────────────────────────────────────────────
+     
+        # ── 2. Instantiate EventBus (module-level singleton, re-exported) ─
+        from services.event_bus import bus as _bus
+        services.bus = _bus
+     
+        # ── 3. Instantiate TaskManager (replaces single DownloadQueue) ────
+        services.task_manager = TaskManager(
+            io_workers=3,   # bandwidth slots (same as before)
+            cpu_workers=2,  # CPU-heavy tasks
+            api_workers=5,  # fast API tasks
+        )
+     
+        # ── 4. Wire executors per channel ────────────────────────────────
+        #   io_queue  → existing download executor (no change to the function)
+        services.task_manager.set_executor(_execute_download_task, IO_CHANNEL)
+        #
+        #   cpu_queue / api_queue → wire up when those features are built:
+        #   services.task_manager.set_executor(execute_cpu_task,  CPU_CHANNEL)
+        #   services.task_manager.set_executor(execute_api_task,  API_CHANNEL)
+     
+        await services.task_manager.start()
+     
+        # ── 5. Register event listeners (the only place DB wiring lives) ──
+        task_repo = TaskRepository()
+     
+        #   "task_started"    → persist the in-progress record
+        services.bus.on("task_started",    task_repo.save)
+     
+        #   "task_retrying"   → update retry_count in DB
+        services.bus.on("task_retrying",   task_repo.save)
+     
+        #   "task_completed"  → persist the terminal state (replaces the
+        #                        old persist_task() call inside _finalize_task)
+        services.bus.on("task_completed",  task_repo.save)
+     
+        #   Future listeners – add here, zero changes elsewhere:
+        #   services.bus.on("task_completed", send_completion_notification)
+        #   services.bus.on("task_completed", analytics_tracker.record)
+     
+        # ── 6. Bot-level setup ────────────────────────────────────────────
         await set_bot_commands(app)
-
-        # ── 5. Health-check HTTP server ───────────────────────────────────
+     
+        # ── 7. Health-check HTTP server ───────────────────────────────────
         runner = web.AppRunner(create_health_app())
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", 8080)

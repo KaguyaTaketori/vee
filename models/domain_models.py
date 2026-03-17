@@ -43,6 +43,7 @@ class DownloadTask:
     max_retries: int = 2
     retry_count: int = 0
     retry_delay: float = 5.0
+    channel: str = "io"
 
 
 class TaskContext(TypedDict):
