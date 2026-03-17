@@ -242,7 +242,7 @@ async def admin_cancel_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
 
     if not context.args:
-        active = list(services.queue.active_tasks.values())
+        active = list(services.task_manager.get_all_active_tasks())
         queued_size = services.queue.get_total_queued()
 
         if not active and queued_size == 0:

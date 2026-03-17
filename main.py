@@ -145,6 +145,8 @@ def main():
             cpu_workers=2,  # CPU-heavy tasks
             api_workers=5,  # fast API tasks
         )
+
+        services.limiter = RateLimiter()
      
         # ── 4. Wire executors per channel ────────────────────────────────
         #   io_queue  → existing download executor (no change to the function)

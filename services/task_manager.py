@@ -181,6 +181,14 @@ class TaskManager:
                 return await queue.cancel_task(task_id)
         return False
 
+    def get_cancel_event(self, task_id: str) -> Optional[asyncio.Event]:
+        """Return the cancel Event for *task_id*, searching all channels."""
+        for queue in self._channels.values():
+            event = queue.get_cancel_event(task_id)
+            if event is not None:
+                return event
+        return None
+
     # ------------------------------------------------------------------
     # Channel introspection (for /queue admin command)
     # ------------------------------------------------------------------
