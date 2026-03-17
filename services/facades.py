@@ -13,6 +13,7 @@ from models.domain_models import DownloadStatus, DownloadTask
 from services.container import services
 from utils.i18n import t
 from utils.logger import log_user
+from utils.telegram_helpers import user_log_args
 from integrations.downloaders.ytdlp_client import is_spotify_url
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ class DownloadFacade:
 
         log_user_obj = getattr(sender, "_query", None)
         if log_user_obj:
-            log_user(log_user_obj.from_user, f"download_request:{callback_data}")
+            log_user(**user_log_args(log_user_obj), action=f"download_request:{callback_data}")
 
         strategy_key = DownloadFacade._map_callback_to_strategy(callback_data, url)
         if not strategy_key:
@@ -183,6 +184,8 @@ class DownloadFacade:
         task_ctx = {"sender": sender, "context": context}
         await services.queue.add_task(task, task_ctx)
         log_user(
-            type("_U", (), {"id": user_id, "username": "batch"})(),
-            f"batch_enqueue:{download_type}",
+            user_id=sender.user_id,
+            username="batch",
+            name="batch",
+            action=f"batch_enqueue:{download_type}",
         )

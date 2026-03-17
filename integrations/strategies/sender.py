@@ -85,20 +85,46 @@ class BotSender(Protocol):
 # ---------------------------------------------------------------------------
 # Telegram implementation
 # ---------------------------------------------------------------------------
-
 class TelegramSender:
-    """BotSender backed by python-telegram-bot objects.
 
-    Wraps the *query* (CallbackQuery or SilentMessageQuery) and the
-    *processing_msg* (the editable status message) that were created by the
-    handler layer.  Strategies receive this object; they never import anything
-    from python-telegram-bot directly.
-    """
-
-    def __init__(self, query, processing_msg) -> None:
-        self._query = query
+    def __init__(
+        self,
+        user: User,
+        reply_target: Message,
+        processing_msg: Message,
+    ) -> None:
+        self._user = user
+        self._reply_target = reply_target
         self._processing_msg = processing_msg
-        self.user_id: int = query.from_user.id
+        self.user_id: int = user.id
+
+    # ------------------------------------------------------------------ 工厂方法
+
+    @classmethod
+    def from_callback(
+        cls,
+        query: CallbackQuery,
+        processing_msg: Message,
+    ) -> "TelegramSender":
+        """从按钮回调构造。reply_target 是 query.message。"""
+        return cls(
+            user=query.from_user,
+            reply_target=query.message,
+            processing_msg=processing_msg,
+        )
+
+    @classmethod
+    def from_message(
+        cls,
+        message: Message,
+        processing_msg: Message,
+    ) -> "TelegramSender":
+        """从文本消息构造（包括批量模式）。reply_target 就是 message 本身。"""
+        return cls(
+            user=message.from_user,
+            reply_target=message,
+            processing_msg=processing_msg,
+        )
 
     # ------------------------------------------------------------------ status
 
@@ -106,7 +132,7 @@ class TelegramSender:
         await self._processing_msg.edit_text(text)
 
     async def send_message(self, text: str) -> None:
-        await self._query.message.reply_text(text)
+        await self._reply_target.reply_text(text)
 
     # ------------------------------------------------------------------- media
 
@@ -116,8 +142,11 @@ class TelegramSender:
         caption: str | None = None,
     ) -> str | None:
         logger.info("send_video: file=%s, caption=%s", file, caption)
-        sent = await self._query.message.reply_video(video=file, caption=caption)
-        logger.info("send_video: sent=%s, file_id=%s", sent, sent.video.file_id if sent and sent.video else None)
+        sent = await self._reply_target.reply_video(video=file, caption=caption)
+        logger.info(
+            "send_video: file_id=%s",
+            sent.video.file_id if sent and sent.video else None,
+        )
         return sent.video.file_id if sent and sent.video else None
 
     async def send_audio(
@@ -126,8 +155,11 @@ class TelegramSender:
         title: str | None = None,
     ) -> str | None:
         logger.info("send_audio: file=%s, title=%s", file, title)
-        sent = await self._query.message.reply_audio(audio=file, title=title)
-        logger.info("send_audio: sent=%s, file_id=%s", sent, sent.audio.file_id if sent and sent.audio else None)
+        sent = await self._reply_target.reply_audio(audio=file, title=title)
+        logger.info(
+            "send_audio: file_id=%s",
+            sent.audio.file_id if sent and sent.audio else None,
+        )
         return sent.audio.file_id if sent and sent.audio else None
 
     async def send_document(
@@ -136,8 +168,11 @@ class TelegramSender:
         caption: str | None = None,
     ) -> str | None:
         logger.info("send_document: file=%s, caption=%s", file, caption)
-        sent = await self._query.message.reply_document(document=file, caption=caption)
-        logger.info("send_document: sent=%s, file_id=%s", sent, sent.document.file_id if sent and sent.document else None)
+        sent = await self._reply_target.reply_document(document=file, caption=caption)
+        logger.info(
+            "send_document: file_id=%s",
+            sent.document.file_id if sent and sent.document else None,
+        )
         return sent.document.file_id if sent and sent.document else None
 
     async def send_photo(
@@ -146,8 +181,11 @@ class TelegramSender:
         caption: str | None = None,
     ) -> str | None:
         logger.info("send_photo: source=%s, caption=%s", source, caption)
-        sent = await self._query.message.reply_photo(photo=source, caption=caption)
-        logger.info("send_photo: sent=%s, file_id=%s", sent, sent.photo[-1].file_id if sent and sent.photo else None)
+        sent = await self._reply_target.reply_photo(photo=source, caption=caption)
+        logger.info(
+            "send_photo: file_id=%s",
+            sent.photo[-1].file_id if sent and sent.photo else None,
+        )
         return sent.photo[-1].file_id if sent and sent.photo else None
 
     # ----------------------------------------------------------------- logging
@@ -160,4 +198,12 @@ class TelegramSender:
         file_size: int | None = None,
     ) -> None:
         from utils.logger import log_download as _log
-        _log(self._query.from_user, action, url, status, file_size)
+        _log(
+            user_id=self._user.id,
+            username=self._user.username or "N/A",
+            name=f"{self._user.first_name} {self._user.last_name or ''}".strip(),
+            action=action,
+            url=url,
+            status=status,
+            file_size=file_size,
+        )

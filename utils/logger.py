@@ -40,21 +40,28 @@ def setup_logging():
     audit_logger.addHandler(audit_handler)
 
 
-def log_user(user, action, extra=None):
-    if not user:
-        return
-
-    user_id  = user.id
-    username = user.username or "N/A"
-    name     = f"{user.first_name} {user.last_name or ''}".strip()
-
+def log_user(
+    user_id: int,
+    username: str,
+    name: str,
+    action: str,
+    extra: str | None = None,
+) -> None:
     extra_info = f" | {extra}" if extra else ""
     entry = f"{datetime.now()} | ID: {user_id} | @{username} | {name} | {action}{extra_info}"
-
     logging.getLogger("audit").info(entry)
 
 
-def log_download(user, action, url, status, file_size=None, format_id=None):
+def log_download(
+    user_id: int,
+    username: str,
+    name: str,
+    action: str,
+    url: str,
+    status: str,
+    file_size: int | None = None,
+    format_id: str | None = None,
+) -> None:
     _MAX_URL_LEN = 50
     url_display = url[:_MAX_URL_LEN] + ("..." if len(url) > _MAX_URL_LEN else "")
     extra = f"url={url_display} | status={status}"
@@ -63,4 +70,6 @@ def log_download(user, action, url, status, file_size=None, format_id=None):
         extra += f" | size={mb:.1f}MB"
     if format_id:
         extra += f" | format={format_id}"
-    log_user(user, action, extra)
+    log_user(user_id, username, name, action, extra)
+
+

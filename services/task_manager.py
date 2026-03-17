@@ -147,6 +147,13 @@ class TaskManager:
             tasks.extend(queue.get_user_tasks(user_id))
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
 
+    def get_all_active_tasks(self) -> list[DownloadTask]:
+        """Return all currently active tasks across all channels."""
+        tasks: list[DownloadTask] = []
+        for queue in self._channels.values():
+            tasks.extend(queue.get_all_active_tasks())
+        return sorted(tasks, key=lambda t: t.created_at, reverse=True)
+
     def get_queue_position(self, user_id: int) -> int:
         """Sum of pending positions across all channels for a user."""
         return sum(

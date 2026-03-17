@@ -151,11 +151,7 @@ class DownloadQueue:
 
     def get_all_active_tasks(self) -> list[DownloadTask]:
         """Return all currently active tasks across all channels."""
-        tasks = []
-        for queue in self._channels.values():
-            tasks.extend(queue.active_tasks.values())
-        return sorted(tasks, key=lambda t: t.created_at)
-
+        return list(self.active_tasks.values())
 
     # ------------------------------------------------------------------
     # Cancellation

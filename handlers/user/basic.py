@@ -6,6 +6,7 @@ from config import ADMIN_IDS
 from core.handler_registry import command_handler
 from services.user_service import track_user, set_user_language
 from utils.logger import log_user
+from utils.telegram_helpers import user_log_args
 from utils.i18n import t, LANGUAGES
 from utils.utils import require_message
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 @require_message
 async def start_command(update: Update, context: CallbackContext):
     track_user(update.message.from_user)
-    log_user(update.message.from_user, "start")
+    log_user(**user_log_args(update.message.from_user), action="start")
     await update.message.reply_text(t("welcome", update.message.from_user.id))
 
 

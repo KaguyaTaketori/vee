@@ -85,23 +85,13 @@ async def _cb_download_video(query, context):
 
 @register(lambda d: d.startswith("quality_") or d in ("download_audio", "download_thumbnail", "download_subtitle"))
 async def _cb_download(query, context: CallbackContext) -> None:
-    """处理 quality_* / download_audio / download_thumbnail / download_subtitle。
-
-    步骤：
-        1. 取出 session URL
-        2. Pipeline 过滤（Auth + RateLimit）
-        3. 将 query / processing_msg 包装为 TelegramSender（唯一 Telegram 接触点）
-        4. 调用 DownloadFacade.process_download_request(sender, ...)
-    """
     user_id = query.from_user.id
 
-    # ── 1. Session ──────────────────────────────────────────────────────────
     url = UserSession.get_pending_url(context, user_id)
     if not url:
         await query.edit_message_text(t("session_expired", user_id))
         return
 
-    # ── 2. Pipeline 过滤 ────────────────────────────────────────────────────
     async def _reply(text: str) -> None:
         try:
             await query.edit_message_text(text)
@@ -114,15 +104,13 @@ async def _cb_download(query, context: CallbackContext) -> None:
         await _reply(t(result.error_key, user_id))
         return
 
-    # ── 3. 包装 processing_msg，构建 TelegramSender ─────────────────────────
     try:
         processing_msg = await query.edit_message_text(t("processing", user_id))
     except Exception:
         processing_msg = query.message
 
-    sender = TelegramSender(query=query, processing_msg=processing_msg)
+    sender = TelegramSender.from_callback(query, processing_msg)
 
-    # ── 4. 委派给 Facade（Facade 不知道任何 Telegram 细节）─────────────────
     success, error_key = await DownloadFacade.process_download_request(
         sender=sender,
         url=url,
