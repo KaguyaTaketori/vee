@@ -1,76 +1,36 @@
-import time
-from database.db import get_db
+# services/analytics.py
+"""
+Analytics service
+-----------------
+Formatting and business logic only.  All SQL now lives in
+repositories.AnalyticsRepository – this module never imports get_db.
+"""
+
+from repositories import AnalyticsRepository
 from utils.utils import format_bytes
+
+_repo = AnalyticsRepository()
 
 
 async def get_daily_stats(days: int = 1) -> dict:
-    since = time.time() - days * 86400
-
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM history WHERE timestamp > ?", (since,)
-        ) as cur:
-            total = (await cur.fetchone())[0]
-
-        async with db.execute(
-            "SELECT status, COUNT(*) FROM history WHERE timestamp > ? GROUP BY status",
-            (since,),
-        ) as cur:
-            status_counts = {row[0]: row[1] for row in await cur.fetchall()}
-
-        async with db.execute(
-            "SELECT COUNT(DISTINCT user_id) FROM history WHERE timestamp > ?", (since,)
-        ) as cur:
-            active_users = (await cur.fetchone())[0]
-
-        async with db.execute(
-            "SELECT download_type, COUNT(*) FROM history WHERE timestamp > ? GROUP BY download_type",
-            (since,),
-        ) as cur:
-            type_dist = {row[0]: row[1] for row in await cur.fetchall()}
-
-        async with db.execute(
-            """
-            SELECT u.username, u.first_name, h.user_id, COUNT(*) as cnt
-            FROM history h
-            LEFT JOIN users u ON h.user_id = u.user_id
-            WHERE h.timestamp > ?
-            GROUP BY h.user_id
-            ORDER BY cnt DESC LIMIT 5
-            """,
-            (since,),
-        ) as cur:
-            top_users = await cur.fetchall()
-
-        async with db.execute(
-            "SELECT SUM(file_size) FROM history WHERE timestamp > ? AND status = 'success'",
-            (since,),
-        ) as cur:
-            total_bytes = (await cur.fetchone())[0] or 0
-
-    return {
-        "total": total,
-        "success": status_counts.get("success", 0),
-        "failed": status_counts.get("failed", 0),
-        "active_users": active_users,
-        "type_dist": type_dist,
-        "top_users": top_users,
-        "total_bytes": total_bytes,
-    }
+    """Return aggregated download statistics for the last *days* day(s)."""
+    return await _repo.get_daily_stats(days=days)
 
 
 def format_daily_report(stats: dict, period: str = "今日") -> str:
     success_rate = (
         f"{stats['success'] / stats['total'] * 100:.1f}%"
-        if stats["total"] > 0 else "N/A"
+        if stats["total"] > 0
+        else "N/A"
     )
 
     type_lines = "\n".join(
-        f"  • {k}: {v} 次" for k, v in sorted(stats["type_dist"].items(), key=lambda x: -x[1])
+        f"  • {k}: {v} 次"
+        for k, v in sorted(stats["type_dist"].items(), key=lambda x: -x[1])
     )
 
     top_lines = "\n".join(
-        f"  {i+1}. {row[1] or row[0] or 'User'} ({row[2]}): {row[3]} 次"
+        f"  {i + 1}. {row[1] or row[0] or 'User'} ({row[2]}): {row[3]} 次"
         for i, row in enumerate(stats["top_users"])
     )
 
@@ -88,20 +48,14 @@ def format_daily_report(stats: dict, period: str = "今日") -> str:
 
 
 async def get_bot_stats() -> str:
-    """Return a high-level statistics summary for the /stats admin command.
-
-    Previously lived in utils/logger.py as get_user_stats(); moved here so
-    that analytics-related DB queries have a single home.
     """
-    from database.history import get_all_users_count, get_total_downloads, get_failed_downloads
-
-    total_users = await get_all_users_count()
-    total_dl    = await get_total_downloads()
-    failed      = await get_failed_downloads(limit=5)
-
+    High-level statistics summary for the /stats admin command.
+    Previously called get_user_stats() in utils/logger.py.
+    """
+    data = await _repo.get_summary_stats()
     return (
         f"📊 Bot Statistics\n"
-        f"Total registered users: {total_users}\n"
-        f"Total downloads: {total_dl}\n"
-        f"Recent failures: {len(failed)}\n"
+        f"Total registered users: {data['total_users']}\n"
+        f"Total downloads: {data['total_downloads']}\n"
+        f"Recent failures: {len(data['recent_failures'])}\n"
     )

@@ -1,18 +1,30 @@
+# services/ratelimit.py
+"""
+Rate-limit service
+------------------
+Business logic only.  All SQL now lives in:
+  - repositories.RateLimitRepository  (rate_limit table)
+  - repositories.UserRepository       (user_rate_tiers table)
+
+This module never imports get_db or writes SELECT / INSERT directly.
+"""
+
 import os
-import time
 import json
-import asyncio
 import logging
-import aiosqlite
-from dataclasses import dataclass
 from typing import Optional
+
 from config import RATE_TIER_LIMITS, ADMIN_IDS, BASE_DIR
-from database.db import get_db
+from repositories import RateLimitRepository, UserRepository
 
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_CONFIG_FILE = os.path.join(BASE_DIR, "rate_limit_config.json")
 RATE_UNLIMITED = -1
+
+# ---------------------------------------------------------------------------
+# Config file helpers (JSON, unchanged)
+# ---------------------------------------------------------------------------
 
 def load_rate_limit() -> dict:
     if os.path.exists(_RATE_LIMIT_CONFIG_FILE):
@@ -21,31 +33,29 @@ def load_rate_limit() -> dict:
     return {"max_downloads_per_hour": 10, "enabled": True}
 
 
-def save_rate_limit(max_downloads: int, enabled: bool):
+def save_rate_limit(max_downloads: int, enabled: bool) -> None:
     with open(_RATE_LIMIT_CONFIG_FILE, "w") as f:
         json.dump({"max_downloads_per_hour": max_downloads, "enabled": enabled}, f)
 
+
+# ---------------------------------------------------------------------------
+# Thin helpers – delegate DB work to repositories
+# ---------------------------------------------------------------------------
+
 async def get_user_tier(user_id: int) -> str:
-    """查询用户等级，默认 normal。"""
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT tier FROM user_rate_tiers WHERE user_id = ?", (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else "normal"
+    """Return the user's tier string (default: 'normal')."""
+    return await UserRepository().get_tier(user_id)
 
 
 async def get_user_limit(user_id: int) -> int:
+    """
+    Return the effective per-hour download cap for *user_id*.
+    RATE_UNLIMITED (-1) means no cap; 0 means suspended.
+    """
     if ADMIN_IDS and user_id in ADMIN_IDS:
         return RATE_UNLIMITED
 
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT tier, max_per_hour FROM user_rate_tiers WHERE user_id = ?",
-            (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-
+    row = await UserRepository().get_tier_and_limit(user_id)
     if row:
         tier, custom_max = row
         if custom_max is not None:
@@ -55,31 +65,31 @@ async def get_user_limit(user_id: int) -> int:
     return RATE_TIER_LIMITS["normal"]
 
 
-async def set_user_tier(user_id: int, tier: str, note: str = "", set_by: int = None, custom_max: int = None):
-    async with get_db() as db:
-        await db.execute(
-            """
-            INSERT INTO user_rate_tiers (user_id, tier, max_per_hour, note, set_by, set_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                tier         = excluded.tier,
-                max_per_hour = excluded.max_per_hour,
-                note         = excluded.note,
-                set_by       = excluded.set_by,
-                set_at       = excluded.set_at
-            """,
-            (user_id, tier, custom_max, note, set_by, time.time()),
-        )
-        await db.commit()
+async def set_user_tier(
+    user_id: int,
+    tier: str,
+    note: str = "",
+    set_by: Optional[int] = None,
+    custom_max: Optional[int] = None,
+) -> None:
+    await UserRepository().set_tier(
+        user_id, tier, note=note, set_by=set_by, custom_max=custom_max
+    )
 
+
+# ---------------------------------------------------------------------------
+# RateLimiter class
+# ---------------------------------------------------------------------------
 
 class RateLimiter:
-    def __init__(self):
+    def __init__(self) -> None:
+        self._rl_repo = RateLimitRepository()
+        self._user_repo = UserRepository()
         config = load_rate_limit()
-        self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
-        self.enabled = config.get("enabled", True)
+        self.max_downloads_per_hour: int = config.get("max_downloads_per_hour", 10)
+        self.enabled: bool = config.get("enabled", True)
 
-    def reload(self):
+    def reload(self) -> None:
         config = load_rate_limit()
         self.max_downloads_per_hour = config.get("max_downloads_per_hour", 10)
         self.enabled = config.get("enabled", True)
@@ -95,52 +105,16 @@ class RateLimiter:
         if user_max == 0:
             return False, "Your account has been suspended."
 
-        now = time.time()
-        window = 3600
+        return await self._rl_repo.record_and_check(user_id, user_max)
 
-        async with get_db() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                await db.execute(
-                    "DELETE FROM rate_limit WHERE timestamp < ?", (now - window,)
-                )
-                async with db.execute(
-                    "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
-                    (user_id, now - window),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    count = row[0] if row else 0
-
-                if count >= user_max:
-                    await db.execute("ROLLBACK")
-                    async with db.execute(
-                        "SELECT MIN(timestamp) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
-                        (user_id, now - window)
-                    ) as cur:
-                        oldest = (await cur.fetchone())[0] or now
-                    remaining_secs = int(oldest + window - now)
-                    return False, f"Rate limit exceeded. Try again in {remaining_secs}s."
-
-                await db.execute(
-                    "INSERT INTO rate_limit (user_id, timestamp) VALUES (?, ?)",
-                    (user_id, now),
-                )
-                await db.commit()
-                return True, None
-            except Exception:
-                await db.execute("ROLLBACK")
-                raise
-
-    async def reset(self, user_id: int):
-        async with get_db() as db:
-            await db.execute("DELETE FROM rate_limit WHERE user_id = ?", (user_id,))
-            await db.commit()
+    async def reset(self, user_id: int) -> None:
+        await self._rl_repo.reset(user_id)
 
     def get_status(self) -> dict:
         return {
             "max_downloads_per_hour": self.max_downloads_per_hour,
             "enabled": self.enabled,
-            "active_users": 0
+            "active_users": 0,
         }
 
     async def get_remaining(self, user_id: int) -> int:
@@ -149,19 +123,11 @@ class RateLimiter:
             return 999
         if user_max == 0:
             return 0
-        now = time.time()
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM rate_limit WHERE user_id = ? AND timestamp > ?",
-                (user_id, now - 3600),
-            ) as cur:
-                row = await cur.fetchone()
-                count = row[0] if row else 0
-        return max(0, user_max - count)
+        return await self._rl_repo.remaining(user_id, user_max)
 
 
 # ---------------------------------------------------------------------------
-# NOTE: The module-level singleton ``rate_limiter = RateLimiter()`` that
-# previously lived here has been removed.  A single instance is now created
-# in main.py and stored in services.container.services.limiter.
+# NOTE: The module-level singleton `rate_limiter = RateLimiter()` that
+# previously lived here has been removed.  A single instance is created in
+# main.py and stored in services.container.services.limiter.
 # ---------------------------------------------------------------------------
