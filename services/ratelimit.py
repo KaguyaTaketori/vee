@@ -49,7 +49,7 @@ async def get_user_limit(user_id: int) -> int:
     if row:
         tier, custom_max = row
         if custom_max is not None:
-            return custom_max                       
+            return custom_max
         return RATE_TIER_LIMITS.get(tier, RATE_TIER_LIMITS["normal"])
 
     return RATE_TIER_LIMITS["normal"]
@@ -160,4 +160,8 @@ class RateLimiter:
         return max(0, user_max - count)
 
 
-rate_limiter = RateLimiter()
+# ---------------------------------------------------------------------------
+# NOTE: The module-level singleton ``rate_limiter = RateLimiter()`` that
+# previously lived here has been removed.  A single instance is now created
+# in main.py and stored in services.container.services.limiter.
+# ---------------------------------------------------------------------------

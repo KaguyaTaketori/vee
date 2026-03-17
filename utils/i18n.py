@@ -3,8 +3,6 @@ import json
 import logging
 from typing import Optional
 from cachetools import LRUCache
-from database.db import DB_PATH
-from database.users import fetch_user_lang_from_db
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +22,10 @@ LANGUAGES = {
 
 def _load_translations(lang: str) -> dict:
     global _cache
-    
+
     if lang in _cache["translations"]:
         return _cache["translations"][lang]
-    
+
     file_path = os.path.join(LOCALES_DIR, f"{lang}.json")
     if os.path.exists(file_path):
         try:
@@ -36,37 +34,38 @@ def _load_translations(lang: str) -> dict:
                 return _cache["translations"][lang]
         except Exception:
             pass
-    
+
     if lang != DEFAULT_LANG:
         return _load_translations(DEFAULT_LANG)
-    
+
     return {}
 
 
-_lang_cache: LRUCache[int, str] = LRUCache(maxsize=10_000) 
+# ---------------------------------------------------------------------------
+# Per-user language cache (in-memory only).
+# DB reads/writes are handled by services.user_service so that this module
+# stays free of any database dependency.
+# ---------------------------------------------------------------------------
+
+_lang_cache: LRUCache[int, str] = LRUCache(maxsize=10_000)
 
 
 def get_user_lang(user_id: int) -> str:
     return _lang_cache.get(user_id, DEFAULT_LANG)
 
 
-async def get_user_lang_async(user_id: int) -> str:
-    if user_id in _lang_cache:
-        return _lang_cache[user_id]
-    return await warm_user_lang(user_id)
+def set_user_lang(user_id: int, lang: str) -> None:
+    """Update the in-memory language cache.
 
-
-async def warm_user_lang(user_id: int) -> str:
-    lang = await fetch_user_lang_from_db(user_id)
+    DB persistence is the caller's responsibility – use
+    ``services.user_service.set_user_language()`` when you need both.
+    """
     _lang_cache[user_id] = lang
-    return lang
 
 
-async def set_user_lang(user_id: int, lang: str):
-    _lang_cache[user_id] = lang
-    from database.users import set_user_lang
-    await set_user_lang(user_id, lang)
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _get_nested(translations: dict, key: str) -> Optional[str]:
     keys = key.split(".")
@@ -84,7 +83,7 @@ def _get_plural(translations: dict, key: str, count: int) -> Optional[str]:
         plural_key = key
     else:
         plural_key = f"{key}_plural"
-    
+
     result = translations.get(plural_key)
     if result and "{count}" in result:
         return result.replace("{count}", str(count))
@@ -93,14 +92,14 @@ def _get_plural(translations: dict, key: str, count: int) -> Optional[str]:
 
 def detect_system_lang(lang_code: str) -> str:
     lang_code = lang_code.lower().replace("-", "_")
-    
+
     if lang_code in LANGUAGES:
         return lang_code
-    
+
     primary = lang_code.split("_")[0]
     if primary in LANGUAGES:
         return primary
-    
+
     lang_map = {
         "zh": "zh", "zhcn": "zh", "zhtw": "zh", "zhhk": "zh",
         "ja": "ja",
@@ -116,7 +115,7 @@ def detect_system_lang(lang_code: str) -> str:
         "vi": "vi",
         "th": "th",
     }
-    
+
     return lang_map.get(primary, DEFAULT_LANG)
 
 
@@ -148,27 +147,27 @@ def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -
         logger.warning(f"Missing i18n placeholder {e} for key '{key}' in lang '{lang}' (got kwargs: {list(kwargs.keys())})")
         return text
 
-    
+
 def tp(key: str, count: int, user_id: Optional[int] = None, lang: Optional[str] = None, **kwargs) -> str:
     if not lang:
         lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
-    
+
     translations = _load_translations(lang)
-    
+
     plural_text = _get_plural(translations, key, count)
-    
+
     if plural_text:
         if "{count}" in plural_text:
             return plural_text.replace("{count}", str(count))
         return plural_text
-    
+
     if lang != DEFAULT_LANG:
         fallback = _get_plural(_load_translations(DEFAULT_LANG), key, count)
         if fallback:
             if "{count}" in fallback:
                 return fallback.replace("{count}", str(count))
             return fallback
-    
+
     return str(count)
 
 

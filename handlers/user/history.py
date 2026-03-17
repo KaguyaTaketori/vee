@@ -2,7 +2,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
-from services.queue import download_queue
+from services.container import services
 from models.domain_models import STATUS_EMOJI, DownloadStatus
 from utils.i18n import t
 from utils.utils import format_history_list, format_history_item, require_message
@@ -71,7 +71,7 @@ async def tasks_command(update: Update, context: CallbackContext):
 async def cancel_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
 
-    user_tasks = download_queue.get_user_tasks(user_id)
+    user_tasks = services.queue.get_user_tasks(user_id)
     active = [
         task for task in user_tasks
         if task.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.PROCESSING)
@@ -100,3 +100,4 @@ async def cancel_command(update: Update, context: CallbackContext):
         t("select_cancel_task", user_id),
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+

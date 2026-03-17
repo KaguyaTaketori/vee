@@ -3,18 +3,19 @@ from telegram import Update
 from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
-from services.ratelimit import rate_limiter
+from services.container import services
+from services.user_service import set_user_language, warm_user_lang
 from database.history import get_user_history, clear_file_id_by_url
-from utils.i18n import warm_user_lang, set_user_lang as i18n_set_user_lang, LANGUAGES, t
+from utils.i18n import LANGUAGES, t
 from utils.utils import format_history_list
 from utils.auth import check_admin
 from services.session import UserSession
-from services.queue import download_queue
 from handlers.user.history import _send_history_page
 
 logger = logging.getLogger(__name__)
 
 _CALLBACK_HANDLERS: list[tuple[callable, callable]] = []
+
 
 def register(matcher: callable):
     def decorator(func: callable):
@@ -27,7 +28,7 @@ def register(matcher: callable):
 async def _cb_lang(query, context):
     lang_code = query.data.replace("lang_", "")
     if lang_code in LANGUAGES:
-        await i18n_set_user_lang(query.from_user.id, lang_code)
+        await set_user_language(query.from_user.id, lang_code)
         await query.edit_message_text(t("language_changed", query.from_user.id))
 
 
@@ -55,7 +56,7 @@ async def _cb_cancel_close(query, context):
 async def _cb_cancel_task(query, context):
     user_id = query.from_user.id
     task_id = query.data.replace("cancel_task_", "")
-    task = download_queue.get_task(task_id)
+    task = services.queue.get_task(task_id)
     if not task:
         await query.edit_message_text(t("task_not_found", user_id))
         return
@@ -63,7 +64,7 @@ async def _cb_cancel_task(query, context):
     if task.user_id != user_id and not is_admin:
         await query.answer(t("cancel_own_only", user_id), show_alert=True)
         return
-    success = await download_queue.cancel_task(task_id)
+    success = await services.queue.cancel_task(task_id)
     key = "task_cancelled" if success else "cancel_failed"
     await query.edit_message_text(t(key, user_id))
 
@@ -119,7 +120,6 @@ async def _cb_refresh_do(query, context):
         await query.answer("Admin only.", show_alert=True)
         return
 
-    # callback_data: "refresh_do_{admin_id}_{index}"
     parts = query.data.split("_")
     admin_id = int(parts[2])
     index = int(parts[3])
@@ -142,7 +142,6 @@ async def _cb_refresh_page(query, context):
         await query.answer("Admin only.", show_alert=True)
         return
 
-    # callback_data: "refresh_page_{admin_id}_{page}"
     parts = query.data.split("_")
     admin_id = int(parts[2])
     page = int(parts[3])
@@ -162,5 +161,6 @@ async def handle_callback(update, context):
             await handler(query, context)
             return
     await query.answer()
-    
+
     logger.warning(f"Unhandled callback_data: {query.data}")
+

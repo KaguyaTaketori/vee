@@ -5,11 +5,12 @@ from telegram.ext import CallbackContext
 from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
 from config import ADMIN_IDS, RATE_TIER_LIMITS
+from services.container import services
 from services.user_service import (
     get_allowed_users, save_allowed_users, get_all_users_info,
     get_user_display_name, get_user_display_names_bulk
 )
-from services.ratelimit import rate_limiter, save_rate_limit, get_user_tier, get_user_limit, set_user_tier
+from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit, set_user_tier
 from database.db import get_db
 from utils.i18n import t
 from utils.utils import require_admin, require_message, format_history_list
@@ -24,17 +25,17 @@ async def allow_command(update: Update, context: CallbackContext):
     if not context.args:
         await update.message.reply_text(t("usage_allow", user_id))
         return
-    
+
     try:
         target_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text(t("invalid_user_id", user_id))
         return
-    
+
     users = get_allowed_users()
     users.add(target_id)
     save_allowed_users(users)
-    
+
     await update.message.reply_text(t("user_allowed", user_id, target_id=target_id))
 
 
@@ -45,17 +46,17 @@ async def block_command(update: Update, context: CallbackContext):
     if not context.args:
         await update.message.reply_text(t("usage_block", user_id))
         return
-    
+
     try:
         target_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text(t("invalid_user_id", user_id))
         return
-    
+
     users = get_allowed_users()
     users.discard(target_id)
     save_allowed_users(users)
-    
+
     await update.message.reply_text(t("user_blocked", user_id, target_id=target_id))
 
 
@@ -89,6 +90,7 @@ async def users_command(update: Update, context: CallbackContext):
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+
 @require_admin
 @require_message
 async def broadcast_command(update: Update, context: CallbackContext):
@@ -117,6 +119,7 @@ async def broadcast_command(update: Update, context: CallbackContext):
         f"Broadcast sent to {success}/{len(users)} users."
     )
 
+
 @require_admin
 @require_message
 async def userhistory_command(update: Update, context: CallbackContext):
@@ -125,7 +128,7 @@ async def userhistory_command(update: Update, context: CallbackContext):
     if not users:
         await update.message.reply_text(t("no_users_to_show", user_id))
         return
-    
+
     name_map = await get_user_display_names_bulk(list(users))
 
     keyboard = [
@@ -136,6 +139,7 @@ async def userhistory_command(update: Update, context: CallbackContext):
         t("select_user_history", user_id),
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
 
 @require_admin
 @require_message
@@ -170,9 +174,9 @@ async def settier_command(update: Update, context: CallbackContext):
             await update.message.reply_text(t("settier_invalid_id", user_id))
             return
 
-        tier  = await get_user_tier(target_id)
-        limit = await get_user_limit(target_id)
-        remaining = await rate_limiter.get_remaining(target_id)
+        tier      = await get_user_tier(target_id)
+        limit     = await get_user_limit(target_id)
+        remaining = await services.limiter.get_remaining(target_id)
         await update.message.reply_text(
             t("settier_info", user_id, target_id=target_id, tier=tier, limit=limit, remaining=remaining)
         )
@@ -218,3 +222,4 @@ async def settier_command(update: Update, context: CallbackContext):
         await update.message.reply_text(
             t("settier_invalid_tier", user_id, tier=tier_arg, options=options)
         )
+

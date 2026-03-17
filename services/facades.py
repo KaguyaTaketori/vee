@@ -8,9 +8,8 @@ import uuid
 from integrations.strategies.factory import StrategyFactory
 from integrations.strategies.sender import TelegramSender
 from models.domain_models import DownloadStatus, DownloadTask
+from services.container import services
 from services.query_adapters import SilentMessageQuery
-from services.queue import download_queue
-from services.ratelimit import rate_limiter
 from utils.i18n import t
 from utils.logger import log_user
 from utils.utils import is_user_allowed
@@ -41,7 +40,7 @@ async def _execute_download_task(task: DownloadTask) -> None:
 
     task.status = DownloadStatus.PROCESSING
 
-    ctx = download_queue.get_task_context(task.task_id)
+    ctx = services.queue.get_task_context(task.task_id)
     if not ctx:
         task.status = DownloadStatus.FAILED
         task.error = "Task context missing"
@@ -53,7 +52,7 @@ async def _execute_download_task(task: DownloadTask) -> None:
     # ── Build the platform sender here, not inside the strategy ──────────────
     sender = TelegramSender(query, processing_msg)
 
-    cancel_event = download_queue.get_cancel_event(task.task_id)
+    cancel_event = services.queue.get_cancel_event(task.task_id)
 
     strategy_future = asyncio.ensure_future(strategy.execute(sender, url))
     cancel_future = (
@@ -142,7 +141,7 @@ class DownloadFacade:
             logger.warning("Unauthorized user %s attempted to download %s", user_id, url)
             return False, "unauthorized"
 
-        can_download, rate_limit_msg = await rate_limiter.check_limit(user_id)
+        can_download, rate_limit_msg = await services.limiter.check_limit(user_id)
         if not can_download:
             logger.warning("User %s blocked by rate limit: %s", user_id, rate_limit_msg)
             return False, "rate_limit_exceeded"
@@ -174,12 +173,12 @@ class DownloadFacade:
                 "processing_msg": processing_msg,
                 "context": context,
             }
-            await download_queue.add_task(task, task_ctx)
+            await services.queue.add_task(task, task_ctx)
 
-            position = download_queue.get_queue_position(user_id)
-            active = download_queue.get_active_count()
+            position = services.queue.get_queue_position(user_id)
+            active   = services.queue.get_active_count()
 
-            if position > 0 or active >= download_queue.max_concurrent:
+            if position > 0 or active >= services.queue.max_concurrent:
                 await processing_msg.edit_text(
                     t("queued", user_id, position=position + 1)
                 )
@@ -238,5 +237,5 @@ class DownloadFacade:
             "processing_msg": status_msg,
             "context": context,
         }
-        await download_queue.add_task(task, task_ctx)
+        await services.queue.add_task(task, task_ctx)
         log_user(user, f"batch_enqueue:{download_type}")

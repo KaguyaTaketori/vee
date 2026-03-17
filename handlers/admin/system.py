@@ -6,13 +6,11 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 from config import get_config, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES, save_disk_config, reload_disk_config
 from core import jobs as core_jobs
+from services.container import services
 from services.user_service import cleanup_temp_files, get_user_display_name
-from services.queue import download_queue
-from services.ratelimit import rate_limiter
-from services.analytics import get_daily_stats, format_daily_report
-from utils.logger import get_user_stats
+from services.analytics import get_daily_stats, format_daily_report, get_bot_stats
 from utils.i18n import t
-from utils.utils import require_admin, require_message,  scan_temp_files, format_bytes
+from utils.utils import require_admin, require_message, scan_temp_files, format_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +18,7 @@ logger = logging.getLogger(__name__)
 @require_admin
 @require_message
 async def stats_command(update: Update, context: CallbackContext):
-    msg = await get_user_stats()
+    msg = await get_bot_stats()
     await update.message.reply_text(msg)
 
 
@@ -28,10 +26,10 @@ async def stats_command(update: Update, context: CallbackContext):
 @require_message
 async def status_command(update: Update, context: CallbackContext):
     config = get_config()
-    rate_status = rate_limiter.get_status()
-    
+    rate_status = services.limiter.get_status()
+
     temp_files, temp_size, _, _ = scan_temp_files(config["temp_dir"])
-    
+
     msg = "📊 Bot Status\n\n"
     msg += f"CPU: {psutil.cpu_percent()}%\n"
     mem = psutil.virtual_memory()
@@ -49,6 +47,7 @@ async def status_command(update: Update, context: CallbackContext):
 @require_admin
 @require_message
 async def storage_command(update: Update, context: CallbackContext):
+    from config import disk_config  # runtime threshold (updated by /setdisk)
     disk = psutil.disk_usage("/")
     disk_percent = disk.percent
     total, used, free = disk.total, disk.used, disk.free
@@ -57,10 +56,11 @@ async def storage_command(update: Update, context: CallbackContext):
     temp_dir = config["temp_dir"]
     temp_files, temp_size, oldest_file, oldest_time = scan_temp_files(temp_dir)
 
-    if disk_percent >= cfg.DISK_CRIT_THRESHOLD:
-        alert = f"\n🚨 CRITICAL: 磁盘使用率已超过 {cfg.DISK_CRIT_THRESHOLD}%!"
-    elif disk_percent >= cfg.DISK_WARN_THRESHOLD:
-        alert = f"\n⚠️ WARNING: 磁盘使用率已超过 {cfg.DISK_WARN_THRESHOLD}%"
+    level = disk_config.current_level(disk_percent)
+    if level == "critical":
+        alert = f"\n🚨 CRITICAL: 磁盘使用率已超过 {disk_config.crit_threshold}%!"
+    elif level == "warn":
+        alert = f"\n⚠️ WARNING: 磁盘使用率已超过 {disk_config.warn_threshold}%"
     else:
         alert = ""
 
@@ -80,6 +80,7 @@ async def storage_command(update: Update, context: CallbackContext):
 
     await update.message.reply_text("\n".join(lines))
 
+
 @require_admin
 @require_message
 async def setdisk_command(update: Update, context: CallbackContext):
@@ -97,7 +98,7 @@ async def setdisk_command(update: Update, context: CallbackContext):
 
         if not (0 < warn < crit <= 100):
             raise ValueError("warn must be < crit")
-    except ValueError as e:
+    except ValueError:
         await update.message.reply_text(t("setdisk_invalid", user_id))
         return
 
@@ -131,3 +132,4 @@ async def report_command(update: Update, context: CallbackContext):
     stats = await get_daily_stats(days=days)
     period = f"近 {days} 天" if days > 1 else "今日"
     await update.message.reply_text(format_daily_report(stats, period=period))
+

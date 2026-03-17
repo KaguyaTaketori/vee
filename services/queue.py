@@ -30,14 +30,14 @@ class DownloadQueue:
         self._pending_user_tasks: dict[int, list[str]] = {}
         self._task_contexts: dict[str, TaskContext] = {}
         self._cancelled_ids: set[str] = set()
-    
+
     def set_executor(self, executor: Callable):
         """Set the async function to execute when processing a task.
-        
+
         The executor should accept: (task: DownloadTask, processing_msg, context)
         """
         self._executor = executor
-    
+
     async def start(self):
         self._running = True
         self._cancel_event = asyncio.Event()
@@ -57,7 +57,12 @@ class DownloadQueue:
     async def _worker(self, worker_id: int):
         while self._running:
             try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                task = item.task
+                if task.task_id in self._cancelled_ids:
+                    self._cancelled_ids.discard(task.task_id)
+                    logger.info(f"Task {task.task_id} was cancelled before execution, skipping.")
+                    continue
                 await self._process_task(task)
             except asyncio.TimeoutError:
                 continue
@@ -163,7 +168,7 @@ class DownloadQueue:
 
         if telegram_ctx is not None:
             self._task_contexts[task.task_id] = telegram_ctx
-        
+
         self._cancel_events[task.task_id] = asyncio.Event()
         return task.task_id
 
@@ -181,15 +186,15 @@ class DownloadQueue:
             if task:
                 tasks.append(task)
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
-    
+
     def get_queue_position(self, user_id: int) -> int:
         """Get the number of queued tasks for a user (not including active)."""
         return len(self._pending_user_tasks.get(user_id, []))
-    
+
     def get_total_queued(self) -> int:
         """Get total number of queued tasks."""
         return self.queue.qsize()
-    
+
     def get_active_count(self) -> int:
         """Get number of currently active tasks."""
         return len(self.active_tasks)
@@ -198,7 +203,7 @@ class DownloadQueue:
         task = self.active_tasks.get(task_id)
         if not task:
             return False
-        
+
         event = self._cancel_events.get(task_id)
         if event:
             event.set()
@@ -217,25 +222,10 @@ class DownloadQueue:
                 return True
         return False
 
-    async def _worker(self, worker_id: int):
-        while self._running:
-            try:
-                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                task = item.task
-                if task.task_id in self._cancelled_ids:
-                    self._cancelled_ids.discard(task.task_id)
-                    logger.info(f"Task {task.task_id} was cancelled before execution, skipping.")
-                    continue
-                await self._process_task(task)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
     async def cancel_task(self, task_id: str) -> bool:
         if task_id in self.active_tasks:
             return await self.cancel_active_task(task_id)
-        
+
         return await self.cancel_queued_task(task_id)
 
     def complete_task(self, task: DownloadTask):
@@ -257,4 +247,8 @@ class DownloadQueue:
                     user_tasks.discard(task_id)
 
 
-download_queue = DownloadQueue(max_concurrent=3)
+# ---------------------------------------------------------------------------
+# NOTE: The module-level singleton ``download_queue = DownloadQueue(...)``
+# that previously lived here has been removed.  A single instance is now
+# created in main.py and stored in services.container.services.queue.
+# ---------------------------------------------------------------------------

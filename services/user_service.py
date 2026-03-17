@@ -3,7 +3,13 @@ import time
 import asyncio
 
 from utils.cache import TTLCache
-from database.users import update_user as _update_user, get_all_users as _get_all_users, get_user_info as _get_user_info
+from database.users import (
+    update_user as _update_user,
+    get_all_users as _get_all_users,
+    get_user_info as _get_user_info,
+    fetch_user_lang_from_db,
+    set_user_lang as _db_set_user_lang,
+)
 from database.db import get_db
 from config import (
     ALLOWED_USERS_FILE,
@@ -17,19 +23,30 @@ from config import (
 _allowed_users_cache: TTLCache = TTLCache(ttl=CACHE_TTL)
 _users_db_cache: TTLCache      = TTLCache(ttl=CACHE_TTL)
 
+
 def track_user(user):
     if user:
         try:
             loop = asyncio.get_running_loop()
-            asyncio.create_task(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
+            asyncio.create_task(_update_user(
+                user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+            ))
         except RuntimeError:
-            asyncio.run(_update_user(user.id, username=user.username, first_name=user.first_name, last_name=user.last_name))
+            asyncio.run(_update_user(
+                user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+            ))
 
 
 def get_allowed_users() -> set:
     cached = _allowed_users_cache.get()
     if cached is not TTLCache._MISSING:
-        return cached                       # ✅ 空 set() 也能正确命中
+        return cached
 
     users = set()
     if os.path.exists(ALLOWED_USERS_FILE):
@@ -112,3 +129,53 @@ def cleanup_temp_files(max_age_hours: int = None):
                         pass
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Language preference helpers
+# These are the single authoritative point for reading/writing user language,
+# keeping database.users and utils.i18n properly decoupled from each other.
+# ---------------------------------------------------------------------------
+
+async def warm_user_lang(user_id: int) -> str:
+    """Fetch the user's language from the DB and seed the i18n in-memory cache.
+
+    Call this once per session (e.g. on the first message from a user) so
+    that ``t()`` resolves the correct language without hitting the DB on
+    every translation lookup.
+    """
+    from utils.i18n import get_user_lang, set_user_lang as _cache_set
+
+    # Skip DB round-trip if already cached for this session
+    from cachetools import LRUCache  # just for isinstance check
+    from utils.i18n import _lang_cache, DEFAULT_LANG
+    if user_id in _lang_cache:
+        return _lang_cache[user_id]
+
+    lang = await fetch_user_lang_from_db(user_id)
+    _cache_set(user_id, lang)
+    return lang
+
+
+async def set_user_language(user_id: int, lang: str) -> None:
+    """Persist a new language preference to the DB and update the i18n cache.
+
+    This is the single call-site for any language change – handlers should
+    call this instead of touching i18n or database.users directly.
+    """
+    from utils.i18n import set_user_lang as _cache_set
+    _cache_set(user_id, lang)
+    await _db_set_user_lang(user_id, lang)
+
+
+def format_user_display(user: dict) -> str:
+    parts = []
+    if user.get("username"):
+        parts.append(f"@{user['username']}")
+    if user.get("first_name"):
+        parts.append(user["first_name"])
+    if user.get("last_name"):
+        parts.append(user["last_name"])
+
+    name = " ".join(parts) if parts else f"User {user['user_id']}"
+    return f"{name} (`{user['user_id']}`)"

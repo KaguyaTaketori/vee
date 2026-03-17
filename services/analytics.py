@@ -1,6 +1,8 @@
 import time
 from database.db import get_db
 from utils.utils import format_bytes
+
+
 async def get_daily_stats(days: int = 1) -> dict:
     since = time.time() - days * 86400
 
@@ -82,4 +84,24 @@ def format_daily_report(stats: dict, period: str = "今日") -> str:
         f"👥 活跃用户：{stats['active_users']} 人\n"
         f"\n📂 类型分布：\n{type_lines or '  暂无'}\n"
         f"\n🏆 活跃榜 Top5：\n{top_lines or '  暂无'}"
+    )
+
+
+async def get_bot_stats() -> str:
+    """Return a high-level statistics summary for the /stats admin command.
+
+    Previously lived in utils/logger.py as get_user_stats(); moved here so
+    that analytics-related DB queries have a single home.
+    """
+    from database.history import get_all_users_count, get_total_downloads, get_failed_downloads
+
+    total_users = await get_all_users_count()
+    total_dl    = await get_total_downloads()
+    failed      = await get_failed_downloads(limit=5)
+
+    return (
+        f"📊 Bot Statistics\n"
+        f"Total registered users: {total_users}\n"
+        f"Total downloads: {total_dl}\n"
+        f"Recent failures: {len(failed)}\n"
     )

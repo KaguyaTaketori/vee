@@ -3,14 +3,50 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
-from services.queue import download_queue
-from services.ratelimit import rate_limiter, save_rate_limit, get_user_tier, get_user_limit
+from services.container import services
+from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit
 from services.user_service import get_user_display_name
 from database.history import clear_file_id_by_url, get_user_history, get_recent_cached_urls
 from utils.i18n import t
 from utils.utils import require_admin, require_message, format_history_list
 
 logger = logging.getLogger(__name__)
+
+_FORMAT_LABEL: dict[str, str] = {
+    # YouTube
+    "137": "1080p", "248": "1080p",
+    "136": "720p",  "247": "720p",
+    "135": "480p",  "244": "480p",
+    "134": "360p",  "243": "360p",
+    "133": "240p",  "242": "240p",
+    "160": "144p",  "278": "144p",
+    "271": "1440p", "308": "1440p",
+    "313": "2160p", "315": "2160p",
+    "best": "最佳画质",
+    # Bilibili
+    "127": "8K",
+    "126": "Dolby 视界",
+    "125": "HDR 真彩",
+    "120": "4K 超清",
+    "116": "1080p60",
+    "112": "1080p+",
+    "80":  "1080p",
+    "74":  "720p60",
+    "64":  "720p",
+    "32":  "480p",
+    "16":  "360p",
+    # Bilibili 旧版 qn 编号
+    "30280": "8K",
+    "30250": "Dolby 视界",
+    "30251": "Dolby 全景声",
+    "30240": "HDR 真彩",
+    "30232": "1080p60",
+    "30080": "1080p+",
+    "30064": "1080p",
+    "30032": "480p",
+    "30016": "360p",
+}
+
 
 def _format_download_type(download_type: str, file_size: int | None = None) -> str:
     size_str = ""
@@ -29,55 +65,22 @@ def _format_download_type(download_type: str, file_size: int | None = None) -> s
     if download_type == "video":
         return f"🎬 视频{size_str}"
     if download_type.startswith("video_"):
-        _FORMAT_LABEL = {
-            # YouTube
-            "137": "1080p", "248": "1080p",
-            "136": "720p",  "247": "720p",
-            "135": "480p",  "244": "480p",
-            "134": "360p",  "243": "360p",
-            "133": "240p",  "242": "240p",
-            "160": "144p",  "278": "144p",
-            "271": "1440p", "308": "1440p",
-            "313": "2160p", "315": "2160p",
-            "best": "最佳画质",
-            # Bilibili
-            "127": "8K",
-            "126": "Dolby 视界",
-            "125": "HDR 真彩",
-            "120": "4K 超清",
-            "116": "1080p60",
-            "112": "1080p+",
-            "80":  "1080p",
-            "74":  "720p60",
-            "64":  "720p",
-            "32":  "480p",
-            "16":  "360p",
-            # Bilibili 旧版 qn 编号（部分客户端仍在使用）
-            "30280": "8K",
-            "30250": "Dolby 视界",
-            "30251": "Dolby 全景声",
-            "30240": "HDR 真彩",
-            "30232": "1080p60",
-            "30080": "1080p+",
-            "30064": "1080p",
-            "30032": "480p",
-            "30016": "360p",
-        }
         fmt_id = download_type.removeprefix("video_")
         label = _FORMAT_LABEL.get(fmt_id, fmt_id)
         return f"🎬 {label}{size_str}"
 
     return download_type
 
+
 @require_admin
 @require_message
 async def queue_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    active = download_queue.active_tasks
-    queued = download_queue.queue.qsize()
-    
+    active = services.queue.active_tasks
+    queued = services.queue.queue.qsize()
+
     msg = t("queue_title", user_id, active=len(active), queued=queued)
-    
+
     if active:
         msg += "\n" + t("active_downloads", user_id) + "\n"
         for tid, task in list(active.items())[:10]:
@@ -88,7 +91,7 @@ async def queue_command(update: Update, context: CallbackContext):
                 "uploading": "📤",
             }.get(task.status.value, "⏳")
             msg += f"{status_emoji} {task.download_type} - {user_name}\n"
-    
+
     await update.message.reply_text(msg)
 
 
@@ -99,22 +102,22 @@ async def failed_command(update: Update, context: CallbackContext):
     if not context.args:
         await update.message.reply_text(t("usage_failed", user_id))
         return
-    
+
     try:
         target_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text(t("invalid_user_id", user_id))
         return
-    
+
     history = await get_user_history(target_id, limit=50)
     failed = [h for h in history if h.get("status") == "failed"]
-    
+
     if not failed:
         await update.message.reply_text(t("failed_for_user", user_id, target_id=target_id))
         return
-    
+
     msg = format_history_list(failed[:20], t("failed_title_simple", user_id, target_id=target_id) + "\n")
-    
+
     await update.message.reply_text(msg)
 
 
@@ -199,7 +202,7 @@ async def _send_refresh_page(message_or_query, user_id: int, page: int, context)
 @require_message
 async def rateinfo_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    status = rate_limiter.get_status()
+    status = services.limiter.get_status()
     status_text = "Enabled" if status["enabled"] else "Disabled"
     msg = t("rateinfo_status", user_id, status=status_text, max=status['max_downloads_per_hour'], users=status['active_users'])
     await update.message.reply_text(msg)
@@ -212,7 +215,7 @@ async def setrate_command(update: Update, context: CallbackContext):
     if not context.args:
         await update.message.reply_text(t("usage_setrate", user_id))
         return
-    
+
     try:
         max_per_hour = int(context.args[0])
         if max_per_hour < 1 or max_per_hour > 100:
@@ -221,14 +224,14 @@ async def setrate_command(update: Update, context: CallbackContext):
     except ValueError:
         await update.message.reply_text(t("invalid_number", user_id))
         return
-    
+
     enabled = True
     if len(context.args) > 1:
         enabled = context.args[1].lower() in ["on", "true", "1"]
-    
+
     save_rate_limit(max_per_hour, enabled)
-    rate_limiter.reload()
-    
+    services.limiter.reload()
+
     status = "enabled" if enabled else "disabled"
     await update.message.reply_text(t("rate_limit_updated_simple", user_id, max=max_per_hour, status=status))
 
@@ -237,15 +240,15 @@ async def setrate_command(update: Update, context: CallbackContext):
 @require_message
 async def admin_cancel_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-      
+
     if not context.args:
-        active = list(download_queue.active_tasks.values())
-        queued_size = download_queue.get_total_queued()
-        
+        active = list(services.queue.active_tasks.values())
+        queued_size = services.queue.get_total_queued()
+
         if not active and queued_size == 0:
             await update.message.reply_text(t("queue_empty_cn", user_id))
             return
-        
+
         keyboard = []
         for task in active:
             short_url = task.url[:25] + "..." if len(task.url) > 25 else task.url
@@ -256,17 +259,18 @@ async def admin_cancel_command(update: Update, context: CallbackContext):
                     callback_data=f"cancel_task_{task.task_id}"
                 )
             ])
-        
+
         keyboard.append([InlineKeyboardButton(t("btn_close", user_id), callback_data="cancel_menu_close")])
-        
+
         msg = t("admin_tasks_title", user_id, active=len(active), queued=queued_size)
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    
+
     task_id = context.args[0]
-    success = await download_queue.cancel_task(task_id)
-    
+    success = await services.queue.cancel_task(task_id)
+
     if success:
         await update.message.reply_text(t("task_cancel_confirm", user_id, task_id=task_id))
     else:
         await update.message.reply_text(t("task_cancel_error", user_id, task_id=task_id))
+
