@@ -9,7 +9,7 @@ import time
 import logging
 from typing import Optional
 
-from .base import BaseRepository
+from shared.repositories.base import BaseRepository
 
 logger = logging.getLogger(__name__)
 

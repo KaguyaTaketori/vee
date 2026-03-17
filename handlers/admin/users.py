@@ -115,13 +115,13 @@ async def broadcast_command(update: Update, context: CallbackContext):
                 await context.bot.send_message(chat_id=uid, text=message)
                 return True
             except Exception as e:
-                logger.warning(f"Failed to send broadcast to {uid}: {e}")
+                logger.warning("Failed to send broadcast to %s: %s", uid, e)
                 return False
 
     results = await asyncio.gather(*[_send(uid) for uid in users])
     success = sum(results)
     await update.message.reply_text(
-        f"Broadcast sent to {success}/{len(users)} users."
+        t("broadcast_sent", user_id, success=success, failed=len(users) - success)
     )
 
 

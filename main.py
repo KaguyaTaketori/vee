@@ -1,7 +1,8 @@
 import pytz
 import logging
+import asyncio
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, CommandHandler, filters
 from telegram.request import HTTPXRequest
 from datetime import time as dt_time
 
@@ -31,27 +32,53 @@ from core.handler_registry import registry
 from handlers.admin.cookies import handle_cookie_file
 from integrations.ptb_adapter import PtbCommandRegistrar
 
+from llm.manager import build_llm_manager_from_env
+import llm.manager as _llm_mod
+from modules.billing.handlers.bill_handler import (
+  handle_bill_text,
+  handle_bill_photo,
+  handle_bill_command,
+)
+from modules.billing.handlers.bill_callbacks import handle_bill_edit_reply
+import modules.billing.handlers  # noqa: 触发回调注册
+
 import handlers.user.basic
 import handlers.user.history
 import handlers.admin.system
 import handlers.admin.users
 import handlers.admin.tasks
 import handlers.admin.cookies
+from modules.billing.handlers.expenses import handle_receipt_photo
 
-from handlers.downloads.message_parser import handle_link
-from handlers.downloads.inline_actions import handle_callback
+from modules.downloader.handlers.message_parser import handle_link
+from modules.downloader.handlers.inline_actions import handle_callback
+
+from modules.downloader import DownloaderModule
+from modules.billing import BillingModule
 
 logger = logging.getLogger(__name__)
 
+MODULES = [
+    DownloaderModule(),
+    BillingModule(),
+]
 
 def register_all_handlers(app: Application) -> None:
-    from config import ADMIN_IDS
-    registry.apply(PtbCommandRegistrar(app, admin_ids=frozenset(ADMIN_IDS)))
+   # from config import ADMIN_IDS
+   # registry.apply(PtbCommandRegistrar(app, admin_ids=frozenset(ADMIN_IDS)))
+   # app.add_handler(CommandHandler("bill", handle_bill_command))
+   # app.add_handler(MessageHandler(filters.PHOTO, handle_bill_photo))
+   # app.add_handler(
+   #   MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_bill_edit_reply),
+   #   group=1,
+   # )
 
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
-
+   # app.add_handler(CallbackQueryHandler(handle_callback))
+   # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+   # app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
+   # app.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
+   for module in MODULES:
+        module.setup(app)
 
 class _NotifierProxy:
     async def notify_admins(self, message: str, parse_mode=None) -> None:
@@ -111,8 +138,11 @@ def main() -> None:
     async def post_init_callback(app: Application) -> None:
         init_config()
         await init_db()
+        for module in MODULES:
+            if hasattr(module, 'init_db'):
+                await module.init_db()
         await mark_stale_tasks_failed()
-
+        _llm_mod.llm_manager = build_llm_manager_from_env()
         from services.event_bus import bus as _bus
         services.bus = _bus
 
@@ -131,7 +161,7 @@ def main() -> None:
         services.bus.on("task_retrying",  task_repo.save)
         services.bus.on("task_completed", task_repo.save)
 
-        await set_bot_commands(app)
+        await set_bot_commands(app, MODULES)
 
         runner = web.AppRunner(create_health_app())
         await runner.setup()
@@ -142,7 +172,8 @@ def main() -> None:
     app.post_init = post_init_callback
 
     async def post_shutdown(context) -> None:
-        await services.task_manager.stop()
+        if services.task_manager is not None:
+            await services.task_manager.stop()
 
     app.post_shutdown = post_shutdown
 
