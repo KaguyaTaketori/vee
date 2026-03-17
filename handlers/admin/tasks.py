@@ -1,8 +1,9 @@
 import logging
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
-from config import ADMIN_IDS
+from core.handler_registry import command_handler
 from services.container import services
 from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit
 from services.user_service import get_user_display_name
@@ -72,29 +73,31 @@ def _format_download_type(download_type: str, file_size: int | None = None) -> s
     return download_type
 
 
+@command_handler("queue", admin_only=True)
 @require_admin
 @require_message
 async def queue_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    active = services.queue.active_tasks
-    queued = services.queue.queue.qsize()
+    active = services.task_manager.get_all_active_tasks()
+    queued = services.task_manager.get_total_queued()
 
     msg = t("queue_title", user_id, active=len(active), queued=queued)
 
     if active:
         msg += "\n" + t("active_downloads", user_id) + "\n"
-        for tid, task in list(active.items())[:10]:
+        for task in list(active)[:10]:
             user_name = await get_user_display_name(task.user_id)
             status_emoji = {
                 "downloading": "⬇️",
-                "processing": "⚙️",
-                "uploading": "📤",
+                "processing":  "⚙️",
+                "uploading":   "📤",
             }.get(task.status.value, "⏳")
             msg += f"{status_emoji} {task.download_type} - {user_name}\n"
 
     await update.message.reply_text(msg)
 
 
+@command_handler("failed", admin_only=True)
 @require_admin
 @require_message
 async def failed_command(update: Update, context: CallbackContext):
@@ -116,11 +119,14 @@ async def failed_command(update: Update, context: CallbackContext):
         await update.message.reply_text(t("failed_for_user", user_id, target_id=target_id))
         return
 
-    msg = format_history_list(failed[:20], t("failed_title_simple", user_id, target_id=target_id) + "\n")
-
+    msg = format_history_list(
+        failed[:20],
+        t("failed_title_simple", user_id, target_id=target_id) + "\n",
+    )
     await update.message.reply_text(msg)
 
 
+@command_handler("cookie", admin_only=True)
 @require_admin
 @require_message
 async def cookie_command(update: Update, context: CallbackContext):
@@ -132,6 +138,8 @@ async def cookie_command(update: Update, context: CallbackContext):
 
 REFRESH_PAGE_SIZE = 5
 
+
+@command_handler("refresh", admin_only=True)
 @require_admin
 @require_message
 async def refresh_command(update: Update, context: CallbackContext):
@@ -148,7 +156,6 @@ async def refresh_command(update: Update, context: CallbackContext):
 
 
 async def _send_refresh_page(message_or_query, user_id: int, page: int, context):
-    from datetime import datetime
     records, total = await get_recent_cached_urls(
         limit=REFRESH_PAGE_SIZE,
         offset=page * REFRESH_PAGE_SIZE,
@@ -177,7 +184,7 @@ async def _send_refresh_page(message_or_query, user_id: int, page: int, context)
     num_buttons = [
         InlineKeyboardButton(
             str(base_index + i + 1),
-            callback_data=f"refresh_do_{user_id}_{i}"
+            callback_data=f"refresh_do_{user_id}_{i}",
         )
         for i in range(len(records))
     ]
@@ -198,16 +205,58 @@ async def _send_refresh_page(message_or_query, user_id: int, page: int, context)
         await message_or_query.edit_message_text(text, reply_markup=markup)
 
 
+@command_handler("admcancel", admin_only=True)
+@require_admin
+@require_message
+async def admin_cancel_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+
+    if not context.args:
+        active = list(services.task_manager.get_all_active_tasks())
+        queued_size = services.task_manager.get_total_queued()
+
+        if not active and queued_size == 0:
+            await update.message.reply_text(t("queue_empty_cn", user_id))
+            return
+
+        keyboard = []
+        for task in active:
+            short_url = task.url[:25] + "..." if len(task.url) > 25 else task.url
+            label = f"[{task.task_id}] UID:{task.user_id} {short_url}"
+            keyboard.append([
+                InlineKeyboardButton(
+                    t("btn_cancel_task", user_id, label=label),
+                    callback_data=f"cancel_task_{task.task_id}",
+                )
+            ])
+
+        keyboard.append([InlineKeyboardButton(t("btn_close", user_id), callback_data="cancel_menu_close")])
+
+        msg = t("admin_tasks_title", user_id, active=len(active), queued=queued_size)
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    task_id = context.args[0]
+    success = await services.task_manager.cancel_task(task_id)
+
+    if success:
+        await update.message.reply_text(t("task_cancel_confirm", user_id, task_id=task_id))
+    else:
+        await update.message.reply_text(t("task_cancel_error", user_id, task_id=task_id))
+
+
+@command_handler("rateinfo", admin_only=True)
 @require_admin
 @require_message
 async def rateinfo_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     status = services.limiter.get_status()
     status_text = "Enabled" if status["enabled"] else "Disabled"
-    msg = t("rateinfo_status", user_id, status=status_text, max=status['max_downloads_per_hour'], users=status['active_users'])
+    msg = t("rateinfo_status", user_id, status=status_text, max=status["max_downloads_per_hour"], users=status["active_users"])
     await update.message.reply_text(msg)
 
 
+@command_handler("setrate", admin_only=True)
 @require_admin
 @require_message
 async def setrate_command(update: Update, context: CallbackContext):
@@ -233,44 +282,6 @@ async def setrate_command(update: Update, context: CallbackContext):
     services.limiter.reload()
 
     status = "enabled" if enabled else "disabled"
-    await update.message.reply_text(t("rate_limit_updated_simple", user_id, max=max_per_hour, status=status))
-
-
-@require_admin
-@require_message
-async def admin_cancel_command(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-
-    if not context.args:
-        active = list(services.task_manager.get_all_active_tasks())
-        queued_size = services.queue.get_total_queued()
-
-        if not active and queued_size == 0:
-            await update.message.reply_text(t("queue_empty_cn", user_id))
-            return
-
-        keyboard = []
-        for task in active:
-            short_url = task.url[:25] + "..." if len(task.url) > 25 else task.url
-            label = f"[{task.task_id}] UID:{task.user_id} {short_url}"
-            keyboard.append([
-                InlineKeyboardButton(
-                    t("btn_cancel_task", user_id, label=label),
-                    callback_data=f"cancel_task_{task.task_id}"
-                )
-            ])
-
-        keyboard.append([InlineKeyboardButton(t("btn_close", user_id), callback_data="cancel_menu_close")])
-
-        msg = t("admin_tasks_title", user_id, active=len(active), queued=queued_size)
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    task_id = context.args[0]
-    success = await services.queue.cancel_task(task_id)
-
-    if success:
-        await update.message.reply_text(t("task_cancel_confirm", user_id, task_id=task_id))
-    else:
-        await update.message.reply_text(t("task_cancel_error", user_id, task_id=task_id))
-
+    await update.message.reply_text(
+        t("rate_limit_updated_simple", user_id, max=max_per_hour, status=status)
+    )

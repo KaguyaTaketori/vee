@@ -5,10 +5,11 @@ from telegram.ext import CallbackContext
 from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
 from config import ADMIN_IDS, RATE_TIER_LIMITS
+from core.handler_registry import command_handler
 from services.container import services
 from services.user_service import (
     get_allowed_users, save_allowed_users, get_all_users_info,
-    get_user_display_name, get_user_display_names_bulk
+    get_user_display_name, get_user_display_names_bulk,
 )
 from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit, set_user_tier
 from database.db import get_db
@@ -18,6 +19,7 @@ from utils.utils import require_admin, require_message, format_history_list
 logger = logging.getLogger(__name__)
 
 
+@command_handler("allow", admin_only=True)
 @require_admin
 @require_message
 async def allow_command(update: Update, context: CallbackContext):
@@ -39,6 +41,7 @@ async def allow_command(update: Update, context: CallbackContext):
     await update.message.reply_text(t("user_allowed", user_id, target_id=target_id))
 
 
+@command_handler("block", admin_only=True)
 @require_admin
 @require_message
 async def block_command(update: Update, context: CallbackContext):
@@ -60,6 +63,7 @@ async def block_command(update: Update, context: CallbackContext):
     await update.message.reply_text(t("user_blocked", user_id, target_id=target_id))
 
 
+@command_handler("users", admin_only=True)
 @require_admin
 @require_message
 async def users_command(update: Update, context: CallbackContext):
@@ -91,6 +95,7 @@ async def users_command(update: Update, context: CallbackContext):
     )
 
 
+@command_handler("broadcast", admin_only=True)
 @require_admin
 @require_message
 async def broadcast_command(update: Update, context: CallbackContext):
@@ -120,6 +125,7 @@ async def broadcast_command(update: Update, context: CallbackContext):
     )
 
 
+@command_handler("userhistory", admin_only=True)
 @require_admin
 @require_message
 async def userhistory_command(update: Update, context: CallbackContext):
@@ -137,10 +143,11 @@ async def userhistory_command(update: Update, context: CallbackContext):
     ]
     await update.message.reply_text(
         t("select_user_history", user_id),
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
+@command_handler("settier", admin_only=True)
 @require_admin
 @require_message
 async def settier_command(update: Update, context: CallbackContext):
@@ -160,66 +167,36 @@ async def settier_command(update: Update, context: CallbackContext):
 
         lines = [t("settier_list_title", user_id)]
         for r in rows:
-            limit_str = f"(自定义: {r[2]}/h)" if r[2] is not None else f"({RATE_TIER_LIMITS.get(r[1], '?')}/h)"
-            note_str  = f" — {r[3]}" if r[3] else ""
-            lines.append(f"  UID {r[0]}: [{r[1]}] {limit_str}{note_str}")
-
+            limit_str = (
+                f"(自定义: {r[2]}/h)" if r[2] is not None
+                else f"({RATE_TIER_LIMITS.get(r[1], '?')}/h)"
+            )
+            lines.append(f"• {r[0]} → {r[1]} {limit_str}")
         await update.message.reply_text("\n".join(lines))
-        return
-
-    if len(context.args) == 1:
-        try:
-            target_id = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text(t("settier_invalid_id", user_id))
-            return
-
-        tier      = await get_user_tier(target_id)
-        limit     = await get_user_limit(target_id)
-        remaining = await services.limiter.get_remaining(target_id)
-        await update.message.reply_text(
-            t("settier_info", user_id, target_id=target_id, tier=tier, limit=limit, remaining=remaining)
-        )
         return
 
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text(t("settier_invalid_id", user_id))
+        await update.message.reply_text(t("invalid_user_id", user_id))
         return
 
-    tier_arg = context.args[1].lower()
+    tier = context.args[1] if len(context.args) > 1 else None
+    if not tier or tier not in VALID_TIERS:
+        await update.message.reply_text(
+            t("settier_usage", user_id, tiers=", ".join(VALID_TIERS))
+        )
+        return
 
-    if tier_arg == "custom":
-        if len(context.args) < 3:
-            await update.message.reply_text(t("settier_usage", user_id))
-            return
+    custom_limit = None
+    if len(context.args) > 2:
         try:
-            custom_max = int(context.args[2])
-            if custom_max < 0 or custom_max > 10000:
-                raise ValueError
+            custom_limit = int(context.args[2])
         except ValueError:
-            await update.message.reply_text(t("settier_custom_invalid", user_id))
-            return
+            pass
 
-        note = " ".join(context.args[3:]) if len(context.args) > 3 else ""
-        await set_user_tier(target_id, "custom", note=note,
-                            set_by=update.message.from_user.id, custom_max=custom_max)
-        await update.message.reply_text(
-            t("settier_custom_set", user_id, target_id=target_id, max=custom_max)
-        )
-
-    elif tier_arg in VALID_TIERS:
-        note = " ".join(context.args[2:]) if len(context.args) > 2 else ""
-        await set_user_tier(target_id, tier_arg, note=note,
-                            set_by=update.message.from_user.id)
-        tier_limit = RATE_TIER_LIMITS[tier_arg]
-        await update.message.reply_text(
-            t("settier_tier_set", user_id, target_id=target_id, tier=tier_arg, limit=tier_limit)
-        )
-    else:
-        options = " | ".join(VALID_TIERS) + " | custom <数值>"
-        await update.message.reply_text(
-            t("settier_invalid_tier", user_id, tier=tier_arg, options=options)
-        )
-
+    await set_user_tier(target_id, tier, custom_limit)
+    limit = custom_limit if custom_limit is not None else RATE_TIER_LIMITS.get(tier, "?")
+    await update.message.reply_text(
+        t("settier_updated", user_id, target_id=target_id, tier=tier, limit=limit)
+    )

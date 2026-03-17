@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from .base import DownloadStrategy
+from .base import TaskStrategy
 from .sender import BotSender
 from integrations.downloaders import ytdlp_client
 from utils.i18n import t
@@ -10,10 +10,10 @@ from utils.i18n import t
 logger = logging.getLogger(__name__)
 
 
-class VideoStrategy(DownloadStrategy):
+class VideoStrategy(TaskStrategy):
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return "video"
 
     async def _send_from_file_id(
@@ -39,7 +39,7 @@ class VideoStrategy(DownloadStrategy):
         logger.info("Video upload completed")
         return file_id
 
-    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+    async def _do_execute(self, url: str, progress_hook) -> tuple[str, dict]:
         return await ytdlp_client.download_video(url, "best", progress_hook)
 
 
@@ -51,8 +51,8 @@ class VideoFormatStrategy(VideoStrategy):
         super().__init__()
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return f"video_{self._format_id}"
 
-    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+    async def _do_execute(self, url: str, progress_hook) -> tuple[str, dict]:
         return await ytdlp_client.download_video(url, self._format_id, progress_hook)

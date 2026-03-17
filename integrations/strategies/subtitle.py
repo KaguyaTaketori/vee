@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import logging
 
-from .base import DownloadStrategy
+from .base import TaskStrategy
 from .sender import BotSender
 from integrations.downloaders import ytdlp_client
 
 logger = logging.getLogger(__name__)
 
 
-class SubtitleStrategy(DownloadStrategy):
+class SubtitleStrategy(TaskStrategy):
 
     SUPPORTED_LANGS = ["zh-Hans", "zh-Hant", "zh", "en", "ja", "ko"]
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return "subtitle"
 
     def _get_caption(self, title: str, emoji: str = "📝") -> str | None:
@@ -38,7 +38,7 @@ class SubtitleStrategy(DownloadStrategy):
             file_id = await sender.send_document(f, caption=caption)
         return file_id
 
-    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+    async def _do_execute(self, url: str, progress_hook) -> tuple[str, dict]:
         return await ytdlp_client.download_subtitle(
             url, preferred_langs=self.SUPPORTED_LANGS
         )

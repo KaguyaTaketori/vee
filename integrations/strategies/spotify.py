@@ -12,8 +12,8 @@ class SpotifyStrategy(AudioStrategy):
     """AudioStrategy variant that routes to the Spotify downloader."""
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return "spotify"
 
-    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+    async def _do_execute(self, url: str, progress_hook) -> tuple[str, dict]:
         return await download_spotify(url, progress_hook=progress_hook)

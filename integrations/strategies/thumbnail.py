@@ -4,23 +4,23 @@ import logging
 
 from database.history import add_history, get_file_id_by_url
 from utils.i18n import t
-from .base import DownloadStrategy
+from .base import TaskStrategy
 from .sender import BotSender
 from integrations.downloaders import ytdlp_client
 
 logger = logging.getLogger(__name__)
 
 
-class ThumbnailStrategy(DownloadStrategy):
+class ThumbnailStrategy(TaskStrategy):
     """Downloads a video thumbnail and sends it as a photo.
 
-    Thumbnails are special: _do_download returns a *URL* rather than a local
+    Thumbnails are special: _do_execute returns a *URL* rather than a local
     file path (the image stays remote; Telegram fetches it directly).  This
     is why we override execute() — the base class assumes a local file.
     """
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return "thumbnail"
 
     def _get_caption(self, title: str, emoji: str = "🖼️") -> str | None:
@@ -42,7 +42,7 @@ class ThumbnailStrategy(DownloadStrategy):
     ) -> str | None:
         return await sender.send_photo(filename, caption=caption)
 
-    async def _do_download(
+    async def _do_execute(
         self, url: str, progress_hook
     ) -> tuple[str, dict]:
         thumbnail_url, info = await ytdlp_client.get_thumbnail(url)
@@ -57,12 +57,10 @@ class ThumbnailStrategy(DownloadStrategy):
 
         await sender.edit_status(t("downloading", user_id))
         try:
-            thumbnail_url, info = await self._do_download(url, None)
+            thumbnail_url, info = await self._do_execute(url, None)
         except Exception as exc:
             logger.error("Thumbnail fetch failed: %s", exc)
-            await sender.edit_status(
-                t("download_failed", user_id, error=str(exc))
-            )
+            await sender.edit_status(t("download_failed", user_id))
             return
 
         title = info.get("title") if info else None
@@ -70,10 +68,7 @@ class ThumbnailStrategy(DownloadStrategy):
 
         await sender.edit_status(t("uploading", user_id))
         try:
-            # Re-use cached file_id if we have one, otherwise send the URL
-            existing_id = await get_file_id_by_url(
-                url, download_type=self.download_type
-            )
+            existing_id = await get_file_id_by_url(url, download_type=self.task_type)
             if existing_id:
                 await self._send_from_file_id(sender, existing_id, caption)
                 file_id = existing_id
@@ -81,10 +76,10 @@ class ThumbnailStrategy(DownloadStrategy):
                 file_id = await self._upload_new_file(sender, thumbnail_url, caption)
 
             sender.log_download(
-                f"{self.download_type}_downloaded", url, "success", 0
+                f"{self.task_type}_downloaded", url, "success", 0
             )
             await add_history(
-                user_id, url, self.download_type,
+                user_id, url, self.task_type,
                 0, title, "success", thumbnail_url, file_id,
             )
         except Exception as exc:
@@ -92,9 +87,9 @@ class ThumbnailStrategy(DownloadStrategy):
                 t("upload_failed", user_id, error=str(exc))
             )
             sender.log_download(
-                f"{self.download_type}_downloaded", url,
+                f"{self.task_type}_downloaded", url,
                 f"upload_failed: {exc}",
             )
             await add_history(
-                user_id, url, self.download_type, 0, title, "failed"
+                user_id, url, self.task_type, 0, title, "failed"
             )

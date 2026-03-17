@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import logging
 
-from .base import DownloadStrategy
+from .base import TaskStrategy
 from .sender import BotSender
 from integrations.downloaders import ytdlp_client
 from utils.i18n import t
@@ -11,10 +11,10 @@ from utils.i18n import t
 logger = logging.getLogger(__name__)
 
 
-class AudioStrategy(DownloadStrategy):
+class AudioStrategy(TaskStrategy):
 
     @property
-    def download_type(self) -> str:
+    def task_type(self) -> str:
         return "audio"
 
     def _get_caption(self, title: str, emoji: str = "🎵") -> str | None:
@@ -44,5 +44,5 @@ class AudioStrategy(DownloadStrategy):
         logger.info("Audio upload completed")
         return file_id
 
-    async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
+    async def _do_execute(self, url: str, progress_hook) -> tuple[str, dict]:
         return await ytdlp_client.download_audio(url, progress_hook)

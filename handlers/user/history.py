@@ -2,6 +2,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
+from core.handler_registry import command_handler
 from services.container import services
 from models.domain_models import STATUS_EMOJI, DownloadStatus
 from utils.i18n import t
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 5
 
 
+@command_handler("history")
 @require_message
 async def history_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
@@ -46,6 +48,7 @@ async def _send_history_page(message_or_query, user_id: int, page: int):
         await message_or_query.edit_message_text(text, reply_markup=markup)
 
 
+@command_handler("tasks")
 @require_message
 async def tasks_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
@@ -67,11 +70,12 @@ async def tasks_command(update: Update, context: CallbackContext):
     await update.message.reply_text("\n".join(lines))
 
 
+@command_handler("cancel")
 @require_message
 async def cancel_command(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
 
-    user_tasks = services.queue.get_user_tasks(user_id)
+    user_tasks = services.task_manager.get_user_tasks(user_id)
     active = [
         task for task in user_tasks
         if task.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.PROCESSING)
@@ -98,6 +102,5 @@ async def cancel_command(update: Update, context: CallbackContext):
 
     await update.message.reply_text(
         t("select_cancel_task", user_id),
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-

@@ -2,12 +2,13 @@ import logging
 import psutil
 import config as cfg
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import CallbackContext
 from config import get_config, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES, save_disk_config, reload_disk_config
 from core import jobs as core_jobs
+from core.handler_registry import command_handler
 from services.container import services
-from services.user_service import cleanup_temp_files, get_user_display_name
+from services.user_service import cleanup_temp_files
 from services.analytics import get_daily_stats, format_daily_report, get_bot_stats
 from utils.i18n import t
 from utils.utils import require_admin, require_message, scan_temp_files, format_bytes
@@ -15,6 +16,7 @@ from utils.utils import require_admin, require_message, scan_temp_files, format_
 logger = logging.getLogger(__name__)
 
 
+@command_handler("stats", admin_only=True)
 @require_admin
 @require_message
 async def stats_command(update: Update, context: CallbackContext):
@@ -22,6 +24,7 @@ async def stats_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@command_handler("status", admin_only=True)
 @require_admin
 @require_message
 async def status_command(update: Update, context: CallbackContext):
@@ -44,10 +47,11 @@ async def status_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
+@command_handler("storage", admin_only=True)
 @require_admin
 @require_message
 async def storage_command(update: Update, context: CallbackContext):
-    from config import disk_config  # runtime threshold (updated by /setdisk)
+    from config import disk_config
     disk = psutil.disk_usage("/")
     disk_percent = disk.percent
     total, used, free = disk.total, disk.used, disk.free
@@ -81,6 +85,7 @@ async def storage_command(update: Update, context: CallbackContext):
     await update.message.reply_text("\n".join(lines))
 
 
+@command_handler("setdisk", admin_only=True)
 @require_admin
 @require_message
 async def setdisk_command(update: Update, context: CallbackContext):
@@ -111,6 +116,7 @@ async def setdisk_command(update: Update, context: CallbackContext):
     )
 
 
+@command_handler("cleanup", admin_only=True)
 @require_admin
 @require_message
 async def cleanup_command(update: Update, context: CallbackContext):
@@ -119,6 +125,7 @@ async def cleanup_command(update: Update, context: CallbackContext):
     await update.message.reply_text(t("temp_cleaned", user_id))
 
 
+@command_handler("report", admin_only=True)
 @require_admin
 @require_message
 async def report_command(update: Update, context: CallbackContext):
@@ -132,4 +139,3 @@ async def report_command(update: Update, context: CallbackContext):
     stats = await get_daily_stats(days=days)
     period = f"近 {days} 天" if days > 1 else "今日"
     await update.message.reply_text(format_daily_report(stats, period=period))
-
