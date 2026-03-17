@@ -126,16 +126,6 @@ async def failed_command(update: Update, context: CallbackContext):
     await update.message.reply_text(msg)
 
 
-@command_handler("cookie", admin_only=True)
-@require_admin
-@require_message
-async def cookie_command(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    await update.message.reply_text(
-        t("cookie_instruction_title", user_id) + "\n\n" + t("cookie_instruction_steps", user_id)
-    )
-
-
 REFRESH_PAGE_SIZE = 5
 
 

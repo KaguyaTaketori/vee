@@ -9,7 +9,7 @@ from aiohttp import web
 from config import (
     TOKEN, BOT_API_URL, LOCAL_MODE,
     CLEANUP_INTERVAL_HOURS, DISK_CHECK_INTERVAL_MINUTES,
-    init_config,
+    init_config, ADMIN_IDS,
 )
 from services.task_manager import TaskManager, IO_CHANNEL
 from services.event_bus import bus
@@ -17,6 +17,7 @@ from repositories import TaskRepository
 from services.container import services
 from services.ratelimit import RateLimiter
 from services.facades import _execute_download_task
+from services.notifier import TelegramAdminNotifier
 from models.domain_models import DownloadStatus
 from utils.logger import setup_logging
 from database.db import init_db
@@ -26,14 +27,16 @@ from core.health import create_health_app
 from core.filters import CookieFilter
 from core.jobs import cleanup_job, storage_alert_job, daily_report_job
 from core.bot_setup import set_bot_commands
-from core.cookies import handle_cookie_file
 from core.handler_registry import registry
+from handlers.admin.cookies import handle_cookie_file
+from integrations.ptb_adapter import PtbCommandRegistrar
 
 import handlers.user.basic
 import handlers.user.history
 import handlers.admin.system
 import handlers.admin.users
 import handlers.admin.tasks
+import handlers.admin.cookies
 
 from handlers.downloads.message_parser import handle_link
 from handlers.downloads.inline_actions import handle_callback
@@ -42,32 +45,41 @@ logger = logging.getLogger(__name__)
 
 
 def register_all_handlers(app: Application) -> None:
-    registry.apply(app)
+    from config import ADMIN_IDS
+    registry.apply(PtbCommandRegistrar(app, admin_ids=frozenset(ADMIN_IDS)))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
 
 
+class _NotifierProxy:
+    async def notify_admins(self, message: str, parse_mode=None) -> None:
+        await services.notifier.notify_admins(message, parse_mode)
+
+_notifier_proxy = _NotifierProxy()
+
 def register_jobs(app: Application) -> None:
+    job_data = {"notifier": _notifier_proxy}
+    
     if CLEANUP_INTERVAL_HOURS > 0:
-        app.job_queue.run_repeating(
-            cleanup_job,
-            interval=CLEANUP_INTERVAL_HOURS * 3600,
-            first=60,
-        )
+        app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_HOURS * 3600, first=60,)
+
     if DISK_CHECK_INTERVAL_MINUTES > 0:
         app.job_queue.run_repeating(
             storage_alert_job,
             interval=DISK_CHECK_INTERVAL_MINUTES * 60,
             first=300,
             name="storage_alert",
+            data=job_data,
         )
+
     tz = pytz.timezone("Asia/Shanghai")
     app.job_queue.run_daily(
         daily_report_job,
         time=dt_time(hour=9, minute=0, tzinfo=tz),
         name="daily_report",
+        data=job_data,
     )
 
 
@@ -110,6 +122,7 @@ def main() -> None:
             api_workers=5,
         )
         services.limiter = RateLimiter()
+        services.notifier = TelegramAdminNotifier(app.bot, list(ADMIN_IDS))
         services.task_manager.set_executor(_execute_download_task, IO_CHANNEL)
         await services.task_manager.start()
 
