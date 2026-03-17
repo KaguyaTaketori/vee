@@ -34,9 +34,22 @@ def _make_progress_hook(processing_msg, loop: asyncio.AbstractEventLoop):
         status = d.get("status")
 
         if status == "downloading" and "downloaded_bytes" in d:
-            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-            downloaded = d.get("downloaded_bytes", 0)
-            speed = d.get("speed", 0)
+            try:
+                total = float(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+            except (TypeError, ValueError):
+                total = 0.0
+            try:
+                downloaded = float(d.get("downloaded_bytes") or 0)
+            except (TypeError, ValueError):
+                downloaded = 0.0
+
+            if not isinstance(total, (int, float)) or not isinstance(downloaded, (int, float)):
+                return
+            try:
+                raw_speed = d.get("speed")
+                speed = float(raw_speed) if isinstance(raw_speed, (int, float)) else 0.0
+            except (TypeError, ValueError):
+                speed = 0.0
 
             if total > tracker.max_total:
                 tracker.max_total = total

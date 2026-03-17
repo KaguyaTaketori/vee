@@ -149,6 +149,14 @@ class DownloadQueue:
     def get_active_count(self) -> int:
         return len(self.active_tasks)
 
+    def get_all_active_tasks(self) -> list[DownloadTask]:
+        """Return all currently active tasks across all channels."""
+        tasks = []
+        for queue in self._channels.values():
+            tasks.extend(queue.active_tasks.values())
+        return sorted(tasks, key=lambda t: t.created_at)
+
+
     # ------------------------------------------------------------------
     # Cancellation
     # ------------------------------------------------------------------
@@ -259,7 +267,6 @@ class DownloadQueue:
         task.started_at = time.time()
         self.active_tasks[task.task_id] = task
 
-        # Emit "task_started" so listeners can persist the in-progress state.
         bus.emit("task_started", task)
 
         user_pending = self._pending_user_tasks.get(task.user_id, [])
@@ -284,13 +291,14 @@ class DownloadQueue:
 
                 ctx = self.get_task_context(task.task_id)
                 if ctx:
-                    try:
-                        await ctx["processing_msg"].edit_text(
-                            f"🔄 Retrying… (attempt {attempt}/{task.max_retries})"
-                        )
-                    except Exception:
-                        pass
-
+                    sender = ctx.get("sender")
+                    if sender:
+                        try:
+                            await sender.edit_status(
+                                f"🔄 Retrying… (attempt {attempt}/{task.max_retries})"
+                            )
+                        except Exception:
+                            pass
             try:
                 await self._executor(task)
                 if task.status not in (
@@ -326,7 +334,3 @@ class DownloadQueue:
         )
 
 
-# ---------------------------------------------------------------------------
-# NOTE: The singleton previously lived here. It is now created inside
-# TaskManager (services/task_manager.py) and exposed via services.task_manager.
-# ---------------------------------------------------------------------------

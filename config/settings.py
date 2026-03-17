@@ -5,10 +5,19 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+def _parse_size(val: str) -> int:
+    val = val.strip().upper()
+    units = {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    for suffix, mult in units.items():
+        if val.endswith(suffix):
+            return int(float(val[:-len(suffix)]) * mult)
+    return int(val)
+
+
 TOKEN: str | None    = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_PATH: str         = os.getenv("DB_PATH", os.path.join(BASE_DIR, "bot_data.db"))
-MAX_FILE_SIZE: int   = int(os.getenv("MAX_FILE_SIZE",  2 * 1024 * 1024 * 1024))
-MAX_CACHE_SIZE: int  = int(os.getenv("MAX_CACHE_SIZE", 500 * 1024 * 1024))
+MAX_FILE_SIZE: int = _parse_size(os.getenv("MAX_FILE_SIZE", str(2 * 1024 * 1024 * 1024)))
+MAX_CACHE_SIZE: int = _parse_size(os.getenv("MAX_CACHE_SIZE", str(500 * 1024 * 1024)))
 BOT_API_URL: str     = os.getenv("BOT_API_URL", "http://127.0.0.1:8082/bot")
 LOCAL_MODE: bool     = os.getenv("LOCAL_MODE", "true").lower() == "true"
 COOKIE_FILE: str     = os.getenv("COOKIE_FILE", "")

@@ -71,8 +71,12 @@ class TaskStrategy(ABC):
         self, filename: str, sender: BotSender
     ) -> bool:
         """Return False (and clean up) if the file exceeds MAX_FILE_SIZE."""
+        if not filename or not os.path.isfile(filename):
+            return True
         file_size = os.path.getsize(filename)
-        if file_size > MAX_FILE_SIZE:
+        file_size = int(os.path.getsize(filename))
+        max_size = int(MAX_FILE_SIZE)
+        if file_size > max_size:
             await sender.edit_status(
                 t("file_too_large", sender.user_id,
                   size=f"{file_size // (1024 * 1024)}MB")
@@ -134,9 +138,13 @@ class TaskStrategy(ABC):
             return file_id
         new_id = await self._upload_new_file(sender, filename, caption)
         if new_id:
+            try:
+                file_size = int(os.path.getsize(filename)) if os.path.exists(filename) else 0
+            except (OSError, TypeError, ValueError):
+                file_size = 0
             await add_history(
                 sender.user_id, url, self.task_type,
-                os.path.getsize(filename) if os.path.exists(filename) else 0,
+                file_size,
                 caption, "success", filename, new_id,
             )
         return new_id
@@ -147,7 +155,13 @@ class TaskStrategy(ABC):
         await sender.edit_status(t("processing", user_id))
 
         cached_file = await self._check_cached_file(url, user_id)
-        progress_hook = None  # injected by caller if needed
+        loop = asyncio.get_event_loop()
+        processing_msg = getattr(sender, '_processing_msg', None)
+        if processing_msg:
+            from utils.download_tracker import _make_progress_hook
+            progress_hook = _make_progress_hook(processing_msg, loop)
+        else:
+            progress_hook = None
 
         if cached_file:
             filename, info = cached_file, {}
@@ -156,7 +170,7 @@ class TaskStrategy(ABC):
                 filename, info = await self._do_execute(url, progress_hook)
             except Exception as exc:
                 logger.error("Task execution failed (%s): %s", self.task_type, exc)
-                await sender.edit_status(t("download_failed", user_id))
+                await sender.edit_status(t("download_failed", user_id, error=str(exc)))
                 raise
 
         if not await self._validate_file_size(filename, sender):
@@ -171,12 +185,10 @@ class TaskStrategy(ABC):
         except Exception as exc:
             logger.error("Upload failed: %s", exc)
             await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+            exc._status_already_edited = True
             raise
         finally:
             self._cleanup_temp_file(filename, cached_file)
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat alias — 允许旧代码 `from .base import DownloadStrategy` 不崩
-# ---------------------------------------------------------------------------
 DownloadStrategy = TaskStrategy

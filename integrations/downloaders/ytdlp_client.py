@@ -205,40 +205,6 @@ async def download_video(url: str, format_id: str, progress_hook=None) -> tuple[
     return await loop.run_in_executor(None, _download)
 
 
-async def download_subtitle(url: str, preferred_langs: list[str] | None = None) -> tuple[str, dict]:
-    url = await YtDlpHelper.prepare_url(url)
-    loop = _get_running_loop()
-
-    def _download():
-        helper = YtDlpHelper(url)
-        ydl_opts = helper.get_opts()
-        ydl_opts.update({
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitlesformat": "srt/vtt/best",
-            "outtmpl": get_temp_template(),
-        })
-
-        if preferred_langs:
-            ydl_opts["subtitleslangs"] = preferred_langs
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "subtitle")
-
-        for ext in ("srt", "vtt", "ass"):
-            for fname in os.listdir(TEMP_DIR):
-                if fname.startswith(BOT_FILE_PREFIX) and fname.endswith(f".{ext}"):
-                    full_path = os.path.join(TEMP_DIR, fname)
-                    if time.time() - os.path.getmtime(full_path) < 60:
-                        return full_path, info
-
-        raise RuntimeError("No subtitle file found. The video may not have subtitles.")
-
-    return await loop.run_in_executor(None, _download)
-
-
 @_in_executor
 def download_audio(url: str, progress_hook=None) -> tuple[str, dict]:
     helper = YtDlpHelper(url)

@@ -27,15 +27,13 @@ from core.filters import CookieFilter
 from core.jobs import cleanup_job, storage_alert_job, daily_report_job
 from core.bot_setup import set_bot_commands
 from core.cookies import handle_cookie_file
-from core.handler_registry import registry  # ← 唯一需要的 handler 导入
+from core.handler_registry import registry
 
-# ── 触发所有 handler 模块的 import，让 @command_handler 装饰器执行注册 ──────
-import handlers.user.basic        # noqa: F401
-import handlers.user.history      # noqa: F401
-import handlers.admin.system      # noqa: F401
-import handlers.admin.users       # noqa: F401
-import handlers.admin.tasks       # noqa: F401
-# ─────────────────────────────────────────────────────────────────────────────
+import handlers.user.basic
+import handlers.user.history
+import handlers.admin.system
+import handlers.admin.users
+import handlers.admin.tasks
 
 from handlers.downloads.message_parser import handle_link
 from handlers.downloads.inline_actions import handle_callback
@@ -44,10 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 def register_all_handlers(app: Application) -> None:
-    # 所有命令 handler：一行搞定
     registry.apply(app)
 
-    # 非命令 handler（无法用装饰器声明，保留在此）
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
