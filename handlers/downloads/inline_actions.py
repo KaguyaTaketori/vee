@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import logging
 from telegram import Update
 from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
+
+from integrations.strategies.sender import TelegramSender
+from services.facades import DownloadFacade
+from services.middleware import RequestContext, default_pipeline
 from services.container import services
 from services.user_service import set_user_language, warm_user_lang
 from database.history import get_user_history, clear_file_id_by_url
@@ -78,23 +84,54 @@ async def _cb_download_video(query, context):
 
 
 @register(lambda d: d.startswith("quality_") or d in ("download_audio", "download_thumbnail", "download_subtitle"))
-async def _cb_download(query, context):
+async def _cb_download(query, context: CallbackContext) -> None:
+    """处理 quality_* / download_audio / download_thumbnail / download_subtitle。
+
+    步骤：
+        1. 取出 session URL
+        2. Pipeline 过滤（Auth + RateLimit）
+        3. 将 query / processing_msg 包装为 TelegramSender（唯一 Telegram 接触点）
+        4. 调用 DownloadFacade.process_download_request(sender, ...)
+    """
     user_id = query.from_user.id
+
+    # ── 1. Session ──────────────────────────────────────────────────────────
     url = UserSession.get_pending_url(context, user_id)
     if not url:
         await query.edit_message_text(t("session_expired", user_id))
         return
+
+    # ── 2. Pipeline 过滤 ────────────────────────────────────────────────────
+    async def _reply(text: str) -> None:
+        try:
+            await query.edit_message_text(text)
+        except Exception:
+            pass
+
+    pipeline_ctx = RequestContext(user=query.from_user, reply=_reply)
+    result = await default_pipeline.run(pipeline_ctx)
+    if not result.ok:
+        await _reply(t(result.error_key, user_id))
+        return
+
+    # ── 3. 包装 processing_msg，构建 TelegramSender ─────────────────────────
     try:
         processing_msg = await query.edit_message_text(t("processing", user_id))
     except Exception:
         processing_msg = query.message
-    from services.facades import DownloadFacade
+
+    sender = TelegramSender(query=query, processing_msg=processing_msg)
+
+    # ── 4. 委派给 Facade（Facade 不知道任何 Telegram 细节）─────────────────
     success, error_key = await DownloadFacade.process_download_request(
-        query, url, query.data, context, processing_msg
+        sender=sender,
+        url=url,
+        callback_data=query.data,
+        context=context,
     )
     if not success:
         try:
-            await processing_msg.edit_text(t(error_key, user_id))
+            await sender.edit_status(t(error_key, user_id))
         except Exception:
             pass
 

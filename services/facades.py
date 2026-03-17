@@ -1,3 +1,34 @@
+"""
+services/facades.py
+────────────────────
+Download 业务门面层。
+
+变更摘要
+--------
+1. **TelegramSender 不再在此处实例化**。
+   Handler 层（message_parser / inline_actions）在收到 Telegram 消息时
+   立刻将 update.message / query 包装为 TelegramSender，然后把这个
+   实现了 BotSender 协议的对象传进来。
+
+   旧代码：_execute_download_task() 从 task_ctx["query"] / ["processing_msg"]
+           硬编码地调用 TelegramSender(query, processing_msg)。
+   新代码：_execute_download_task() 直接从 task_ctx["sender"] 取出 BotSender，
+           不知道也不关心它是 TelegramSender 还是未来的 DiscordSender。
+
+2. **process_download_request 不再做 Auth / RateLimit 检查**。
+   这两个关卡已由 Handler 层的 ``default_pipeline.run()`` 统一处理。
+   Facade 只负责「策略映射 → 入队 → 状态反馈」纯业务逻辑。
+
+3. **enqueue_silent 签名变更**：
+   旧：enqueue_silent(user, url, download_type, status_msg, context)
+   新：enqueue_silent(sender: BotSender, url, download_type, context)
+   Sender 由 Handler 层构造并传入，Facade 不再持有任何 Telegram 对象。
+
+4. **task_ctx 结构简化**：
+   只保留 {"sender": BotSender}，消除了 "query" / "processing_msg" 两个
+   Telegram 专属字段。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,36 +37,33 @@ import traceback
 import uuid
 
 from integrations.strategies.factory import StrategyFactory
-from integrations.strategies.sender import TelegramSender
+
+# BotSender 是协议类型，仅用于类型注解；不引用任何 Telegram 实现
+from integrations.strategies.sender import BotSender
+
 from models.domain_models import DownloadStatus, DownloadTask
 from services.container import services
-from services.query_adapters import SilentMessageQuery
 from utils.i18n import t
 from utils.logger import log_user
-from utils.utils import is_user_allowed
 from integrations.downloaders.ytdlp_client import is_spotify_url
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Queue executor
+# Queue executor（内部，由 TaskManager worker 调用）
 # ---------------------------------------------------------------------------
 
 async def _execute_download_task(task: DownloadTask) -> None:
-    """Called by the queue worker for each task.
+    """队列 worker 的执行入口。
 
-    Builds a TelegramSender from the stored task context, then delegates
-    execution to the appropriate strategy.  The strategy receives only a
-    BotSender — it never touches Telegram objects directly.
+    从 task_ctx 取出 BotSender，委派给对应 Strategy 执行。
+    Strategy 只调用 sender.send_*/edit_status() 等平台无关接口。
     """
-    user_id = task.user_id
-    url = task.url
-
     strategy = StrategyFactory.get(task.download_type)
     if not strategy:
         task.status = DownloadStatus.FAILED
-        task.error = f"No strategy found: {task.download_type}"
+        task.error  = f"No strategy found: {task.download_type}"
         return
 
     task.status = DownloadStatus.PROCESSING
@@ -43,19 +71,15 @@ async def _execute_download_task(task: DownloadTask) -> None:
     ctx = services.queue.get_task_context(task.task_id)
     if not ctx:
         task.status = DownloadStatus.FAILED
-        task.error = "Task context missing"
+        task.error  = "Task context missing"
         return
 
-    processing_msg = ctx["processing_msg"]
-    query = ctx["query"]
+    # ── Sender 直接从 ctx 取出，不再硬编码 TelegramSender ─────────────────
+    sender: BotSender = ctx["sender"]
 
-    # ── Build the platform sender here, not inside the strategy ──────────────
-    sender = TelegramSender(query, processing_msg)
-
-    cancel_event = services.queue.get_cancel_event(task.task_id)
-
-    strategy_future = asyncio.ensure_future(strategy.execute(sender, url))
-    cancel_future = (
+    cancel_event    = services.queue.get_cancel_event(task.task_id)
+    strategy_future = asyncio.ensure_future(strategy.execute(sender, task.url))
+    cancel_future   = (
         asyncio.ensure_future(cancel_event.wait())
         if cancel_event
         else asyncio.ensure_future(asyncio.sleep(float("inf")))
@@ -70,9 +94,9 @@ async def _execute_download_task(task: DownloadTask) -> None:
         strategy_future.cancel()
         cancel_future.cancel()
         task.status = DownloadStatus.CANCELLED
-        task.error = "Queue stopped"
+        task.error  = "Queue stopped"
         try:
-            await processing_msg.edit_text(t("bot_shutting_down", task.user_id))
+            await sender.edit_status(t("bot_shutting_down", task.user_id))
         except Exception:
             pass
         return
@@ -86,22 +110,20 @@ async def _execute_download_task(task: DownloadTask) -> None:
 
     if cancel_future in done:
         task.status = DownloadStatus.CANCELLED
-        logger.info("Task %s cancelled by user %s", task.task_id, user_id)
+        logger.info("Task %s cancelled by user %s", task.task_id, task.user_id)
         try:
-            await processing_msg.edit_text(t("download_cancelled", task.user_id))
+            await sender.edit_status(t("download_cancelled", task.user_id))
         except Exception:
             pass
 
     elif strategy_future in done:
         exc = strategy_future.exception()
         if exc:
-            logger.error(
-                "Strategy execution failed: %s: %s", type(exc).__name__, exc
-            )
+            logger.error("Strategy execution failed: %s: %s", type(exc).__name__, exc)
             task.status = DownloadStatus.FAILED
-            task.error = str(exc)
+            task.error  = str(exc)
             try:
-                await processing_msg.edit_text(t("download_failed", user_id))
+                await sender.edit_status(t("download_failed", task.user_id))
             except Exception:
                 pass
         else:
@@ -114,39 +136,52 @@ async def _execute_download_task(task: DownloadTask) -> None:
 # ---------------------------------------------------------------------------
 
 class DownloadFacade:
-    """Orchestrates the download flow with auth, rate-limiting, and queuing.
+    """统一的下载业务门面。
 
-    The handler layer calls process_download_request() or enqueue_silent().
-    Both store the Telegram objects in the queue context dict; the actual
-    TelegramSender is created in _execute_download_task() above, so
-    strategies are never aware of which platform they are running on.
+    Handler 层负责：
+        - 鉴权 / 限流（通过 Pipeline）
+        - 包装 TelegramSender
+
+    Facade 负责：
+        - 策略映射
+        - 任务入队
+        - 队列状态回显
+
+    两层之间通过 ``BotSender`` 协议解耦，Facade 不知道也不关心
+    底层是 Telegram、Discord 还是测试用的 MockSender。
     """
 
     @staticmethod
     async def process_download_request(
-        query,
+        sender: BotSender,
         url: str,
         callback_data: str,
         context,
-        processing_msg,
     ) -> tuple[bool, str | None]:
-        """Validate, queue, and acknowledge a download request.
+        """验证、入队、反馈。
 
-        Returns (True, None) on success, or (False, i18n_error_key) on failure.
+        Parameters
+        ----------
+        sender:
+            由 Handler 层构造好的 BotSender（已绑定 processing_msg）。
+        url:
+            待下载的 URL。
+        callback_data:
+            用户点击的 InlineKeyboard 按钮数据，用于映射 Strategy。
+        context:
+            python-telegram-bot 的 CallbackContext（仅用于日志）。
+
+        Returns
+        -------
+        (True, None)        — 成功入队
+        (False, error_key)  — 失败，附带 i18n key
         """
-        user = query.from_user
-        user_id = user.id
+        user_id = sender.user_id
 
-        if not is_user_allowed(user_id):
-            logger.warning("Unauthorized user %s attempted to download %s", user_id, url)
-            return False, "unauthorized"
-
-        can_download, rate_limit_msg = await services.limiter.check_limit(user_id)
-        if not can_download:
-            logger.warning("User %s blocked by rate limit: %s", user_id, rate_limit_msg)
-            return False, "rate_limit_exceeded"
-
-        log_user(user, f"download_request:{callback_data}")
+        # Auth / RateLimit 已在 Handler 层的 Pipeline 中完成，此处不重复。
+        log_user_obj = getattr(sender, "_query", None)
+        if log_user_obj:
+            log_user(log_user_obj.from_user, f"download_request:{callback_data}")
 
         strategy_key = DownloadFacade._map_callback_to_strategy(callback_data, url)
         if not strategy_key:
@@ -166,24 +201,17 @@ class DownloadFacade:
                 download_type=strategy_key,
             )
 
-            # Store platform-specific objects in the queue context.
-            # _execute_download_task() will wrap them in a TelegramSender.
-            task_ctx = {
-                "query": query,
-                "processing_msg": processing_msg,
-                "context": context,
-            }
+            # ── 只存 sender，Queue / Worker 不再需要知道 Telegram 的存在 ──
+            task_ctx = {"sender": sender, "context": context}
             await services.queue.add_task(task, task_ctx)
 
             position = services.queue.get_queue_position(user_id)
             active   = services.queue.get_active_count()
 
             if position > 0 or active >= services.queue.max_concurrent:
-                await processing_msg.edit_text(
-                    t("queued", user_id, position=position + 1)
-                )
+                await sender.edit_status(t("queued", user_id, position=position + 1))
             else:
-                await processing_msg.edit_text(t("downloading", user_id))
+                await sender.edit_status(t("downloading", user_id))
 
             return True, None
 
@@ -192,10 +220,10 @@ class DownloadFacade:
             logger.error("Traceback: %s", traceback.format_exc())
             return False, "download_failed"
 
+    # ------------------------------------------------------------------ utils
+
     @staticmethod
-    def _map_callback_to_strategy(
-        callback_data: str, url: str | None = None
-    ) -> str | None:
+    def _map_callback_to_strategy(callback_data: str, url: str | None = None) -> str | None:
         if callback_data == "download_audio":
             return "spotify" if (url and is_spotify_url(url)) else "download_audio"
         if url and is_spotify_url(url):
@@ -212,14 +240,29 @@ class DownloadFacade:
 
     @staticmethod
     async def enqueue_silent(
-        user, url: str, download_type: str, status_msg, context
+        sender: BotSender,
+        url: str,
+        download_type: str,
+        context,
     ) -> None:
-        """Queue a download without interactive format selection (batch mode)."""
-        user_id = user.id
+        """批量/静默入队（无格式选择交互）。
+
+        Parameters
+        ----------
+        sender:
+            由 Handler 层构造、绑定了对应 status_msg 的 BotSender。
+        url:
+            待下载的 URL。
+        download_type:
+            策略 key，如 "download_audio" / "spotify"。
+        context:
+            python-telegram-bot CallbackContext（仅供日志使用）。
+        """
+        user_id = sender.user_id
 
         strategy = StrategyFactory.get(download_type)
         if not strategy:
-            await status_msg.edit_text(f"❌ Unsupported type: {download_type}")
+            await sender.edit_status(f"❌ Unsupported type: {download_type}")
             return
 
         task = DownloadTask(
@@ -229,13 +272,9 @@ class DownloadFacade:
             download_type=download_type,
         )
 
-        # SilentMessageQuery satisfies the query interface expected by
-        # TelegramSender: it exposes .from_user and .message.
-        query = SilentMessageQuery(user, status_msg)
-        task_ctx = {
-            "query": query,
-            "processing_msg": status_msg,
-            "context": context,
-        }
+        task_ctx = {"sender": sender, "context": context}
         await services.queue.add_task(task, task_ctx)
-        log_user(user, f"batch_enqueue:{download_type}")
+        log_user(
+            type("_U", (), {"id": user_id, "username": "batch"})(),
+            f"batch_enqueue:{download_type}",
+        )
