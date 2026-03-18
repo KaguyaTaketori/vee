@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from models.domain_models import DownloadTask, DownloadStatus, TaskContext
-from services.event_bus import bus
+from shared.services.event_bus import bus
 
 logger = logging.getLogger(__name__)
 

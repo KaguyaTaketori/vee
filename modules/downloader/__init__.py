@@ -1,7 +1,7 @@
 from telegram.ext import Application, MessageHandler, filters
 from core.filters import CookieFilter
 from core.handler_registry import registry
-from integrations.ptb_adapter import PtbCommandRegistrar
+from modules.downloader.integrations.ptb_adapter import PtbCommandRegistrar
 from config import ADMIN_IDS
 
 class DownloaderModule:

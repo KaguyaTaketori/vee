@@ -10,12 +10,12 @@ from telegram.ext import CallbackContext
 
 from config import MAX_CACHE_SIZE
 from database.history import check_recent_download
-from integrations.downloaders.ytdlp_client import is_spotify_url
+from modules.downloader.integrations.downloaders.ytdlp_client import is_spotify_url
 
 from modules.downloader.strategies.sender import TelegramSender
 
 from modules.downloader.services.facades import DownloadFacade
-from services.middleware import RequestContext, default_pipeline
+from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.session import UserSession
 from shared.services.user_service import track_user, warm_user_lang
 from utils.i18n import t
@@ -168,8 +168,8 @@ async def _handle_batch_urls(
 
 
 async def _show_quality_options(query, url: str) -> None:
-    from integrations.downloaders.helpers import mask_url
-    from integrations.downloaders.ytdlp_client import CookieExpiredError, get_formats
+    from modules.downloader.integrations.downloaders.helpers import mask_url
+    from modules.downloader.integrations.downloaders.ytdlp_client import CookieExpiredError, get_formats
     from config import MAX_FILE_SIZE
 
     user_id = query.from_user.id

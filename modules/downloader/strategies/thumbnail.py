@@ -6,7 +6,7 @@ from database.history import add_history, get_file_id_by_url
 from utils.i18n import t
 from .base import TaskStrategy
 from .sender import BotSender
-from integrations.downloaders import ytdlp_client
+from modules.downloader.integrations.downloaders import ytdlp_client
 
 logger = logging.getLogger(__name__)
 

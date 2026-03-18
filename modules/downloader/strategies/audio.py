@@ -5,7 +5,7 @@ import logging
 
 from .base import TaskStrategy
 from .sender import BotSender
-from integrations.downloaders import ytdlp_client
+from modules.downloader.integrations.downloaders import ytdlp_client
 from utils.i18n import t
 
 logger = logging.getLogger(__name__)

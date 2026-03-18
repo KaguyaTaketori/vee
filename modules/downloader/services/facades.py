@@ -14,7 +14,7 @@ from shared.services.container import services
 from utils.i18n import t
 from utils.logger import log_user
 from utils.telegram_helpers import user_log_args
-from integrations.downloaders.ytdlp_client import is_spotify_url
+from modules.downloader.integrations.downloaders.ytdlp_client import is_spotify_url
 
 logger = logging.getLogger(__name__)
 

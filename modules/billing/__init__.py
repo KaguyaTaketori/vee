@@ -11,6 +11,10 @@ class BillingModule:
         app.add_handler(CommandHandler("bill", handle_bill_command))
         app.add_handler(MessageHandler(filters.PHOTO, handle_bill_photo))
         app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bill_text),
+            group=1,
+        )
+        app.add_handler(
             MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_bill_edit_reply),
             group=1,
         )

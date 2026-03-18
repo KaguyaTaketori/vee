@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from .audio import AudioStrategy
-from integrations.downloaders.spotify_client import download_spotify
+from modules.downloader.integrations.downloaders.spotify_client import download_spotify
 
 logger = logging.getLogger(__name__)
 

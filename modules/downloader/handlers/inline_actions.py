@@ -8,7 +8,7 @@ from config import ADMIN_IDS
 
 from modules.downloader.strategies.sender import TelegramSender
 from modules.downloader.services.facades import DownloadFacade
-from services.middleware import RequestContext, default_pipeline
+from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.container import services
 from shared.services.user_service import set_user_language, warm_user_lang
 from shared.services.session import UserSession
