@@ -149,3 +149,90 @@ async def get_user_bill_count(user_id: int) -> int:
         )
         row = await cursor.fetchone()
     return row[0] if row else 0
+
+
+async def get_monthly_summary(user_id: int, year: int, month: int) -> dict:
+    """
+    返回指定月份的消费汇总。
+
+    :returns: {
+        "total": float,
+        "count": int,
+        "by_category": [{"category": str, "total": float, "count": int}, ...],
+        "by_currency": [{"currency": str, "total": float}, ...],
+    }
+    """
+    month_str = f"{year:04d}-{month:02d}"
+
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT
+                COALESCE(category, '其他') AS category,
+                SUM(amount)               AS total,
+                COUNT(*)                  AS cnt
+            FROM bills
+            WHERE user_id = ?
+              AND bill_date LIKE ?
+            GROUP BY category
+            ORDER BY total DESC
+            """,
+            (user_id, f"{month_str}%"),
+        )
+        by_category = [
+            {"category": row[0], "total": row[1], "count": row[2]}
+            for row in await cursor.fetchall()
+        ]
+
+        cursor = await db.execute(
+            """
+            SELECT currency, SUM(amount) AS total
+            FROM bills
+            WHERE user_id = ?
+              AND bill_date LIKE ?
+            GROUP BY currency
+            ORDER BY total DESC
+            """,
+            (user_id, f"{month_str}%"),
+        )
+        by_currency = [
+            {"currency": row[0], "total": row[1]}
+            for row in await cursor.fetchall()
+        ]
+
+        cursor = await db.execute(
+            """
+            SELECT SUM(amount), COUNT(*)
+            FROM bills
+            WHERE user_id = ?
+              AND bill_date LIKE ?
+            """,
+            (user_id, f"{month_str}%"),
+        )
+        row = await cursor.fetchone()
+        total = row[0] or 0.0
+        count = row[1] or 0
+
+    return {
+        "total": total,
+        "count": count,
+        "by_category": by_category,
+        "by_currency": by_currency,
+    }
+
+
+async def get_recent_bills(user_id: int, limit: int = 5) -> list[dict]:
+    """返回最近 N 条账单，用于 /mybills 末尾的流水预览。"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, amount, currency, category, description, merchant, bill_date
+            FROM bills
+            WHERE user_id = ?
+            ORDER BY bill_date DESC, created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
