@@ -123,6 +123,9 @@
     "batch_start": "📥 {count}개의 링크가 감지되어 일괄 다운로드 시작...",
     "batch_item_queued": "[{index}/{total}] 대기열에 추가됨:\n{url}...",
     "history_header": "📋 다운로드 기록 ({page}/{total} 페이지, 총 {count}개)\n\n",
+    "bill":    "지출 기록 (텍스트 또는 영수증 사진)",
+    "jz":      "지출 기록 (bill의 별칭)",
+    "mybills": "월별 소비 요약 보기 [YYYY-MM]",
     "commands": {
         "user": {
             "start": "봇 시작",

@@ -145,6 +145,9 @@
     "rateinfo_status": "レート制限状態：\n- ステータス：{status}\n- 1時間あたりの最大ダウンロード：{max}\n- トラッキング中のユーザー：{users}",
     "rate_limit_updated_simple": "レート制限を更新：{max}/時間、{status}",
     "no_history": "ダウンロード履歴がありません。",
+    "bill":    "支出を記録（テキストまたはレシート写真）",
+    "jz":      "支出を記録（billの別名）",
+    "mybills": "月別消費サマリーを表示 [YYYY-MM]",
     "commands": {
         "user": {
             "start": "ボットを起動",

@@ -155,6 +155,9 @@
     "disk_recovered": "✅ 磁盘已恢复正常，当前使用率 {percent}%",
     "no_records":     "（暂无记录）",
     "yesterday":      "昨日",
+    "bill":    "记一笔账（支持文字或图片收据）",
+    "jz":      "记一笔账（bill 的别名）",
+    "mybills": "查看本月消费汇总 [YYYY-MM]",
     "commands": {
 	    "user": {
 	      "start":   "启动机器人",

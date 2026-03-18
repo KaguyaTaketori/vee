@@ -147,29 +147,28 @@ async def _handle_batch_urls(ctx: PlatformContext, urls: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # PTB entry point
 # ---------------------------------------------------------------------------
-
 @require_message
 async def handle_link(update: Update, context: CallbackContext) -> None:
     user = update.message.from_user
     track_user(user)
     await warm_user_lang(user.id)
-
+ 
+    if update.message.reply_to_message and context.user_data.get("text_input_state"):
+        return
+ 
     text = update.message.text.strip()
     urls = [u for u in URL_PATTERN.findall(text) if is_valid_url(u)]
-
-    # TelegramContext.from_message captures `update.message` in a closure,
-    # making ctx.create_sender() work without re-exposing the PTB object.
+ 
     ctx = TelegramContext.from_message(update, context)
-
+ 
     if not urls:
         await ctx.send(t("unsupported_url", ctx.user_id))
         return
-
-    # Middleware check (auth + rate limit)
+ 
     mw_ctx = RequestContext(user=user, reply=update.message.reply_text)
     result = await default_pipeline.run(mw_ctx)
     if not result.ok:
         await ctx.send(t(result.error_key, ctx.user_id))
         return
-
+ 
     await _handle_link_impl(ctx, urls)

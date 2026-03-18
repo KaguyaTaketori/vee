@@ -7,38 +7,6 @@ from utils.i18n import LANGUAGES, get_command_description
 logger = logging.getLogger(__name__)
 
 
-_USER_COMMAND_NAMES = [
-    "start",
-    "cancel",
-    "help",
-    "history",
-    "myid",
-    "lang",
-    "tasks",
-]
-
-_ADMIN_COMMAND_NAMES = [
-    "stats",
-    "allow",
-    "block",
-    "users",
-    "broadcast",
-    "userhistory",
-    "rateinfo",
-    "setrate",
-    "cleanup",
-    "status",
-    "queue",
-    "storage",
-    "failed",
-    "cookie",
-    "refresh",
-    "admcancel",
-    "settier",
-    "setdisk",
-    "report",
-]
-
 def _build_commands(names: list[str], scope: str, lang: str) -> list[BotCommand]:
     return [
         BotCommand(
@@ -48,47 +16,50 @@ def _build_commands(names: list[str], scope: str, lang: str) -> list[BotCommand]
         for name in names
     ]
 
-async def set_bot_commands(app: Application, modules:list):
-    user_cmds = []
-    admin_cmds = []
+
+async def set_bot_commands(app: Application, modules: list):
+    # 从各模块收集命令名，保持注册顺序
+    user_cmd_names: list[str] = []
+    admin_cmd_names: list[str] = []
     for module in modules:
-        user_cmds.extend(module.get_user_commands())
-        admin_cmds.extend(module.get_admin_commands())
+        for cmd in module.get_user_commands():
+            if cmd not in user_cmd_names:
+                user_cmd_names.append(cmd)
+        for cmd in module.get_admin_commands():
+            if cmd not in admin_cmd_names:
+                admin_cmd_names.append(cmd)
 
     bot = app.bot
     errors = []
 
+    # 普通用户命令（所有语言）
     for lang_code in LANGUAGES:
         try:
-            commands = _build_commands(_USER_COMMAND_NAMES, "user", lang_code)
             await bot.set_my_commands(
-                commands,
+                _build_commands(user_cmd_names, "user", lang_code),
                 scope=BotCommandScopeDefault(),
                 language_code=lang_code,
             )
-            logger.debug("Set user commands for lang=%s", lang_code)
         except Exception as e:
             errors.append(f"user commands lang={lang_code}: {e}")
 
+    # 普通用户命令（fallback 无语言）
     try:
         await bot.set_my_commands(
-            _build_commands(_USER_COMMAND_NAMES, "user", "en"),
+            _build_commands(user_cmd_names, "user", "en"),
             scope=BotCommandScopeDefault(),
         )
     except Exception as e:
         errors.append(f"user commands fallback: {e}")
 
+    # 管理员命令（所有语言 + fallback）
+    all_admin_names = user_cmd_names + admin_cmd_names
     if ADMIN_IDS:
         for admin_id in ADMIN_IDS:
             for lang_code in LANGUAGES:
                 try:
-                    commands = _build_commands(
-                        _USER_COMMAND_NAMES + _ADMIN_COMMAND_NAMES,
-                        "admin",
-                        lang_code,
-                    )
                     await bot.set_my_commands(
-                        commands,
+                        _build_commands(all_admin_names, "admin", lang_code),
                         scope=BotCommandScopeChat(chat_id=admin_id),
                         language_code=lang_code,
                     )
@@ -97,11 +68,7 @@ async def set_bot_commands(app: Application, modules:list):
 
             try:
                 await bot.set_my_commands(
-                    _build_commands(
-                        _USER_COMMAND_NAMES + _ADMIN_COMMAND_NAMES,
-                        "admin",
-                        "en",
-                    ),
+                    _build_commands(all_admin_names, "admin", "en"),
                     scope=BotCommandScopeChat(chat_id=admin_id),
                 )
             except Exception as e:
@@ -112,7 +79,9 @@ async def set_bot_commands(app: Application, modules:list):
             logger.warning("set_bot_commands partial failure: %s", err)
     else:
         logger.info(
-            "Bot commands set for %s languages and %s admins",
+            "Bot commands set: %d user, %d admin, %d languages, %d admins",
+            len(user_cmd_names),
+            len(admin_cmd_names),
             len(LANGUAGES),
-            len(ADMIN_IDS)
+            len(ADMIN_IDS),
         )

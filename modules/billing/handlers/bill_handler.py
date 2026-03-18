@@ -1,12 +1,8 @@
+# modules/billing/handlers/bill_handler.py
 """
-modules/billing/handlers/bill_handler.py
-
-变更说明（items 支持版本）：
-1. _build_confirmation_text
-   - 新增 items 明细展示区：商品名 + 金额，折扣用红色标注（负数前缀 ➖）
-   - 超过 8 行时折叠，只显示前 8 行 + "…共 N 项"
-2. merchant 兜底：过滤 "未知商家" / "unknown" 显示为 "未知"
-3. 其余逻辑（键盘、命令处理、图片处理）不变
+变更说明（Bug2 修复）：
+- _confirmation_keyboard 新增「✏️ 改明细」按钮，callback_data: bill_edit:items:{cache_id}
+- 其余逻辑不变
 """
 from __future__ import annotations
 
@@ -25,7 +21,7 @@ from utils.utils import require_message
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITEMS_PREVIEW = 8  # 确认卡最多展示的明细行数
+_MAX_ITEMS_PREVIEW = 8
 
 
 def _get_parser() -> BillParser:
@@ -36,7 +32,6 @@ def _get_parser() -> BillParser:
 
 
 def _format_items_preview(entry: BillEntry) -> str:
-    """将 items 格式化为确认卡中的明细区块，返回 Markdown 字符串。"""
     if not entry.items:
         return ""
 
@@ -45,7 +40,6 @@ def _format_items_preview(entry: BillEntry) -> str:
 
     for item in display_items:
         if item.item_type == "discount":
-            # 折扣行：红色标记（Markdown 用斜体区分）
             lines.append(f"  ➖ _{item.name}_　`{item.amount:+.0f}`")
         elif item.item_type == "tax":
             lines.append(f"  🧾 _{item.name}_　`{item.amount:.0f}`")
@@ -61,7 +55,6 @@ def _format_items_preview(entry: BillEntry) -> str:
 
 
 def _build_confirmation_text(entry: BillEntry) -> str:
-    """构建账单确认卡 Markdown 文本。"""
     category    = entry.category    or "未分类"
     description = entry.description or "—"
     merchant    = (
@@ -90,21 +83,25 @@ def _build_confirmation_text(entry: BillEntry) -> str:
 
 
 def _confirmation_keyboard(cache_id: str):
-    """多字段编辑键盘。callback_data 格式：bill_edit:{field}:{cache_id}"""
+    """
+    [Bug2] 新增第三行「✏️ 改明细」按钮。
+    有明细时显示，无明细时仍显示（可用于手动添加的场景，点击后提示无明细）。
+    """
     return [
         [btn("✅ 确认无误", f"bill_confirm:{cache_id}")],
         [
-            btn("✏️ 改金额", f"bill_edit:amount:{cache_id}"),
-            btn("🏷️ 改类别", f"bill_edit:category:{cache_id}"),
+            btn("✏️ 改金额",   f"bill_edit:amount:{cache_id}"),
+            btn("🏷️ 改类别",   f"bill_edit:category:{cache_id}"),
         ],
         [
-            btn("🏪 改商家", f"bill_edit:merchant:{cache_id}"),
-            btn("📝 改描述", f"bill_edit:description:{cache_id}"),
+            btn("🏪 改商家",   f"bill_edit:merchant:{cache_id}"),
+            btn("📝 改描述",   f"bill_edit:description:{cache_id}"),
         ],
         [
-            btn("📅 改日期", f"bill_edit:bill_date:{cache_id}"),
-            btn("❌ 取消记账", f"bill_cancel:{cache_id}"),
+            btn("📅 改日期",   f"bill_edit:bill_date:{cache_id}"),
+            btn("🧾 改明细",   f"bill_edit:items:{cache_id}"),    # ← Bug2 新增
         ],
+        [btn("❌ 取消记账", f"bill_cancel:{cache_id}")],
     ]
 
 
@@ -186,7 +183,6 @@ async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = 
         await ctx.edit("❌ 服务异常，请稍后重试。")
         return
 
-    # 保存 Telegram file_id，用户确认后一并写库
     if file_id:
         entry.receipt_file_id = file_id
 
@@ -199,7 +195,6 @@ async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = 
 
 
 async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
-    """PTB adapter：下载图片字节，构建 ctx，委托给 _bill_photo_impl。"""
     if not update.message or not update.message.photo:
         return
 
@@ -210,9 +205,8 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
     processing_msg = await update.message.reply_text("🤖 AI 正在识别收据图片，请稍候…")
 
     try:
-        # 取最高分辨率（列表最后一项），同时保留 file_id 用于凭证存档
         photo = update.message.photo[-1]
-        file_id = photo.file_id                 # Telegram 永久 file_id
+        file_id = photo.file_id
         tg_file = await photo.get_file()
         buf = BytesIO()
         await tg_file.download_to_memory(buf)

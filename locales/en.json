@@ -154,6 +154,9 @@
     "disk_recovered": "✅ Disk usage back to normal at {percent}%",
     "no_records":     "(No records found)",
     "yesterday":      "Yesterday",
+    "bill":    "Log an expense (text or receipt photo)",
+    "jz":      "Log an expense (alias for bill)",
+    "mybills": "View monthly spending summary [YYYY-MM]",
     "commands": {
       "user": {
         "start":   "Start the bot",

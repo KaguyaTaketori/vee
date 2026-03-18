@@ -1,33 +1,33 @@
 # modules/billing/handlers/bill_callbacks.py
 """
-modules/billing/handlers/bill_callbacks.py
-
-变更说明：
-1. category 字段编辑改为 InlineKeyboard 选择（新增 bill_cat: 回调），
-   不再走 ForceReply 文本输入，消除用户手误输入非法类别的可能。
-2. handle_bill_edit_reply：编辑完成后用 edit_keyboard 替换原消息，
-   避免 send_keyboard 新发一条造成多张确认卡重叠。
-3. category 回调直接写回缓存并刷新确认卡，无需经过 ForceReply 流程。
+修复说明：
+1. [Bug1] _cb_bill_cat 和 handle_bill_edit_reply 创建新 BillEntry 时补回
+   receipt_file_id 和 items，防止凭证和明细丢失。
+2. [Bug2] 新增 bill_items: / bill_item_edit: / bill_item_del: 回调，
+   让用户可以查看并逐条编辑/删除明细。
+3. 其余逻辑（ForceReply、字段校验、bill_back 等）不变。
 """
 from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 
 from telegram.ext import CallbackContext as PTBCallbackContext
 
 from core.callback_bus import register, CallbackContext
 from modules.billing.database.bills import insert_bill
-from modules.billing.services.bill_cache import bill_cache, BillEntry
+from modules.billing.services.bill_cache import bill_cache, BillEntry, BillItem
 from modules.billing.services.bill_parser import VALID_CATEGORIES
 from shared.services.platform_context import TelegramContext, btn
+from utils.decorators import auto_delete 
 
 logger = logging.getLogger(__name__)
 
-# state_key 写入 user_data 的前缀，格式：bill_edit:{field}:{cache_id}
+# state_key 写入 user_data 的前缀
 _STATE_PREFIX = "bill_edit:"
 
-# 各字段的中文标签和 ForceReply 输入提示（category 不在此列，走 InlineKeyboard）
+# 各字段的中文标签和 ForceReply 输入提示（category 不在此列）
 _FIELD_CONFIG: dict[str, tuple[str, str]] = {
     "amount":      ("金额",    "请输入新金额（纯数字，如：128.5）"),
     "merchant":    ("商家",    "请输入商家名称"),
@@ -35,7 +35,13 @@ _FIELD_CONFIG: dict[str, tuple[str, str]] = {
     "bill_date":   ("日期",    "请输入日期（格式：2024-03-18）"),
 }
 
-# category 类别选择键盘（两列布局）
+# 明细字段配置
+_ITEM_FIELD_CONFIG: dict[str, tuple[str, str]] = {
+    "name":   ("名称", "请输入新商品名称"),
+    "amount": ("金额", "请输入新金额（数字，折扣为负数如 -50）"),
+}
+
+# category 类别选择键盘
 _CATEGORY_EMOJI: dict[str, str] = {
     "餐饮":  "🍜",
     "交通":  "🚇",
@@ -47,12 +53,10 @@ _CATEGORY_EMOJI: dict[str, str] = {
     "其他":  "📦",
 }
 
-# 按顺序排列，方便用户扫描
 _CATEGORY_ORDER = ["餐饮", "交通", "购物", "娱乐", "医疗", "住房", "水电煤", "其他"]
 
 
 def _category_keyboard(cache_id: str):
-    """生成类别选择键盘，每行两个按钮。callback_data: bill_cat:{category}:{cache_id}"""
     rows = []
     for i in range(0, len(_CATEGORY_ORDER), 2):
         row = []
@@ -61,6 +65,20 @@ def _category_keyboard(cache_id: str):
             row.append(btn(f"{emoji} {cat}", f"bill_cat:{cat}:{cache_id}"))
         rows.append(row)
     rows.append([btn("« 返回", f"bill_back:{cache_id}")])
+    return rows
+
+
+def _items_keyboard(entry: BillEntry, cache_id: str):
+    """明细列表键盘：每条明细一行，可点击编辑名称或金额，可删除。"""
+    rows = []
+    for idx, item in enumerate(entry.items):
+        label = f"{item.name[:12]}  ¥{item.amount:.0f}"
+        rows.append([
+            btn(f"✏️ {label}", f"bill_item_edit:name:{idx}:{cache_id}"),
+            btn(f"💴 金额",    f"bill_item_edit:amount:{idx}:{cache_id}"),
+            btn(f"🗑️",         f"bill_item_del:{idx}:{cache_id}"),
+        ])
+    rows.append([btn("« 返回确认", f"bill_back:{cache_id}")])
     return rows
 
 
@@ -92,7 +110,7 @@ async def _cb_bill_confirm(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_edit  —  callback_data 格式：bill_edit:{field}:{cache_id}
+# bill_edit  —  callback_data：bill_edit:{field}:{cache_id}
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_edit:"))
@@ -112,12 +130,25 @@ async def _cb_bill_edit(ctx: CallbackContext) -> None:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
-    # category 走 InlineKeyboard，其余字段走 ForceReply 文本输入
     if field == "category":
         await ctx.answer()
         await ctx.platform_ctx.edit_keyboard(
             f"🏷️ 请选择新类别（当前：{entry.category or '未分类'}）：",
             _category_keyboard(cache_id),
+        )
+        return
+
+    if field == "items":
+        await ctx.answer()
+        if not entry.items:
+            await ctx.platform_ctx.edit_keyboard(
+                "📋 当前账单没有商品明细。",
+                [[btn("« 返回", f"bill_back:{cache_id}")]],
+            )
+            return
+        await ctx.platform_ctx.edit_keyboard(
+            "📋 *商品明细*\n点击行内按钮编辑名称/金额，或删除该条目：",
+            _items_keyboard(entry, cache_id),
         )
         return
 
@@ -137,7 +168,103 @@ async def _cb_bill_edit(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_cat  —  类别选择回调，callback_data 格式：bill_cat:{category}:{cache_id}
+# bill_item_edit  —  callback_data：bill_item_edit:{field}:{idx}:{cache_id}
+# [Bug2] 新增：编辑单条明细的名称或金额
+# ---------------------------------------------------------------------------
+
+@register(lambda d: d.startswith("bill_item_edit:"))
+async def _cb_bill_item_edit(ctx: CallbackContext) -> None:
+    # 格式：bill_item_edit:{field}:{idx}:{cache_id}
+    parts = ctx.data.split(":", 3)
+    if len(parts) != 4:
+        await ctx.answer_alert("❌ 数据格式错误。")
+        return
+
+    _, field, idx_str, cache_id = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await ctx.answer_alert("❌ 明细索引无效。")
+        return
+
+    if field not in _ITEM_FIELD_CONFIG:
+        await ctx.answer_alert(f"❌ 不支持编辑字段：{field}")
+        return
+
+    entry = await bill_cache.get(cache_id)
+    if entry is None:
+        await ctx.answer_alert("⏰ 账单已过期，请重新发送。")
+        return
+    if entry.user_id != ctx.user_id:
+        await ctx.answer_alert("❌ 这不是你的账单。")
+        return
+    if idx >= len(entry.items):
+        await ctx.answer_alert("❌ 明细条目不存在。")
+        return
+
+    item = entry.items[idx]
+    field_label, prompt_hint = _ITEM_FIELD_CONFIG[field]
+    current_val = getattr(item, field)
+
+    await ctx.answer()
+    await ctx.request_text_input(
+        prompt=f"第 {idx + 1} 条：{item.name}\n当前{field_label}：`{current_val}`\n{prompt_hint}：",
+        state_key=f"{_STATE_PREFIX}item:{field}:{idx}:{cache_id}",
+        placeholder=f"请输入新{field_label}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# bill_item_del  —  callback_data：bill_item_del:{idx}:{cache_id}
+# [Bug2] 新增：删除单条明细
+# ---------------------------------------------------------------------------
+
+@register(lambda d: d.startswith("bill_item_del:"))
+async def _cb_bill_item_del(ctx: CallbackContext) -> None:
+    parts = ctx.data.split(":", 2)
+    if len(parts) != 3:
+        await ctx.answer_alert("❌ 数据格式错误。")
+        return
+
+    _, idx_str, cache_id = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await ctx.answer_alert("❌ 明细索引无效。")
+        return
+
+    entry = await bill_cache.get(cache_id)
+    if entry is None:
+        await ctx.answer_alert("⏰ 账单已过期，请重新发送。")
+        return
+    if entry.user_id != ctx.user_id:
+        await ctx.answer_alert("❌ 这不是你的账单。")
+        return
+    if idx >= len(entry.items):
+        await ctx.answer_alert("❌ 明细条目不存在。")
+        return
+
+    new_items = [item for i, item in enumerate(entry.items) if i != idx]
+    updated = replace(entry, items=new_items)
+    await bill_cache.update(cache_id, updated)
+    await ctx.answer("已删除")
+
+    # 刷新明细列表
+    if updated.items:
+        await ctx.platform_ctx.edit_keyboard(
+            "📋 *商品明细*\n点击行内按钮编辑名称/金额，或删除该条目：",
+            _items_keyboard(updated, cache_id),
+        )
+    else:
+        from modules.billing.handlers.bill_handler import _confirmation_keyboard, _build_confirmation_text
+        await ctx.platform_ctx.edit_keyboard(
+            _build_confirmation_text(updated),
+            _confirmation_keyboard(cache_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# bill_cat  —  callback_data：bill_cat:{category}:{cache_id}
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_cat:"))
@@ -161,16 +288,8 @@ async def _cb_bill_cat(ctx: CallbackContext) -> None:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
-    updated = BillEntry(
-        user_id=entry.user_id,
-        amount=entry.amount,
-        currency=entry.currency,
-        category=category,
-        description=entry.description,
-        merchant=entry.merchant,
-        bill_date=entry.bill_date,
-        raw_text=entry.raw_text,
-    )
+    # [Bug1] 修复：dataclasses.replace 自动保留 receipt_file_id 和 items
+    updated = replace(entry, category=category)
     await bill_cache.update(cache_id, updated)
 
     await ctx.answer(f"已选择：{category}")
@@ -184,7 +303,7 @@ async def _cb_bill_cat(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_back  —  从类别选择键盘返回确认卡
+# bill_back  —  从各子菜单返回确认卡
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_back:"))
@@ -225,9 +344,9 @@ async def _cb_bill_cancel(ctx: CallbackContext) -> None:
 # ---------------------------------------------------------------------------
 # ForceReply reply handler — registered as MessageHandler in BillingModule
 # ---------------------------------------------------------------------------
-
+@auto_delete(delay=3.0)
 async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
-    """处理用户回复 ForceReply 的输入，支持多字段写回。"""
+    """处理 ForceReply 回复，支持主字段和明细字段。"""
     if not update.message:
         return
 
@@ -235,15 +354,34 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
     if not state.startswith(_STATE_PREFIX):
         return
 
-    # state 格式：bill_edit:{field}:{cache_id}
     remainder = state[len(_STATE_PREFIX):]
-    field, cache_id = remainder.split(":", 1)
     context.user_data.pop("text_input_state", None)
 
     ctx = TelegramContext.from_message(update, context)
     text = update.message.text.strip()
 
-    # ── 字段校验 ──────────────────────────────────────────────────────────
+    # ── 判断是普通字段还是明细字段 ────────────────────────────────────────
+    if remainder.startswith("item:"):
+        # 格式：item:{field}:{idx}:{cache_id}
+        parts = remainder[len("item:"):].split(":", 2)
+        if len(parts) != 3:
+            await ctx.send("❌ 状态数据异常，请重试。")
+            return
+        field, idx_str, cache_id = parts
+        await _handle_item_reply(ctx, cache_id, field, int(idx_str), text)
+    else:
+        # 格式：{field}:{cache_id}
+        field, cache_id = remainder.split(":", 1)
+        await _handle_main_field_reply(ctx, cache_id, field, text)
+
+
+async def _handle_main_field_reply(
+    ctx: TelegramContext,
+    cache_id: str,
+    field: str,
+    text: str,
+) -> None:
+    """处理主字段（amount / merchant / description / bill_date）的 ForceReply 回复。"""
     new_val: object
 
     if field == "amount":
@@ -254,21 +392,16 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
         except ValueError as e:
             await ctx.send(f"❌ 金额格式不正确：{e}，请输入正数（如：128.5）。")
             return
-
     elif field == "bill_date":
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", text):
             await ctx.send("❌ 日期格式不正确，请使用 YYYY-MM-DD 格式（如：2024-03-18）。")
             return
         new_val = text
-
     elif field == "description":
         new_val = text[:50]
-
     else:
-        # merchant — 直接使用，截断即可
         new_val = text[:50]
 
-    # ── 写回缓存 ──────────────────────────────────────────────────────────
     entry = await bill_cache.get(cache_id)
     if entry is None:
         await ctx.send("⏰ 账单已过期，请重新发送。")
@@ -277,26 +410,75 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
         await ctx.send("❌ 这不是你的账单。")
         return
 
-    updated = BillEntry(
-        user_id=entry.user_id,
-        amount=new_val if field == "amount" else entry.amount,
-        currency=entry.currency,
-        category=entry.category,
-        description=new_val if field == "description" else entry.description,
-        merchant=new_val if field == "merchant" else entry.merchant,
-        bill_date=new_val if field == "bill_date" else entry.bill_date,
-        raw_text=entry.raw_text,
-    )
+    # [Bug1] 修复：dataclasses.replace 自动保留 receipt_file_id 和 items
+    updated = replace(entry, **{field: new_val})
     await bill_cache.update(cache_id, updated)
 
-    # ── 用 edit_keyboard 替换原确认消息，而不是 send_keyboard 新发一条 ──
     from modules.billing.handlers.bill_handler import _confirmation_keyboard, _build_confirmation_text
-
-    # ForceReply 场景下没有可 edit 的目标消息（原确认卡是之前发的），
-    # 需要通过 bot.send_message 重新发一张确认卡并带上键盘。
-    # 由于 TelegramContext.from_message 的 _edit_fn 指向当前输入消息，
-    # 此处直接 send_keyboard 发新卡（ForceReply 流程的固有限制）。
     await ctx.send_keyboard(
         _build_confirmation_text(updated),
         _confirmation_keyboard(cache_id),
     )
+
+
+async def _handle_item_reply(
+    ctx: TelegramContext,
+    cache_id: str,
+    field: str,
+    idx: int,
+    text: str,
+) -> None:
+    """处理明细字段（name / amount）的 ForceReply 回复。"""
+    entry = await bill_cache.get(cache_id)
+    if entry is None:
+        await ctx.send("⏰ 账单已过期，请重新发送。")
+        return
+    if entry.user_id != ctx.user_id:
+        await ctx.send("❌ 这不是你的账单。")
+        return
+    if idx >= len(entry.items):
+        await ctx.send("❌ 明细条目不存在。")
+        return
+
+    old_item = entry.items[idx]
+
+    if field == "name":
+        new_item = BillItem(
+            name=text[:50],
+            name_raw=old_item.name_raw,
+            quantity=old_item.quantity,
+            unit_price=old_item.unit_price,
+            amount=old_item.amount,
+            item_type=old_item.item_type,
+            sort_order=old_item.sort_order,
+        )
+    elif field == "amount":
+        try:
+            new_amount = float(text.replace(",", "."))
+        except ValueError:
+            await ctx.send("❌ 金额格式不正确，请输入数字（折扣为负数，如 -50）。")
+            return
+        new_item = BillItem(
+            name=old_item.name,
+            name_raw=old_item.name_raw,
+            quantity=old_item.quantity,
+            unit_price=old_item.unit_price,
+            amount=new_amount,
+            item_type=old_item.item_type,
+            sort_order=old_item.sort_order,
+        )
+    else:
+        await ctx.send(f"❌ 不支持编辑字段：{field}")
+        return
+
+    new_items = list(entry.items)
+    new_items[idx] = new_item
+    updated = replace(entry, items=new_items)
+    await bill_cache.update(cache_id, updated)
+
+    # 回到明细列表
+    await ctx.send_keyboard(
+        "📋 *商品明细*\n点击行内按钮编辑名称/金额，或删除该条目：",
+        _items_keyboard(updated, cache_id),
+    )
+
