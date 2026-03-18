@@ -4,8 +4,8 @@ from modules.billing import BillingModule
 from infra.telegram.runner import run
 
 MODULES = [
-    DownloaderModule(),
     BillingModule(),
+    DownloaderModule(),
 ]
 
 
