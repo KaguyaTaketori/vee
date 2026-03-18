@@ -1,29 +1,24 @@
+# modules/downloader/handlers/inline_actions.py
 from __future__ import annotations
 
 import logging
-from telegram import Update
-from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
-
+from core.callback_bus import register          # ← 从 core 层导入，不再自己维护列表
+from core.callback_bus import handle_callback   # re-export，让 DownloaderModule.setup() 仍可从这里取
 from modules.downloader.strategies.sender import TelegramSender
 from modules.downloader.services.facades import DownloadFacade
 from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.container import services
 from shared.services.user_service import set_user_language, warm_user_lang
 from shared.services.session import UserSession
+from database.history import get_user_history, clear_file_id_by_url
+from utils.i18n import LANGUAGES, t
+from utils.utils import format_history_list
+from utils.auth import check_admin
 from handlers.user.history import _send_history_page
 
 logger = logging.getLogger(__name__)
-
-_CALLBACK_HANDLERS: list[tuple[callable, callable]] = []
-
-
-def register(matcher: callable):
-    def decorator(func: callable):
-        _CALLBACK_HANDLERS.append((matcher, func))
-        return func
-    return decorator
 
 
 @register(lambda d: d.startswith("lang_"))
@@ -42,7 +37,7 @@ async def _cb_admin_history(query, context):
         return
     target_id = int(query.data.replace("uh_", ""))
     history = await get_user_history(target_id, limit=20)
-    msg = format_history_list(history, t("admin_history_for_user", user_id, target_id=target_id))
+    msg = format_history_list(history, f"Download history for user {target_id}:\n\n")
     await query.edit_message_text(msg)
 
 
@@ -66,23 +61,29 @@ async def _cb_cancel_task(query, context):
     if task.user_id != user_id and not is_admin:
         await query.answer(t("cancel_own_only", user_id), show_alert=True)
         return
-    success = await services.queue.cancel_task(task_id)
-    key = "task_cancelled" if success else "cancel_failed"
-    await query.edit_message_text(t(key, user_id))
+    cancelled = await services.queue.cancel_task(task_id)
+    if cancelled:
+        await query.edit_message_text(t("task_cancelled", user_id))
+    else:
+        await query.edit_message_text(t("cancel_failed", user_id))
 
 
-@register(lambda d: d == "download_video")
-async def _cb_download_video(query, context):
-    url = UserSession.get_pending_url(context, query.from_user.id)
-    if url:
-        from modules.downloader.handlers.message_parser import _show_quality_options
-        await _show_quality_options(query, url)
-
-
-@register(lambda d: d.startswith("quality_") or d in ("download_audio", "download_thumbnail", "download_subtitle"))
-async def _cb_download(query, context: CallbackContext) -> None:
+@register(lambda d: d.startswith("admcancel_task_"))
+async def _cb_admcancel_task(query, context):
     user_id = query.from_user.id
+    if not check_admin(user_id):
+        await query.answer(t("admin_only", user_id), show_alert=True)
+        return
+    task_id = query.data.replace("admcancel_task_", "")
+    cancelled = await services.queue.cancel_task(task_id)
+    msg = t("task_cancel_confirm", user_id, task_id=task_id) if cancelled \
+        else t("task_cancel_error", user_id, task_id=task_id)
+    await query.edit_message_text(msg)
 
+
+@register(lambda d: d.startswith("download_") or d.startswith("quality_"))
+async def _cb_download(query, context):
+    user_id = query.from_user.id
     url = UserSession.get_pending_url(context, user_id)
     if not url:
         await query.edit_message_text(t("session_expired", user_id))
@@ -106,7 +107,6 @@ async def _cb_download(query, context: CallbackContext) -> None:
         processing_msg = query.message
 
     sender = TelegramSender.from_callback(query, processing_msg)
-
     success, error_key = await DownloadFacade.process_download_request(
         sender=sender,
         url=url,
@@ -125,11 +125,9 @@ async def _cb_history_page(query, context):
     parts = query.data.split("_")
     target_user_id = int(parts[2])
     page = int(parts[3])
-
     if query.from_user.id != target_user_id:
-        await query.answer(t("not_your_history", user_id), show_alert=True)
+        await query.answer(t("not_your_history", query.from_user.id), show_alert=True)
         return
-
     await query.answer()
     await _send_history_page(query, target_user_id, page)
 
@@ -140,16 +138,13 @@ async def _cb_refresh_do(query, context):
     if not check_admin(user_id):
         await query.answer(t("admin_only", user_id), show_alert=True)
         return
-
     parts = query.data.split("_")
     admin_id = int(parts[2])
     index = int(parts[3])
-
     urls = context.bot_data.get(f"refresh_urls_{admin_id}")
     if not urls or index >= len(urls):
         await query.edit_message_text(t("refresh_session_expired", user_id))
         return
-
     url = urls[index]
     await clear_file_id_by_url(url)
     context.bot_data.pop(f"refresh_urls_{admin_id}", None)
@@ -162,26 +157,9 @@ async def _cb_refresh_page(query, context):
     if not check_admin(user_id):
         await query.answer(t("admin_only", user_id), show_alert=True)
         return
-
     parts = query.data.split("_")
     admin_id = int(parts[2])
     page = int(parts[3])
-
     from handlers.admin.tasks import _send_refresh_page
     await query.answer()
     await _send_refresh_page(query, admin_id, page, context)
-
-
-async def handle_callback(update, context):
-    query = update.callback_query
-    if not query:
-        return
-
-    for matcher, handler in _CALLBACK_HANDLERS:
-        if matcher(query.data):
-            await handler(query, context)
-            return
-    await query.answer()
-
-    logger.warning("Unhandled callback_data: %s", query.data)
-
