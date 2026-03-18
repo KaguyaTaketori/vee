@@ -1,22 +1,44 @@
+from __future__ import annotations
+
+import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Any
+
+
+@dataclass
 class UserSession:
-    
-    _KEY_URL    = "pending_url_{}"
-    _KEY_CACHE  = "cached_file_{}"
+    url: str
+    user_id: int
+    sender: Any = None
+    created_at: float = field(default_factory=time.time)
 
-    @staticmethod
-    def set_pending(context, user_id: int, url: str, cached_path: str = None):
-        context.user_data[UserSession._KEY_URL.format(user_id)] = url
-        context.user_data[UserSession._KEY_CACHE.format(user_id)] = cached_path
+    _store: dict[str, "UserSession"] = {}  # class-level store
+    _TTL: float = 600.0  # 10 minutes
 
-    @staticmethod
-    def get_pending_url(context, user_id: int) -> str | None:
-        return context.user_data.get(UserSession._KEY_URL.format(user_id))
+    @classmethod
+    def store(cls, *, url: str, user_id: int) -> str:
+        """Persist a URL for later retrieval; return the session key."""
+        cls._evict_expired()
+        key = secrets.token_urlsafe(12)
+        cls._store[key] = cls(url=url, user_id=user_id)
+        return key
 
-    @staticmethod
-    def get_cached_file(context, user_id: int) -> str | None:
-        return context.user_data.get(UserSession._KEY_CACHE.format(user_id))
+    @classmethod
+    def load(cls, key: str) -> Optional["UserSession"]:
+        """Retrieve and validate a session by key."""
+        session = cls._store.get(key)
+        if session is None:
+            return None
+        if time.time() - session.created_at > cls._TTL:
+            del cls._store[key]
+            return None
+        return session
 
-    @staticmethod
-    def clear(context, user_id: int):
-        context.user_data.pop(UserSession._KEY_URL.format(user_id), None)
-        context.user_data.pop(UserSession._KEY_CACHE.format(user_id), None)
+    @classmethod
+    def _evict_expired(cls) -> None:
+        now = time.time()
+        expired = [k for k, v in cls._store.items()
+                   if now - v.created_at > cls._TTL]
+        for k in expired:
+            del cls._store[k]
