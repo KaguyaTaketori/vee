@@ -32,6 +32,7 @@ class BillingModule:
         registrar.register_command("jz", handle_jz_command)
         registrar.register_message(handle_bill_photo, "PHOTO")
         registrar.register_message(handle_bill_edit_reply, "TEXT_REPLY", group=1)
+        registrar.register_message(handle_bill_text, "BILL_TEXT", group=0)
 
     async def init_db(self) -> None:
         from modules.billing.database.bills import init_bills_table

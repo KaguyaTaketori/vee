@@ -24,7 +24,7 @@ providers:
 
   groq:
     model: meta-llama/llama-4-scout-17b-16e-instruct
-    base_url: https://api.groq.com/openai/v1
+    base_url: https://api.groq.com/openai
     keys_env: LLM_GROQ_KEYS
 
   # openai_backup:

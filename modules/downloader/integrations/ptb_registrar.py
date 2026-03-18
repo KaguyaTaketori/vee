@@ -12,6 +12,7 @@ See ``core.registrar`` module docstring for the full list of supported
 """
 from __future__ import annotations
 
+import re as _re
 import logging
 from typing import Callable, Any
 
@@ -32,12 +33,21 @@ logger = logging.getLogger(__name__)
 # Filter name → PTB filter object
 # ---------------------------------------------------------------------------
 
+
+_BILL_RE = _re.compile(
+    r'(?:[\d,，\.]+\s*(?:元|円|¥|\$|€|£|美元|日元|港币|台币))'
+    r'|(?:(?:元|¥|\$)\s*[\d,，\.]+)',
+    _re.IGNORECASE,
+)
+
+
 _FILTER_MAP: dict[str, Any] = {
     "TEXT":         filters.TEXT & ~filters.COMMAND,
     "TEXT_REPLY":   filters.TEXT & filters.REPLY & ~filters.COMMAND,
     "PHOTO":        filters.PHOTO,
     "DOCUMENT_ALL": filters.Document.ALL,
     "COOKIE":       filters.Document.ALL & CookieFilter(),
+    "BILL_TEXT":    filters.TEXT & ~filters.COMMAND & filters.Regex(_BILL_RE),
 }
 
 
