@@ -22,7 +22,7 @@ from shared.services.notifier import TelegramAdminNotifier
 from models.domain_models import DownloadStatus
 from utils.logger import setup_logging
 from database.db import init_db
-from database.task_store import mark_stale_tasks_failed
+from shared.repositories.task_store import mark_stale_tasks_failed
 
 from core.health import create_health_app
 from core.filters import CookieFilter

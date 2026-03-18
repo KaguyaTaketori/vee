@@ -8,7 +8,7 @@ from models.domain_models import STATUS_EMOJI, DownloadStatus
 from utils.i18n import t
 from utils.utils import format_history_list, format_history_item, require_message
 from database.history import get_user_history_page
-from database.task_store import get_user_tasks
+from shared.repositories.task_store import get_user_tasks
 
 logger = logging.getLogger(__name__)
 
