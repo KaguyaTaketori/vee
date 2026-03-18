@@ -385,9 +385,10 @@ def build_llm_manager_from_env() -> LLMManager:
         "openai":    "https://api.openai.com",
         "anthropic": "https://api.anthropic.com",
         "gemini":    "https://generativelanguage.googleapis.com",
+        "groq":      "https://api.groq.com",
     }
 
-    supported = ["openai", "anthropic", "gemini"]
+    supported = ["openai", "anthropic", "gemini", "groq"]
     providers: dict = {}
 
     for p in supported:
