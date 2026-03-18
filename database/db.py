@@ -16,12 +16,13 @@ async def get_db():
 
 async def init_db():
     """Initialize database tables if they don't exist."""
-    logger.info(f"Initializing database at {DB_PATH}")
+    logger.info("Initializing database at %s", DB_PATH)
     
     async with get_db() as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys=ON")
         
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -83,6 +84,23 @@ async def init_db():
             )
         """)
 
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'CNY',
+                category TEXT,
+                description TEXT,
+                receipt_file_id TEXT, -- 如果是通过小票识别，可以存入图片ID
+                created_at REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_id ON expenses(user_id)")
+
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)
         """)
@@ -126,4 +144,3 @@ async def init_db():
         await db.commit()
         
     logger.info("Database initialized successfully")
-

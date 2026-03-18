@@ -12,12 +12,12 @@ from config import MAX_CACHE_SIZE
 from database.history import check_recent_download
 from integrations.downloaders.ytdlp_client import is_spotify_url
 
-from integrations.strategies.sender import TelegramSender
+from modules.downloader.strategies.sender import TelegramSender
 
-from services.facades import DownloadFacade
+from modules.downloader.services.facades import DownloadFacade
 from services.middleware import RequestContext, default_pipeline
-from services.session import UserSession
-from services.user_service import track_user, warm_user_lang
+from shared.services.session import UserSession
+from shared.services.user_service import track_user, warm_user_lang
 from utils.i18n import t
 from utils.utils import require_message
 

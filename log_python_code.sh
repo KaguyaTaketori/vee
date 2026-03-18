@@ -1,7 +1,7 @@
 #!/bin/bash
 # Log all Python files in project to a single text file (excluding venv)
 
-OUTPUT_FILE="python_code_log.txt"
+OUTPUT_FILE="vee_python_code.txt"
 
 rm -f "$OUTPUT_FILE"
 

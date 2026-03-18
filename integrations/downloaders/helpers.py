@@ -33,7 +33,7 @@ def _get_refresh_cmd() -> list[str] | None:
     try:
         return shlex.split(COOKIE_REFRESH_CMD)
     except ValueError as e:
-        logger.error(f"Invalid COOKIE_REFRESH_CMD syntax: {e}")
+        logger.error("Invalid COOKIE_REFRESH_CMD syntax: %s", e)
         return None
 
 
@@ -43,7 +43,7 @@ def _handle_refresh_result(success: bool, returncode: int = 0, stderr: str = "")
         _cookie_last_refresh = time.time()
         logger.info("Cookies refreshed successfully")
         return True
-    logger.error(f"Cookie refresh failed (exit {returncode}): {stderr[:200]}")
+    logger.error("Cookie refresh failed (exit %s): %s", returncode, stderr[:200])
     return False
 
 
@@ -63,10 +63,10 @@ def refresh_cookies() -> bool:
         logger.error("Cookie refresh timed out after 120s")
         return False
     except FileNotFoundError:
-        logger.error(f"Cookie refresh command not found: {cmd[0]}")
+        logger.error("Cookie refresh command not found: %s", cmd[0])
         return False
     except Exception as e:
-        logger.error(f"Cookie refresh unexpected error: {e}")
+        logger.error("Cookie refresh unexpected error: %s", e)
         return False
 
 
@@ -93,10 +93,10 @@ async def refresh_cookies_async() -> bool:
         return _handle_refresh_result(True)
 
     except FileNotFoundError:
-        logger.error(f"Cookie refresh command not found: {cmd[0]}")
+        logger.error("Cookie refresh command not found: %s", cmd[0])
         return False
     except Exception as e:
-        logger.error(f"Cookie refresh (async) unexpected error: {e}")
+        logger.error("Cookie refresh (async) unexpected error: %s", e)
         return False
 
 
@@ -106,14 +106,14 @@ async def resolve_short_url(url: str) -> str:
     try:
         domain = url.split("/")[2].lower() if "://" in url else url.split("/")[0].lower()
         if any(d in domain for d in short_domains):
-            logger.info(f"Resolving short URL: {url}")
+            logger.info("Resolving short URL: %s", url)
             async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
                 response = await client.head(url)
             resolved = str(response.url)
-            logger.info(f"Resolved to: {resolved}")
+            logger.info("Resolved to: %s", resolved)
             return resolved
     except Exception as e:
-        logger.warning(f"Failed to resolve short URL {url}: {e}")
+        logger.warning("Failed to resolve short URL %s: %s", url, e)
     return url
 
 

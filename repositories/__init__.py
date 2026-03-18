@@ -6,8 +6,8 @@ Import convention inside services / handlers:
     from repositories import HistoryRepository, UserRepository, ...
 """
 
-from .history_repo import HistoryRepository
-from .user_repo import UserRepository
+from shared.repositories.history_repo import HistoryRepository
+from shared.repositories.user_repo import UserRepository
 from .task_repo import TaskRepository
 from .rate_limit_repo import RateLimitRepository
 from .analytics_repo import AnalyticsRepository

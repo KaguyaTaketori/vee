@@ -48,7 +48,13 @@ def _build_commands(names: list[str], scope: str, lang: str) -> list[BotCommand]
         for name in names
     ]
 
-async def set_bot_commands(app: Application):
+async def set_bot_commands(app: Application, modules:list):
+    user_cmds = []
+    admin_cmds = []
+    for module in modules:
+        user_cmds.extend(module.get_user_commands())
+        admin_cmds.extend(module.get_admin_commands())
+
     bot = app.bot
     errors = []
 
@@ -60,7 +66,7 @@ async def set_bot_commands(app: Application):
                 scope=BotCommandScopeDefault(),
                 language_code=lang_code,
             )
-            logger.debug(f"Set user commands for lang={lang_code}")
+            logger.debug("Set user commands for lang=%s", lang_code)
         except Exception as e:
             errors.append(f"user commands lang={lang_code}: {e}")
 
@@ -103,9 +109,10 @@ async def set_bot_commands(app: Application):
 
     if errors:
         for err in errors:
-            logger.warning(f"set_bot_commands partial failure: {err}")
+            logger.warning("set_bot_commands partial failure: %s", err)
     else:
         logger.info(
-            f"Bot commands set for {len(LANGUAGES)} languages"
-            f" and {len(ADMIN_IDS)} admins"
+            "Bot commands set for %s languages and %s admins",
+            len(LANGUAGES),
+            len(ADMIN_IDS)
         )

@@ -1,4 +1,4 @@
-# database/task_store.py
+# shared/repositories/task_store.py
 """
 Backward-compatible façade for task-related DB operations.
 
@@ -18,7 +18,7 @@ _repo = None
 def _get_repo():
     global _repo
     if _repo is None:
-        from repositories import TaskRepository
+        from repositories.task_repo import TaskRepository
         _repo = TaskRepository()
     return _repo
 

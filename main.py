@@ -17,7 +17,7 @@ from services.event_bus import bus
 from repositories import TaskRepository
 from services.container import services
 from services.ratelimit import RateLimiter
-from services.facades import _execute_download_task
+from modules.downloader.services.facades import _execute_download_task
 from services.notifier import TelegramAdminNotifier
 from models.domain_models import DownloadStatus
 from utils.logger import setup_logging
@@ -32,8 +32,8 @@ from core.handler_registry import registry
 from handlers.admin.cookies import handle_cookie_file
 from integrations.ptb_adapter import PtbCommandRegistrar
 
-from llm.manager import build_llm_manager_from_env
-import llm.manager as _llm_mod
+from shared.integrations.llm.manager import build_llm_manager_from_env
+import shared.integrations.llm.manager as _llm_mod
 from modules.billing.handlers.bill_handler import (
   handle_bill_text,
   handle_bill_photo,
@@ -64,19 +64,6 @@ MODULES = [
 ]
 
 def register_all_handlers(app: Application) -> None:
-   # from config import ADMIN_IDS
-   # registry.apply(PtbCommandRegistrar(app, admin_ids=frozenset(ADMIN_IDS)))
-   # app.add_handler(CommandHandler("bill", handle_bill_command))
-   # app.add_handler(MessageHandler(filters.PHOTO, handle_bill_photo))
-   # app.add_handler(
-   #   MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_bill_edit_reply),
-   #   group=1,
-   # )
-
-   # app.add_handler(CallbackQueryHandler(handle_callback))
-   # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-   # app.add_handler(MessageHandler(filters.Document.ALL & CookieFilter(), handle_cookie_file))
-   # app.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
    for module in MODULES:
         module.setup(app)
 

@@ -146,7 +146,7 @@ async def get_formats(url):
                 f"URL: {mask_url(url)}, Format count: {len(formats)}, "
                 f"First 10: {[(f.get('format_id'), f.get('height'), f.get('ext')) for f in formats[:10]]}"
             )
-            logger.debug(f"Full URL (debug only): {url}")
+            logger.debug("Full URL (debug only): %s", url)
             return formats, info
     return await loop.run_in_executor(None, _get)
 
@@ -162,7 +162,7 @@ async def download_video(url: str, format_id: str, progress_hook=None) -> tuple[
         try:
             return await download_video_aria2(url, format_id, progress_hook)
         except Exception as e:
-            logger.warning("aria2 失败，回退到 yt-dlp: %s", e)
+            logger.warning("aria2 failed, falling back to yt-dlp: %s", e)
 
     loop = _get_running_loop()
 
@@ -256,7 +256,7 @@ def download_subtitle(url: str, preferred_langs: list[str] | None = None) -> tup
                 full_path = os.path.join(TEMP_DIR, fname)
                 if time.time() - os.path.getmtime(full_path) < 60:
                     return full_path, info
-    raise RuntimeError("未找到字幕文件，该视频可能没有字幕。")
+    raise RuntimeError("No subtitle found. This video may not have subtitles.")
 
 
 def is_spotify_url(url: str) -> bool:

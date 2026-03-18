@@ -6,16 +6,12 @@ from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
 
-from integrations.strategies.sender import TelegramSender
-from services.facades import DownloadFacade
+from modules.downloader.strategies.sender import TelegramSender
+from modules.downloader.services.facades import DownloadFacade
 from services.middleware import RequestContext, default_pipeline
-from services.container import services
-from services.user_service import set_user_language, warm_user_lang
-from database.history import get_user_history, clear_file_id_by_url
-from utils.i18n import LANGUAGES, t
-from utils.utils import format_history_list
-from utils.auth import check_admin
-from services.session import UserSession
+from shared.services.container import services
+from shared.services.user_service import set_user_language, warm_user_lang
+from shared.services.session import UserSession
 from handlers.user.history import _send_history_page
 
 logger = logging.getLogger(__name__)

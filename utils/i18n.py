@@ -135,16 +135,16 @@ def t(key: str, user_id: int | None = None, lang: str | None = None, **kwargs) -
     if not text:
         text = _get_nested(_load_translations(DEFAULT_LANG), key)
         if text and lang != DEFAULT_LANG:
-            logger.info(f"Missing translation for '{key}' in {lang}, falling back to {DEFAULT_LANG}")
+            logger.info("Missing translation for '%s' in %s, falling back to %s", key, lang, DEFAULT_LANG)
 
     if not text:
-        logger.warning(f"Missing translation key: '{key}'")
+        logger.warning("Missing translation key: '%s'", key)
         return key
 
     try:
         return text.format(**kwargs)
     except KeyError as e:
-        logger.warning(f"Missing i18n placeholder {e} for key '{key}' in lang '{lang}' (got kwargs: {list(kwargs.keys())})")
+        logger.warning("Missing i18n placeholder %s for key '%s' in lang '%s' (got kwargs: %s)", e, key, lang, list(kwargs.keys()))
         return text
 
 

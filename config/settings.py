@@ -42,6 +42,11 @@ RATE_TIER_LIMITS: dict[str, int]   = {
     "blocked": 0,
 }
 CACHE_TTL: int = int(os.getenv("CACHE_TTL", "60"))
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai_compatible")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+
 
 def get_config() -> dict:
     return {

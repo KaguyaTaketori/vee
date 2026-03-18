@@ -48,7 +48,7 @@ async def _run_aria2(cmd: list[str]) -> None:
     )
     _, stderr = await process.communicate()
     if process.returncode != 0:
-        raise RuntimeError(f"aria2c failed: {stderr.decode()}")
+        raise RuntimeError("aria2c failed: %s", stderr.decode())
 
 
 async def download_video_aria2(url, format_id, progress_hook=None):
@@ -85,7 +85,7 @@ async def download_video_aria2(url, format_id, progress_hook=None):
                 if target_format:
                     acodec = target_format.get("acodec")
                     has_audio = acodec not in (None, "none") if acodec else False
-                    logger.info(f"ARIA2 Format {format_id}: acodec={acodec}, has_audio={has_audio}")
+                    logger.info("ARIA2 Format %s: acodec=%s, has_audio=%s", format_id, acodec, has_audio)
                     if has_audio:
                         ydl_opts["format"] = format_id
                     else:

@@ -27,7 +27,7 @@ async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
         "--log-level", "INFO",
     ]
 
-    logger.info(f"Running spotdl: {' '.join(cmd)}")
+    logger.info("Running spotdl: %s", " ".join(cmd))
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -45,7 +45,7 @@ async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
             if not line:
                 continue
 
-            logger.debug(f"[spotdl] {line}")
+            logger.debug("[spotdl] %s", line)
 
             m_done = _SPORTDL_DONE_RE.search(line)
             if m_done:
@@ -68,7 +68,7 @@ async def download_spotify(url: str, progress_hook=None) -> tuple[str, dict]:
         await process.wait()
 
         if process.returncode != 0:
-            raise RuntimeError(f"spotdl exited with code {process.returncode}")
+            raise RuntimeError("spotdl exited with code %s", process.returncode)
 
         files = [
             os.path.join(tmp_dir, f)

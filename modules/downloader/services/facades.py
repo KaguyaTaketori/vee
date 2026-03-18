@@ -5,12 +5,12 @@ import logging
 import traceback
 import uuid
 
-from integrations.strategies.factory import StrategyFactory
+from modules.downloader.strategies.factory import StrategyFactory
 
-from integrations.strategies.sender import BotSender
+from modules.downloader.strategies.sender import BotSender
 
 from models.domain_models import DownloadStatus, DownloadTask
-from services.container import services
+from shared.services.container import services
 from utils.i18n import t
 from utils.logger import log_user
 from utils.telegram_helpers import user_log_args
