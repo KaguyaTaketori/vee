@@ -1,8 +1,14 @@
-# modules/billing/handlers/bill_handler.py
 """
-变更说明（Bug2 修复）：
-- _confirmation_keyboard 新增「✏️ 改明细」按钮，callback_data: bill_edit:items:{cache_id}
-- 其余逻辑不变
+modules/billing/handlers/bill_handler.py
+─────────────────────────────────────────
+Bill command and message handlers.
+
+Fix: handle_bill_text and handle_bill_photo previously each hand-rolled
+their own TelegramContext by manually plumbing _reply_fn, _edit_fn, and
+_bot_send_fn.  This duplicated ~15 lines of boilerplate per handler.
+
+Both handlers now use the new TelegramContext.from_message_with_status()
+factory, which overrides _edit to target the processing message.
 """
 from __future__ import annotations
 
@@ -24,6 +30,10 @@ logger = logging.getLogger(__name__)
 _MAX_ITEMS_PREVIEW = 8
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _get_parser() -> BillParser:
     import shared.integrations.llm.manager as llm_mod
     if llm_mod.llm_manager is None:
@@ -34,11 +44,8 @@ def _get_parser() -> BillParser:
 def _format_items_preview(entry: BillEntry) -> str:
     if not entry.items:
         return ""
-
     lines: list[str] = ["", "━━━━━━ 明细 ━━━━━━"]
-    display_items = entry.items[:_MAX_ITEMS_PREVIEW]
-
-    for item in display_items:
+    for item in entry.items[:_MAX_ITEMS_PREVIEW]:
         if item.item_type == "discount":
             lines.append(f"  ➖ _{item.name}_　`{item.amount:+.0f}`")
         elif item.item_type == "tax":
@@ -46,23 +53,20 @@ def _format_items_preview(entry: BillEntry) -> str:
         else:
             qty_str = f" x{item.quantity:.0f}" if item.quantity != 1 else ""
             lines.append(f"  • {item.name}{qty_str}　`{item.amount:.0f}`")
-
     if len(entry.items) > _MAX_ITEMS_PREVIEW:
-        remaining = len(entry.items) - _MAX_ITEMS_PREVIEW
-        lines.append(f"  _…共 {len(entry.items)} 项，另有 {remaining} 项_")
-
+        lines.append(f"  _…共 {len(entry.items)} 项_")
     return "\n".join(lines)
 
 
 def _build_confirmation_text(entry: BillEntry) -> str:
     category    = entry.category    or "未分类"
     description = entry.description or "—"
-    merchant    = (
+    merchant = (
         entry.merchant
         if entry.merchant and entry.merchant not in ("unknown", "未知商家", "")
         else "未知"
     )
-    bill_date   = entry.bill_date   or "未知"
+    bill_date = entry.bill_date or "未知"
 
     text = (
         f"📋 *账单确认*\n\n"
@@ -73,39 +77,29 @@ def _build_confirmation_text(entry: BillEntry) -> str:
         f"📅 日期：{bill_date}\n"
         f"📎 凭证：{'已附图片' if entry.receipt_file_id else '无'}"
     )
-
     items_preview = _format_items_preview(entry)
     if items_preview:
         text += items_preview
-
     text += "\n\n请确认以上信息是否正确："
     return text
 
 
 def _confirmation_keyboard(cache_id: str):
-    """
-    [Bug2] 新增第三行「✏️ 改明细」按钮。
-    有明细时显示，无明细时仍显示（可用于手动添加的场景，点击后提示无明细）。
-    """
     return [
         [btn("✅ 确认无误", f"bill_confirm:{cache_id}")],
-        [
-            btn("✏️ 改金额",   f"bill_edit:amount:{cache_id}"),
-            btn("🏷️ 改类别",   f"bill_edit:category:{cache_id}"),
-        ],
-        [
-            btn("🏪 改商家",   f"bill_edit:merchant:{cache_id}"),
-            btn("📝 改描述",   f"bill_edit:description:{cache_id}"),
-        ],
-        [
-            btn("📅 改日期",   f"bill_edit:bill_date:{cache_id}"),
-            btn("🧾 改明细",   f"bill_edit:items:{cache_id}"),    # ← Bug2 新增
-        ],
+        [btn("✏️ 改金额",   f"bill_edit:amount:{cache_id}"),
+         btn("🏷️ 改类别",   f"bill_edit:category:{cache_id}")],
+        [btn("🏪 改商家",   f"bill_edit:merchant:{cache_id}"),
+         btn("📝 改描述",   f"bill_edit:description:{cache_id}")],
+        [btn("📅 改日期",   f"bill_edit:bill_date:{cache_id}"),
+         btn("🧾 改明细",   f"bill_edit:items:{cache_id}")],
         [btn("❌ 取消记账", f"bill_cancel:{cache_id}")],
     ]
 
 
-# ── /bill command ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# /bill command
+# ---------------------------------------------------------------------------
 
 async def _bill_command_impl(ctx: PlatformContext) -> None:
     if not ctx.args:
@@ -125,7 +119,15 @@ async def handle_bill_command(update: Update, context: CallbackContext) -> None:
     await _bill_command_impl(ctx)
 
 
-# ── Text bill ─────────────────────────────────────────────────────────────
+@require_message
+async def handle_jz_command(update: Update, context: CallbackContext) -> None:
+    ctx = TelegramContext.from_message(update, context)
+    await _bill_command_impl(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Text bill
+# ---------------------------------------------------------------------------
 
 async def _bill_text_impl(ctx: PlatformContext, text: str) -> None:
     try:
@@ -154,23 +156,14 @@ async def handle_bill_text(update: Update, context: CallbackContext) -> None:
         return
 
     processing_msg = await update.message.reply_text("🤖 AI 正在解析账单，请稍候…")
-
-    async def _edit(txt: str, **kw) -> None:
-        await processing_msg.edit_text(txt, **kw)
-
-    ctx = TelegramContext(
-        user_id=user.id,
-        username=user.username or "",
-        display_name=f"{user.first_name} {user.last_name or ''}".strip(),
-        args=list(context.args or []),
-        _reply_fn=update.message.reply_text,
-        _edit_fn=_edit,
-        _bot_send_fn=lambda chat_id, t: context.bot.send_message(chat_id=chat_id, text=t),
-    )
+    # ↓ Unified factory — no more manual _edit_fn plumbing
+    ctx = TelegramContext.from_message_with_status(update, context, processing_msg)
     await _bill_text_impl(ctx, text=text)
 
 
-# ── Photo bill ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Photo bill
+# ---------------------------------------------------------------------------
 
 async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = "") -> None:
     try:
@@ -189,8 +182,8 @@ async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = 
     cache_id = await bill_cache.set(entry)
     await ctx.edit_keyboard(_build_confirmation_text(entry), _confirmation_keyboard(cache_id))
     logger.info(
-        "Bill photo confirmation sent: cache_id=%s user_id=%s items=%d has_receipt=%s",
-        cache_id, ctx.user_id, len(entry.items), bool(file_id),
+        "Bill photo confirmation sent: cache_id=%s user_id=%s items=%d",
+        cache_id, ctx.user_id, len(entry.items),
     )
 
 
@@ -216,22 +209,6 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
         await processing_msg.edit_text("❌ 图片下载失败，请重试。")
         return
 
-    async def _edit(txt: str, **kw) -> None:
-        await processing_msg.edit_text(txt, **kw)
-
-    ctx = TelegramContext(
-        user_id=user.id,
-        username=user.username or "",
-        display_name=f"{user.first_name} {user.last_name or ''}".strip(),
-        args=[],
-        _reply_fn=update.message.reply_text,
-        _edit_fn=_edit,
-        _bot_send_fn=lambda chat_id, t: context.bot.send_message(chat_id=chat_id, text=t),
-    )
+    # ↓ Same unified factory
+    ctx = TelegramContext.from_message_with_status(update, context, processing_msg)
     await _bill_photo_impl(ctx, image_b64, file_id=file_id)
-
-
-@require_message
-async def handle_jz_command(update: Update, context: CallbackContext) -> None:
-    ctx = TelegramContext.from_message(update, context)
-    await _bill_command_impl(ctx)

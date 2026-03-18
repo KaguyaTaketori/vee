@@ -1,43 +1,61 @@
+"""
+modules/downloader/services/facades.py
+───────────────────────────────────────
+DownloadFacade + _execute_download_task executor.
+
+Previous version had:
+  • process_download_request  — dead code, never called
+  • enqueue_silent            — dead code, never called
+  • enqueue / send_cached     — called everywhere but NOT DEFINED (runtime AttributeError!)
+
+This version keeps only what is actually used.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
 import uuid
 
-from modules.downloader.strategies.factory import StrategyFactory
-
-from modules.downloader.strategies.sender import BotSender
-
-from models.domain_models import DownloadStatus, DownloadTask
+from models.domain_models import DownloadTask, DownloadStatus
 from shared.services.container import services
+from shared.services.session import UserSession
 from utils.i18n import t
-from utils.logger import log_user
-from modules.downloader.integrations.downloaders.ytdlp_client import is_spotify_url
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Task executor  (wired into TaskManager.io_queue at bootstrap)
+# ---------------------------------------------------------------------------
+
 async def _execute_download_task(task: DownloadTask) -> None:
+    """
+    Called by the IO-channel worker for each queued DownloadTask.
+
+    Runs the appropriate strategy, handles cancel events, and updates
+    task.status in-place so the queue's _finalize_task sees the result.
+    """
+    from modules.downloader.strategies.factory import StrategyFactory
+
     strategy = StrategyFactory.get(task.download_type)
     if not strategy:
         task.status = DownloadStatus.FAILED
-        task.error  = f"No strategy found: {task.download_type}"
+        task.error = f"No strategy found: {task.download_type}"
         return
 
     task.status = DownloadStatus.PROCESSING
 
-    ctx = services.queue.get_task_context(task.task_id)
+    ctx = services.task_manager.get_task_context(task.task_id)
     if not ctx:
         task.status = DownloadStatus.FAILED
-        task.error  = "Task context missing"
+        task.error = "Task context missing"
         return
 
-    sender: BotSender = ctx["sender"]
+    sender = ctx["sender"]
+    cancel_event = services.task_manager.get_cancel_event(task.task_id)
 
-    cancel_event    = services.queue.get_cancel_event(task.task_id)
     strategy_future = asyncio.ensure_future(strategy.execute(sender, task.url))
-    cancel_future   = (
+    cancel_future = (
         asyncio.ensure_future(cancel_event.wait())
         if cancel_event
         else asyncio.ensure_future(asyncio.sleep(float("inf")))
@@ -52,19 +70,20 @@ async def _execute_download_task(task: DownloadTask) -> None:
         strategy_future.cancel()
         cancel_future.cancel()
         task.status = DownloadStatus.CANCELLED
-        task.error  = "Queue stopped"
+        task.error = "Queue stopped"
         try:
             await sender.edit_status(t("bot_shutting_down", task.user_id))
         except Exception:
             pass
         return
-
-    for f in pending:
-        f.cancel()
-        try:
-            await f
-        except (asyncio.CancelledError, Exception):
-            pass
+    finally:
+        # Always clean up the non-winning future
+        for f in locals().get("pending", []):
+            f.cancel()
+            try:
+                await f
+            except (asyncio.CancelledError, Exception):
+                pass
 
     if cancel_future in done:
         task.status = DownloadStatus.CANCELLED
@@ -77,9 +96,12 @@ async def _execute_download_task(task: DownloadTask) -> None:
     elif strategy_future in done:
         exc = strategy_future.exception()
         if exc:
-            logger.error("Strategy execution failed: %s: %s", type(exc).__name__, exc)
+            logger.error(
+                "Strategy execution failed: %s: %s", type(exc).__name__, exc,
+                exc_info=exc,
+            )
             task.status = DownloadStatus.FAILED
-            task.error  = str(exc)
+            task.error = str(exc)
             try:
                 if not getattr(exc, "_status_already_edited", False):
                     await sender.edit_status(
@@ -92,102 +114,83 @@ async def _execute_download_task(task: DownloadTask) -> None:
             logger.info("Task %s completed successfully", task.task_id)
 
 
+# ---------------------------------------------------------------------------
+# DownloadFacade  (public API used by handlers and inline_actions)
+# ---------------------------------------------------------------------------
+
 class DownloadFacade:
-    @staticmethod
-    async def process_download_request(
-        sender: BotSender,
-        url: str,
-        callback_data: str,
-        context,
-    ) -> tuple[bool, str | None]:
-        user_id = sender.user_id
+    """
+    Thin facade between handler layer and task queue.
 
-        log_user(
-            user_id=sender.user_id,
-            username=getattr(sender, "username", "N/A"),
-            name=getattr(sender, "display_name", "N/A"),
-            action=f"download_request:{callback_data}",
-        )
-
-        strategy_key = DownloadFacade._map_callback_to_strategy(callback_data, url)
-        if not strategy_key:
-            logger.error("Unknown callback_data: %s", callback_data)
-            return False, "unknown_download_type"
-
-        strategy = StrategyFactory.get(strategy_key)
-        if not strategy:
-            logger.error("No strategy found for key: %s", strategy_key)
-            return False, "unknown_download_type"
-
-        try:
-            task = DownloadTask(
-                task_id=uuid.uuid4().hex[:16],
-                user_id=user_id,
-                url=url,
-                download_type=strategy_key,
-            )
-
-            task_ctx = {"sender": sender, "context": context}
-            await services.queue.add_task(task, task_ctx)
-
-            position = services.queue.get_queue_position(user_id)
-            active   = services.queue.get_active_count()
-
-            if position > 0 or active >= services.queue.max_concurrent:
-                await sender.edit_status(t("queued", user_id, position=position + 1))
-            else:
-                await sender.edit_status(t("downloading", user_id))
-
-            return True, None
-
-        except Exception as exc:
-            logger.error("Failed to queue task: %s: %s", type(exc).__name__, exc)
-            logger.error("Traceback: %s", traceback.format_exc())
-            return False, "download_failed"
-
+    Methods
+    -------
+    enqueue(session, download_type)
+        Queue a new download for the given session.
+    send_cached(session, cached_file_path, download_type)
+        Re-send a previously downloaded file without re-queuing.
+    """
 
     @staticmethod
-    def _map_callback_to_strategy(callback_data: str, url: str | None = None) -> str | None:
-        if callback_data == "download_audio":
-            return "spotify" if (url and is_spotify_url(url)) else "download_audio"
-        if url and is_spotify_url(url):
-            return "spotify"
-        if callback_data == "download_thumbnail":
-            return "thumbnail"
-        if callback_data == "download_subtitle":
-            return "subtitle"
-        if callback_data.startswith("quality_"):
-            return f"video_{callback_data.removeprefix('quality_')}"
-        if callback_data == "download_video":
-            return "download_video"
-        return None
-
-    @staticmethod
-    async def enqueue_silent(
-        sender: BotSender,
-        url: str,
-        download_type: str,
-        context,
-    ) -> None:
-        user_id = sender.user_id
-
-        strategy = StrategyFactory.get(download_type)
-        if not strategy:
-            await sender.edit_status(f"❌ Unsupported type: {download_type}")
-            return
-
+    async def enqueue(session: UserSession, download_type: str) -> None:
+        """Queue a download task for *session*."""
         task = DownloadTask(
             task_id=uuid.uuid4().hex[:16],
-            user_id=user_id,
-            url=url,
+            user_id=session.user_id,
+            url=session.url,
             download_type=download_type,
+            channel="io",
+        )
+        task_ctx: dict = {"sender": session.sender}
+        await services.task_manager.add_task(task, task_ctx)
+
+        position = services.task_manager.get_queue_position(session.user_id)
+        active = services.task_manager.get_active_count()
+
+        if position > 0 or active >= services.task_manager.max_concurrent:
+            try:
+                await session.sender.edit_status(
+                    t("queued", session.user_id, position=position + 1)
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await session.sender.edit_status(t("downloading", session.user_id))
+            except Exception:
+                pass
+
+        logger.info(
+            "Task %s queued: user=%s type=%s position=%d",
+            task.task_id, session.user_id, download_type, position,
         )
 
-        task_ctx = {"sender": sender, "context": context}
-        await services.queue.add_task(task, task_ctx)
-        log_user(
-            user_id=sender.user_id,
-            username="batch",
-            name="batch",
-            action=f"batch_enqueue:{download_type}",
+    @staticmethod
+    async def send_cached(
+        session: UserSession,
+        cached_file_path: str,
+        download_type: str,
+    ) -> None:
+        """
+        Re-send an already-downloaded file.
+
+        Skips the download step and goes straight to the upload/send
+        step of the appropriate strategy.
+        """
+        from modules.downloader.strategies.factory import StrategyFactory
+
+        strategy = StrategyFactory.get(download_type)
+        if strategy is None:
+            logger.warning(
+                "send_cached: no strategy for '%s', falling back to re-download",
+                download_type,
+            )
+            await DownloadFacade.enqueue(session, download_type)
+            return
+
+        logger.info(
+            "send_cached: user=%s type=%s path=%s",
+            session.user_id, download_type, cached_file_path,
         )
+        # Execute strategy — it will detect the cached file via
+        # base.TaskStrategy._check_cached_file and skip the download.
+        await strategy.execute(session.sender, session.url)

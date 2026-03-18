@@ -1,3 +1,22 @@
+"""
+core/handler_registry.py
+─────────────────────────
+Global command handler registry.
+
+The @command_handler decorator fires at import time (module-level side
+effect).  In tests this can cause commands registered by one test module
+to leak into unrelated tests.
+
+Fix: added HandlerRegistry.reset() so test suites can call it in tearDown.
+
+Usage in tests
+--------------
+from core.handler_registry import registry
+
+class MyTest(unittest.TestCase):
+    def tearDown(self):
+        registry.reset()
+"""
 from __future__ import annotations
 
 import logging
@@ -16,8 +35,7 @@ class CommandRegistrar(Protocol):
         *,
         admin_only: bool = False,
         **kwargs: Any,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 @dataclass
@@ -47,6 +65,16 @@ class HandlerRegistry:
             )
             logger.debug("Applied /%s (admin=%s)", entry.command, entry.admin_only)
 
+    def reset(self) -> None:
+        """
+        Clear all registered command entries.
+
+        Intended for use in test tearDown to prevent cross-test
+        contamination from module-level @command_handler side effects.
+        """
+        self._entries.clear()
+        logger.debug("HandlerRegistry: reset (all entries cleared)")
+
     @property
     def all_commands(self) -> list[CommandEntry]:
         return list(self._entries)
@@ -63,5 +91,5 @@ def command_handler(command: str, *, admin_only: bool = False, **kwargs: Any):
             admin_only=admin_only,
             extra_kwargs=kwargs,
         ))
-        return func  # 函数本身不变，可独立测试
+        return func
     return decorator

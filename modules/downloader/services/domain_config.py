@@ -10,6 +10,7 @@ SUPPORTED_DOMAINS = (
     "spotify.com",
     "bilibili.com",
     "bilibili.tv",
+    "b23.tv",
     "tiktok.com",
     "instagram.com",
     "twitter.com",

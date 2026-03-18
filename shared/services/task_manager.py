@@ -1,23 +1,16 @@
-# services/task_manager.py
 """
+shared/services/task_manager.py
+────────────────────────────────
 Multi-channel task manager.
 
-Replaces the single DownloadQueue singleton with three purpose-built
-channels, each with its own concurrency budget and executor:
-
-    io_queue  – stream downloads + uploads          (bandwidth-bound)
-    cpu_queue – GIF conversion, background removal,
-                TTS synthesis                        (CPU-bound)
-    api_queue – AI chat, OCR receipt scanning       (API-concurrency-bound)
-
-Routing is driven by ``DownloadTask.channel``, a new optional field that
-defaults to "io" so existing code keeps working without changes.
-
-Public interface mirrors the old DownloadQueue where possible so that
-facades.py and handlers only need minimal updates.
+Three purpose-built channels:
+    io    – stream downloads + uploads          (bandwidth-bound)
+    cpu   – GIF conversion, background removal  (CPU-bound)
+    api   – AI chat, OCR receipt scanning       (API-concurrency-bound)
 """
 from __future__ import annotations
 
+import asyncio  # ← was missing, caused NameError in get_cancel_event
 import logging
 from typing import Callable, Optional
 
@@ -26,29 +19,12 @@ from shared.services._queue import DownloadQueue
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Channel tag constants – use these instead of raw strings in call sites.
-# ---------------------------------------------------------------------------
-IO_CHANNEL  = "io"    # bandwidth-heavy: download, upload
-CPU_CHANNEL = "cpu"   # CPU-heavy: gif, matting, tts
-API_CHANNEL = "api"   # fast API: AI Q&A, OCR
+IO_CHANNEL  = "io"
+CPU_CHANNEL = "cpu"
+API_CHANNEL = "api"
 
 
 class TaskManager:
-    """
-    Façade over three DownloadQueue instances.
-
-    Parameters
-    ----------
-    io_workers:
-        Concurrent slots for I/O tasks (default 3 – same as before).
-    cpu_workers:
-        Concurrent slots for CPU tasks (default 2 – spare cores).
-    api_workers:
-        Concurrent slots for API tasks (default 5 – cheap to wait on).
-    max_completed:
-        Per-channel completed-task cache size.
-    """
 
     def __init__(
         self,
@@ -67,20 +43,9 @@ class TaskManager:
             API_CHANNEL: self.api_queue,
         }
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def set_executor(self, executor: Callable, channel: str = IO_CHANNEL) -> None:
-        """
-        Wire an executor coroutine into one channel.
-
-        Call once per channel during post_init:
-
-            task_manager.set_executor(execute_download, IO_CHANNEL)
-            task_manager.set_executor(execute_cpu_task, CPU_CHANNEL)
-            task_manager.set_executor(execute_api_task, API_CHANNEL)
-        """
         queue = self._channels.get(channel)
         if queue is None:
             raise ValueError(f"Unknown channel '{channel}'. Valid: {list(self._channels)}")
@@ -96,9 +61,7 @@ class TaskManager:
             await queue.stop()
         logger.info("TaskManager: all channels stopped.")
 
-    # ------------------------------------------------------------------
-    # Task routing
-    # ------------------------------------------------------------------
+    # ── Task routing ───────────────────────────────────────────────────────
 
     async def add_task(
         self,
@@ -106,26 +69,17 @@ class TaskManager:
         telegram_ctx: TaskContext = None,
         priority: int = 10,
     ) -> str:
-        """
-        Route *task* to the correct channel based on ``task.channel``.
-
-        If ``task.channel`` is not set or unrecognised, it defaults to
-        ``IO_CHANNEL`` so existing callers need no changes.
-        """
         channel = getattr(task, "channel", IO_CHANNEL) or IO_CHANNEL
-        queue = self._channels.get(channel, self.io_queue)
-
-        if channel not in self._channels:
+        queue = self._channels.get(channel)
+        if queue is None:
             logger.warning(
                 "TaskManager: unknown channel '%s' for task %s, routing to io.",
                 channel, task.task_id,
             )
-
+            queue = self.io_queue
         return await queue.add_task(task, telegram_ctx, priority)
 
-    # ------------------------------------------------------------------
-    # Query helpers (union across all channels)
-    # ------------------------------------------------------------------
+    # ── Query helpers ──────────────────────────────────────────────────────
 
     def get_task(self, task_id: str) -> Optional[DownloadTask]:
         for queue in self._channels.values():
@@ -148,17 +102,13 @@ class TaskManager:
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
 
     def get_all_active_tasks(self) -> list[DownloadTask]:
-        """Return all currently active tasks across all channels."""
         tasks: list[DownloadTask] = []
         for queue in self._channels.values():
             tasks.extend(queue.get_all_active_tasks())
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
 
     def get_queue_position(self, user_id: int) -> int:
-        """Sum of pending positions across all channels for a user."""
-        return sum(
-            q.get_queue_position(user_id) for q in self._channels.values()
-        )
+        return sum(q.get_queue_position(user_id) for q in self._channels.values())
 
     def get_active_count(self, channel: str = None) -> int:
         if channel:
@@ -170,15 +120,11 @@ class TaskManager:
             return self._channels[channel].get_total_queued()
         return sum(q.get_total_queued() for q in self._channels.values())
 
-    # Backward-compat alias used by existing admin /queue handler
     @property
     def max_concurrent(self) -> int:
-        """Total concurrency across all channels."""
         return sum(q.max_concurrent for q in self._channels.values())
 
-    # ------------------------------------------------------------------
-    # Cancellation
-    # ------------------------------------------------------------------
+    # ── Cancellation ───────────────────────────────────────────────────────
 
     async def cancel_task(self, task_id: str) -> bool:
         for queue in self._channels.values():
@@ -196,9 +142,7 @@ class TaskManager:
                 return event
         return None
 
-    # ------------------------------------------------------------------
-    # Channel introspection (for /queue admin command)
-    # ------------------------------------------------------------------
+    # ── Introspection ──────────────────────────────────────────────────────
 
     def stats(self) -> dict[str, dict]:
         return {

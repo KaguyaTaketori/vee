@@ -1,11 +1,15 @@
 """
-services/bill_cache.py
+modules/billing/services/bill_cache.py
+───────────────────────────────────────
+In-memory (and optional Redis) cache for pending bill confirmations.
 
-变更说明（items 支持版本）：
-1. BillEntry 新增 items: list[BillItem] 字段，用于存储收据商品明细
-2. BillItem dataclass：name / name_raw / quantity / unit_price / amount / item_type / sort_order
-3. to_dict / from_dict 完整支持 items 序列化，兼容旧数据（无 items 字段时默认 []）
-4. 缓存逻辑不变，InMemoryBillCache / RedisBillCache 均透明支持
+Fix: InMemoryBillCache.update() previously always reset TTL to
+default_ttl, meaning a user who spent 14 minutes editing a bill would
+suddenly lose their work at the 15-minute mark on the next edit.
+
+New behaviour:
+  - update(cache_id, entry)            → preserve remaining TTL
+  - update(cache_id, entry, ttl=N)     → explicitly set new TTL
 """
 from __future__ import annotations
 
@@ -19,31 +23,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TTL = 900  # 15 分钟
+_DEFAULT_TTL = 900  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
-# 商品明细模型
+# BillItem
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BillItem:
-    """
-    收据中的单行商品/折扣/税费。
-
-    item_type 枚举：
-        'item'     — 普通商品
-        'discount' — 折扣（amount 为负数）
-        'tax'      — 税费
-        'subtotal' — 小计行（一般不入库，仅供展示）
-    """
-    name: str                          # 商品名（翻译为中文）
-    amount: float                      # 该行金额；折扣为负数
-    name_raw: str = ""                 # 原始文字（日文等）
+    name: str
+    amount: float
+    name_raw: str = ""
     quantity: float = 1.0
     unit_price: Optional[float] = None
-    item_type: str = "item"            # item | discount | tax | subtotal
-    sort_order: int = 0                # 与收据顺序对应
+    item_type: str = "item"
+    sort_order: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -54,22 +49,21 @@ class BillItem:
 
 
 # ---------------------------------------------------------------------------
-# 账单主模型
+# BillEntry
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BillEntry:
-    """AI 解析出的账单临时数据。"""
     user_id: int
     amount: float
     currency: str
     category: str
     description: str
     merchant: str
-    bill_date: str                              # ISO 格式 YYYY-MM-DD
-    raw_text: str = ""                                    # 原始用户输入（审计用）
-    items: list[BillItem] = field(default_factory=list)   # 商品明细
-    receipt_file_id: str = ""                             # Telegram file_id（图片凭证）
+    bill_date: str
+    raw_text: str = ""
+    items: list[BillItem] = field(default_factory=list)
+    receipt_file_id: str = ""
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -78,19 +72,20 @@ class BillEntry:
     @classmethod
     def from_dict(cls, d: dict) -> "BillEntry":
         items_raw = d.pop("items", []) or []
-        d.setdefault("receipt_file_id", "")               # 兼容旧数据
+        d.setdefault("receipt_file_id", "")
         obj = cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
         obj.items = [BillItem.from_dict(i) for i in items_raw if isinstance(i, dict)]
         return obj
 
 
 # ---------------------------------------------------------------------------
-# 内存缓存（默认，单进程）
+# InMemoryBillCache
 # ---------------------------------------------------------------------------
 
 class InMemoryBillCache:
     def __init__(self, default_ttl: int = _DEFAULT_TTL) -> None:
         self._default_ttl = default_ttl
+        # value: (entry, absolute_expire_monotonic)
         self._store: dict[str, tuple[BillEntry, float]] = {}
         self._lock = asyncio.Lock()
 
@@ -114,13 +109,34 @@ class InMemoryBillCache:
                 return None
             return entry
 
-    async def update(self, cache_id: str, entry: BillEntry, ttl: Optional[int] = None) -> bool:
+    async def update(
+        self,
+        cache_id: str,
+        entry: BillEntry,
+        ttl: Optional[int] = None,
+    ) -> bool:
+        """
+        Update the entry in the cache.
+
+        TTL behaviour:
+          - ttl=None  → preserve the original expiry time (don't punish
+                        users for editing their bill)
+          - ttl=N     → set a brand-new TTL of N seconds from now
+        """
         async with self._lock:
-            if cache_id not in self._store:
+            existing = self._store.get(cache_id)
+            if existing is None:
                 return False
-            new_expire = time.monotonic() + (ttl if ttl is not None else self._default_ttl)
-            self._store[cache_id] = (entry, new_expire)
-        logger.debug("BillCache UPDATE cache_id=%s (TTL renewed)", cache_id)
+            _, original_expire_at = existing
+            new_expire_at = (
+                time.monotonic() + ttl      # explicit override
+                if ttl is not None
+                else original_expire_at     # ← preserve remaining time
+            )
+            self._store[cache_id] = (entry, new_expire_at)
+        logger.debug(
+            "BillCache UPDATE cache_id=%s ttl_override=%s", cache_id, ttl
+        )
         return True
 
     async def delete(self, cache_id: str) -> bool:
@@ -141,7 +157,7 @@ class InMemoryBillCache:
 
 
 # ---------------------------------------------------------------------------
-# Redis 后端（多实例部署时使用）
+# RedisBillCache  (unchanged — Redis TTL is always explicit via SETEX)
 # ---------------------------------------------------------------------------
 
 class RedisBillCache:
@@ -164,11 +180,7 @@ class RedisBillCache:
     async def set(self, entry: BillEntry, ttl: Optional[int] = None) -> str:
         cache_id = str(uuid.uuid4())
         r = await self._get_redis()
-        await r.setex(
-            self._key(cache_id),
-            ttl or self._default_ttl,
-            json.dumps(entry.to_dict()),
-        )
+        await r.setex(self._key(cache_id), ttl or self._default_ttl, json.dumps(entry.to_dict()))
         return cache_id
 
     async def get(self, cache_id: str) -> Optional[BillEntry]:
@@ -182,27 +194,32 @@ class RedisBillCache:
             logger.error("RedisBillCache GET parse error cache_id=%s: %s", cache_id, e)
             return None
 
-    async def update(self, cache_id: str, entry: BillEntry, ttl: Optional[int] = None) -> bool:
+    async def update(
+        self,
+        cache_id: str,
+        entry: BillEntry,
+        ttl: Optional[int] = None,
+    ) -> bool:
         r = await self._get_redis()
         k = self._key(cache_id)
         existing_ttl = await r.ttl(k)
         if existing_ttl < 0:
             return False
-        new_ttl = ttl if ttl is not None else self._default_ttl
+        # Preserve remaining TTL unless explicitly overridden
+        new_ttl = ttl if ttl is not None else existing_ttl
         await r.setex(k, new_ttl, json.dumps(entry.to_dict()))
         return True
 
     async def delete(self, cache_id: str) -> bool:
         r = await self._get_redis()
-        deleted = await r.delete(self._key(cache_id))
-        return deleted > 0
+        return await r.delete(self._key(cache_id)) > 0
 
     async def purge_expired(self) -> int:
-        return 0
+        return 0  # Redis handles expiry natively
 
 
 # ---------------------------------------------------------------------------
-# 全局单例
+# Global singleton
 # ---------------------------------------------------------------------------
 
 bill_cache: InMemoryBillCache = InMemoryBillCache()

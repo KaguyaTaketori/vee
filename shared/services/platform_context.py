@@ -183,6 +183,42 @@ class TelegramContext(PlatformContext):
             _bot_send_fn=_bot_send,
         )
 
+    @classmethod
+    def from_message_with_status(
+        cls,
+        update: Any,
+        context: Any,
+        processing_msg: Any,
+    ) -> "TelegramContext":
+        msg  = update.message
+        user = msg.from_user
+        args: list[str] = list(context.args or [])
+
+        async def _reply(text: str, **kw: Any) -> None:
+            await msg.reply_text(text, **kw)
+
+        async def _edit(text: str, **kw: Any) -> None:
+            # ← edit the processing message, not send a new one
+            await processing_msg.edit_text(text, **kw)
+
+        async def _bot_send(chat_id: int, text: str) -> None:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+
+        def _sender_factory(pm: Any) -> Any:
+            from modules.downloader.strategies.sender import TelegramSender
+            return TelegramSender.from_message(msg, pm)
+
+        return cls(
+            user_id=user.id,
+            username=user.username or "",
+            display_name=f"{user.first_name} {user.last_name or ''}".strip(),
+            args=args,
+            _reply_fn=_reply,
+            _edit_fn=_edit,
+            _bot_send_fn=_bot_send,
+            _sender_factory=_sender_factory,
+        )
+
     # ── PlatformContext impl ───────────────────────────────────────────────
 
     async def send(self, text: str) -> None:

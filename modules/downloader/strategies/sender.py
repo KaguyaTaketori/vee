@@ -1,26 +1,38 @@
+"""
+modules/downloader/strategies/sender.py
+────────────────────────────────────────
+BotSender Protocol + TelegramSender implementation.
+
+All telegram.* imports are confined to TelegramSender; the Protocol
+itself is fully platform-agnostic.
+"""
 from __future__ import annotations
 
 import logging
-from typing import BinaryIO, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, BinaryIO, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    # These imports are only evaluated by type checkers, never at runtime,
+    # so there is zero PTB dependency in the Protocol layer.
+    from telegram import CallbackQuery, Message, User
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Platform-agnostic BotSender Protocol
+# ---------------------------------------------------------------------------
+
 @runtime_checkable
 class BotSender(Protocol):
-    """Platform-agnostic interface for replying to a user during a download task.
+    """Platform-agnostic interface for replying to a user during a download.
 
-    Every method maps to one user-facing action.  Platform adapters (Telegram,
-    Discord, …) implement this; strategies depend only on this interface.
-
-    Return values of send_* are an optional *cache key* (Telegram's file_id).
-    Platforms that don't support caching just return None — the strategy
-    will re-upload next time, which is perfectly correct behaviour.
+    Return values of send_* are an optional *cache key* (Telegram file_id).
+    Platforms that don't support caching return None — the strategy will
+    re-upload next time, which is correct behaviour.
     """
 
     user_id: int
-
-    # ------------------------------------------------------------------ status
 
     async def edit_status(self, text: str) -> None:
         """Replace the in-progress status message with new text."""
@@ -30,46 +42,29 @@ class BotSender(Protocol):
         """Send a new plain-text message (separate from the status message)."""
         ...
 
-    # ------------------------------------------------------------------- media
-
     async def send_video(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         caption: str | None = None,
-    ) -> str | None:
-        """Send a video.  *file* may be a path, open file handle, or a
-        platform-native cache key (e.g. Telegram file_id).
-        Returns a cacheable key, or None.
-        """
-        ...
+    ) -> str | None: ...
 
     async def send_audio(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         title: str | None = None,
-    ) -> str | None:
-        """Send an audio track.  Returns a cacheable key, or None."""
-        ...
+    ) -> str | None: ...
 
     async def send_document(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         caption: str | None = None,
-    ) -> str | None:
-        """Send a document / generic file.  Returns a cacheable key, or None."""
-        ...
+    ) -> str | None: ...
 
     async def send_photo(
         self,
         source: str,
         caption: str | None = None,
-    ) -> str | None:
-        """Send a photo from a URL, local path, or cache key.
-        Returns a cacheable key, or None.
-        """
-        ...
-
-    # ----------------------------------------------------------------- logging
+    ) -> str | None: ...
 
     def log_download(
         self,
@@ -77,36 +72,41 @@ class BotSender(Protocol):
         url: str,
         status: str,
         file_size: int | None = None,
-    ) -> None:
-        """Write a platform-specific audit log entry for this download."""
-        ...
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
 # Telegram implementation
 # ---------------------------------------------------------------------------
+
 class TelegramSender:
+    """PTB implementation of BotSender.
+
+    Constructed via factory methods; never instantiate directly.
+    All telegram.* objects are imported lazily inside methods so that
+    importing this module does not force a PTB dependency on non-PTB code.
+    """
 
     def __init__(
         self,
-        user: User,
-        reply_target: Message,
-        processing_msg: Message,
+        user: "User",
+        reply_target: "Message",
+        processing_msg: "Message",
     ) -> None:
         self._user = user
         self._reply_target = reply_target
         self._processing_msg = processing_msg
         self.user_id: int = user.id
 
-    # ------------------------------------------------------------------ 工厂方法
+    # ── Factories ──────────────────────────────────────────────────────────
 
     @classmethod
     def from_callback(
         cls,
-        query: CallbackQuery,
-        processing_msg: Message,
+        query: "CallbackQuery",
+        processing_msg: "Message",
     ) -> "TelegramSender":
-        """从按钮回调构造。reply_target 是 query.message。"""
+        """Build from an inline-button callback. reply_target = query.message."""
         return cls(
             user=query.from_user,
             reply_target=query.message,
@@ -116,17 +116,17 @@ class TelegramSender:
     @classmethod
     def from_message(
         cls,
-        message: Message,
-        processing_msg: Message,
+        message: "Message",
+        processing_msg: "Message",
     ) -> "TelegramSender":
-        """从文本消息构造（包括批量模式）。reply_target 就是 message 本身。"""
+        """Build from a plain message (text link, batch mode)."""
         return cls(
             user=message.from_user,
             reply_target=message,
             processing_msg=processing_msg,
         )
 
-    # ------------------------------------------------------------------ status
+    # ── Status ─────────────────────────────────────────────────────────────
 
     async def edit_status(self, text: str) -> None:
         await self._processing_msg.edit_text(text)
@@ -134,61 +134,53 @@ class TelegramSender:
     async def send_message(self, text: str) -> None:
         await self._reply_target.reply_text(text)
 
-    # ------------------------------------------------------------------- media
+    # ── Media ──────────────────────────────────────────────────────────────
 
     async def send_video(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         caption: str | None = None,
     ) -> str | None:
-        logger.info("send_video: file=%s, caption=%s", file, caption)
+        logger.info("send_video: caption=%s", caption)
         sent = await self._reply_target.reply_video(video=file, caption=caption)
-        logger.info(
-            "send_video: file_id=%s",
-            sent.video.file_id if sent and sent.video else None,
-        )
-        return sent.video.file_id if sent and sent.video else None
+        file_id = sent.video.file_id if sent and sent.video else None
+        logger.info("send_video: file_id=%s", file_id)
+        return file_id
 
     async def send_audio(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         title: str | None = None,
     ) -> str | None:
-        logger.info("send_audio: file=%s, title=%s", file, title)
+        logger.info("send_audio: title=%s", title)
         sent = await self._reply_target.reply_audio(audio=file, title=title)
-        logger.info(
-            "send_audio: file_id=%s",
-            sent.audio.file_id if sent and sent.audio else None,
-        )
-        return sent.audio.file_id if sent and sent.audio else None
+        file_id = sent.audio.file_id if sent and sent.audio else None
+        logger.info("send_audio: file_id=%s", file_id)
+        return file_id
 
     async def send_document(
         self,
-        file: str | BinaryIO,
+        file: "str | BinaryIO",
         caption: str | None = None,
     ) -> str | None:
-        logger.info("send_document: file=%s, caption=%s", file, caption)
+        logger.info("send_document: caption=%s", caption)
         sent = await self._reply_target.reply_document(document=file, caption=caption)
-        logger.info(
-            "send_document: file_id=%s",
-            sent.document.file_id if sent and sent.document else None,
-        )
-        return sent.document.file_id if sent and sent.document else None
+        file_id = sent.document.file_id if sent and sent.document else None
+        logger.info("send_document: file_id=%s", file_id)
+        return file_id
 
     async def send_photo(
         self,
         source: str,
         caption: str | None = None,
     ) -> str | None:
-        logger.info("send_photo: source=%s, caption=%s", source, caption)
+        logger.info("send_photo: caption=%s", caption)
         sent = await self._reply_target.reply_photo(photo=source, caption=caption)
-        logger.info(
-            "send_photo: file_id=%s",
-            sent.photo[-1].file_id if sent and sent.photo else None,
-        )
-        return sent.photo[-1].file_id if sent and sent.photo else None
+        file_id = sent.photo[-1].file_id if sent and sent.photo else None
+        logger.info("send_photo: file_id=%s", file_id)
+        return file_id
 
-    # ----------------------------------------------------------------- logging
+    # ── Logging ────────────────────────────────────────────────────────────
 
     def log_download(
         self,
