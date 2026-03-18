@@ -1,24 +1,22 @@
+# handlers/user/basic.py
 """
 handlers/user/basic.py
 ───────────────────────
 Basic user commands: /start, /help, /myid, /lang
 
-Decoupling
-──────────
-Each command now has two layers:
+Two-layer pattern
+─────────────────
+1. ``_impl(ctx: PlatformContext, ...)`` — pure business logic.
+   No telegram.* import, no Update, no CallbackContext, no tg_user object.
+   All user identity comes from ctx.user_id / ctx.username / ctx.display_name.
 
-1. **_impl(ctx: PlatformContext, ...)** — pure business logic.
-   No telegram.* import, no Update, no CallbackContext.
-   Can be called in tests with a MockPlatformContext.
+2. ``xxx_command(update, context)`` — thin PTB adapter.
+   Builds TelegramContext, delegates immediately to _impl.
 
-2. **xxx_command(update, context)** — thin PTB adapter.
-   Builds a TelegramContext, delegates immediately to _impl.
-   All Telegram-specific wiring is confined here.
-
-The decorator stack (@command_handler, @require_message) is unchanged,
-so the PTB registration machinery keeps working without modification.
+``user_log_args(tg_user: telegram.User)`` is no longer needed:
+  log_user() is called with (ctx.user_id, ctx.username, ctx.display_name)
+  which are plain strings already on PlatformContext.
 """
-
 from __future__ import annotations
 
 import logging
@@ -31,7 +29,6 @@ from core.handler_registry import command_handler
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, set_user_language
 from utils.logger import log_user
-from utils.telegram_helpers import user_log_args
 from utils.i18n import t, LANGUAGES
 from utils.utils import require_message
 
@@ -40,9 +37,16 @@ logger = logging.getLogger(__name__)
 
 # ── /start ────────────────────────────────────────────────────────────────
 
-async def _start_impl(ctx: PlatformContext, tg_user: object) -> None:
-    track_user(tg_user)
-    log_user(**user_log_args(tg_user), action="start")
+async def _start_impl(ctx: PlatformContext) -> None:
+    # track_user still needs the raw PTB user object for persistence;
+    # the PTB adapter passes it as a keyword so _impl stays PTB-free.
+    # log_user uses plain strings available on ctx — no telegram.User needed.
+    log_user(
+        user_id=ctx.user_id,
+        username=ctx.username or "N/A",
+        name=ctx.display_name,
+        action="start",
+    )
     await ctx.send(t("welcome", ctx.user_id))
 
 
@@ -50,7 +54,8 @@ async def _start_impl(ctx: PlatformContext, tg_user: object) -> None:
 @require_message
 async def start_command(update: Update, context: CallbackContext) -> None:
     ctx = TelegramContext.from_message(update, context)
-    await _start_impl(ctx, update.message.from_user)
+    track_user(update.message.from_user)   # PTB-specific persistence call, stays in adapter
+    await _start_impl(ctx)
 
 
 # ── /help ─────────────────────────────────────────────────────────────────
@@ -97,7 +102,6 @@ async def _lang_impl(ctx: PlatformContext) -> None:
     • With arg → set language directly
     """
     if not ctx.args:
-        # Build keyboard from available languages
         buttons = [
             [btn(name, f"lang_{code}")]
             for code, name in LANGUAGES.items()

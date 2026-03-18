@@ -1,5 +1,20 @@
+# modules/downloader/handlers/message_parser.py
 """
 modules/downloader/handlers/message_parser.py
+
+Decoupling
+──────────
+``_handle_link_impl``, ``_handle_single_url``, ``_handle_batch_urls``
+previously accepted ``update`` and ``context`` only to construct a
+``TelegramSender``.  That construction now goes through
+``ctx.create_sender(processing_msg)``, which is implemented on
+``TelegramContext.from_message`` via a captured closure — the _impl
+functions never see a PTB object.
+
+The PTB entry point ``handle_link`` remains a thin adapter:
+  1. Extracts user, urls, builds RequestContext for middleware.
+  2. Constructs TelegramContext (which captures the PTB Message).
+  3. Delegates to _handle_link_impl(ctx, urls).
 """
 from __future__ import annotations
 
@@ -12,7 +27,6 @@ from telegram import Update
 from telegram.ext import CallbackContext
 
 from modules.downloader.services.facades import DownloadFacade
-from modules.downloader.strategies.sender import TelegramSender
 from modules.downloader.services.domain_config import SUPPORTED_DOMAINS, is_spotify_url
 from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
@@ -62,22 +76,19 @@ def _infer_download_type(url: str) -> str:
     return "spotify" if is_spotify_url(url) else "download_audio"
 
 
-# ── Business logic (_impl functions) ──────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Business logic — no PTB objects
+# ---------------------------------------------------------------------------
 
-async def _handle_link_impl(ctx: PlatformContext, urls: list[str], update, context) -> None:
-    """Core dispatch after URL extraction and middleware checks."""
+async def _handle_link_impl(ctx: PlatformContext, urls: list[str]) -> None:
+    """Dispatch after URL extraction and middleware checks."""
     if len(urls) == 1:
-        await _handle_single_url(ctx, update, context, urls[0])
+        await _handle_single_url(ctx, urls[0])
     else:
-        await _handle_batch_urls(ctx, update, context, urls)
+        await _handle_batch_urls(ctx, urls)
 
 
-async def _handle_single_url(
-    ctx: PlatformContext,
-    update: Update,
-    context: CallbackContext,
-    url: str,
-) -> None:
+async def _handle_single_url(ctx: PlatformContext, url: str) -> None:
     recent_download = await check_recent_download(url, max_age_hours=24, download_type=None)
     cached_file_path: str | None = None
 
@@ -93,17 +104,16 @@ async def _handle_single_url(
 
     if cached_file_path:
         download_type = recent_download.get("download_type", "video")
-        processing_msg = await update.message.reply_text(t("processing_please_wait", ctx.user_id))
-        sender = TelegramSender.from_message(update.message, processing_msg)
+        processing_msg = await ctx.send(t("processing_please_wait", ctx.user_id))
+        sender = ctx.create_sender(processing_msg)
         session = UserSession(url=url, user_id=ctx.user_id, sender=sender)
         await DownloadFacade.send_cached(session, cached_file_path, download_type)
         return
 
     # Show download-type selection keyboard
     session_key = UserSession.store(url=url, user_id=ctx.user_id)
-    is_spotify = is_spotify_url(url)
 
-    if is_spotify:
+    if is_spotify_url(url):
         buttons = [
             [btn(t("audio", ctx.user_id), f"dl_spotify_{session_key}")],
         ]
@@ -117,12 +127,7 @@ async def _handle_single_url(
     await ctx.send_keyboard(t("what_download", ctx.user_id), buttons)
 
 
-async def _handle_batch_urls(
-    ctx: PlatformContext,
-    update: Update,
-    context: CallbackContext,
-    urls: list[str],
-) -> None:
+async def _handle_batch_urls(ctx: PlatformContext, urls: list[str]) -> None:
     if len(urls) > MAX_BATCH_SIZE:
         await ctx.send(t("batch_limit_exceeded", ctx.user_id, max=MAX_BATCH_SIZE, count=len(urls)))
         urls = urls[:MAX_BATCH_SIZE]
@@ -130,16 +135,18 @@ async def _handle_batch_urls(
     await ctx.send(t("batch_start", ctx.user_id, count=len(urls)))
 
     for i, url in enumerate(urls, 1):
-        processing_msg = await update.message.reply_text(
+        processing_msg = await ctx.send(
             t("batch_item_queued", ctx.user_id, index=i, total=len(urls), url=url[:50])
         )
-        sender = TelegramSender.from_message(update.message, processing_msg)
+        sender = ctx.create_sender(processing_msg)
         download_type = _infer_download_type(url)
         session = UserSession(url=url, user_id=ctx.user_id, sender=sender)
         await DownloadFacade.enqueue(session, download_type)
 
 
-# ── PTB entry point ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PTB entry point
+# ---------------------------------------------------------------------------
 
 @require_message
 async def handle_link(update: Update, context: CallbackContext) -> None:
@@ -150,6 +157,8 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
     text = update.message.text.strip()
     urls = [u for u in URL_PATTERN.findall(text) if is_valid_url(u)]
 
+    # TelegramContext.from_message captures `update.message` in a closure,
+    # making ctx.create_sender() work without re-exposing the PTB object.
     ctx = TelegramContext.from_message(update, context)
 
     if not urls:
@@ -163,4 +172,4 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
         await ctx.send(t(result.error_key, ctx.user_id))
         return
 
-    await _handle_link_impl(ctx, urls, update, context)
+    await _handle_link_impl(ctx, urls)

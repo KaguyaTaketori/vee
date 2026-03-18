@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,27 @@ class PlatformContext(ABC):
     @abstractmethod
     async def bot_send(self, chat_id: int, text: str) -> None: ...
 
+    def create_sender(self, processing_msg: Any) -> Optional[Any]:
+        """Return a platform-specific BotSender for this message context.
+
+        The returned object satisfies the ``BotSender`` Protocol.
+
+        Parameters
+        ----------
+        processing_msg:
+            The "processing…" status message sent just before queuing the
+            download.  On Telegram this is a PTB ``Message`` object;
+            ``TelegramSender`` calls ``edit_text`` on it to update progress.
+
+        Returns
+        -------
+        BotSender | None
+            ``None`` for contexts where no sender can be created
+            (e.g. callback-query contexts — the caller constructs the sender
+            from the raw query object instead).
+        """
+        return None
+
 
 # ---------------------------------------------------------------------------
 # TelegramContext
@@ -96,6 +117,7 @@ class TelegramContext(PlatformContext):
         _reply_fn: Callable[..., Awaitable[Any]],
         _edit_fn: Callable[..., Awaitable[Any]],
         _bot_send_fn: Callable[..., Awaitable[Any]],
+        _sender_factory: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         self.user_id = user_id
         self.username = username
@@ -104,13 +126,12 @@ class TelegramContext(PlatformContext):
         self._reply = _reply_fn
         self._edit = _edit_fn
         self._bot_send = _bot_send_fn
+        self._sender_factory = _sender_factory
 
     # ── factories ──────────────────────────────────────────────────────────
 
     @classmethod
     def from_message(cls, update: Any, context: Any) -> "TelegramContext":
-        from telegram.constants import ParseMode as _PM  # noqa: F401
-
         msg = update.message
         user = msg.from_user
         args: list[str] = list(context.args or [])
@@ -124,6 +145,10 @@ class TelegramContext(PlatformContext):
         async def _bot_send(chat_id: int, text: str) -> None:
             await context.bot.send_message(chat_id=chat_id, text=text)
 
+        def _sender_factory(processing_msg: Any) -> Any:
+            from modules.downloader.strategies.sender import TelegramSender
+            return TelegramSender.from_message(msg, processing_msg)
+
         return cls(
             user_id=user.id,
             username=user.username or "",
@@ -132,6 +157,7 @@ class TelegramContext(PlatformContext):
             _reply_fn=_reply,
             _edit_fn=_edit,
             _bot_send_fn=_bot_send,
+            _sender_factory=_sender_factory,
         )
 
     @classmethod
@@ -190,3 +216,9 @@ class TelegramContext(PlatformContext):
 
     async def bot_send(self, chat_id: int, text: str) -> None:
         await self._bot_send(chat_id, text)
+
+    def create_sender(self, processing_msg: Any) -> Optional[Any]:
+        """Return a TelegramSender bound to this message context, or None."""
+        if self._sender_factory is not None:
+            return self._sender_factory(processing_msg)
+        return None
