@@ -25,9 +25,8 @@ from __future__ import annotations
 import logging
 
 from config import ADMIN_IDS
-from core.callback_bus import register, CallbackContext, TelegramCallbackContext
+from core.callback_bus import register, CallbackContext
 from core.callback_bus import handle_callback  # re-export for DownloaderModule.setup()
-from modules.downloader.strategies.sender import TelegramSender
 from modules.downloader.services.facades import DownloadFacade
 from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.container import services
@@ -164,14 +163,11 @@ async def _cb_download_select(ctx: CallbackContext) -> None:
         await ctx.answer_alert(t(result.error_key, ctx.user_id))
         return
 
-    # TelegramSender still requires the raw PTB query to build its reply target.
-    # Reach through TelegramCallbackContext to get the underlying query.
+    # TelegramSender is constructed via ctx.create_sender() — no isinstance check,
+    # no direct access to ctx._query.  TelegramCallbackContext.create_sender()
+    # builds TelegramSender.from_callback(self._query, processing_msg) internally.
     processing_msg = await ctx.platform_ctx.send(t("downloading", ctx.user_id))
-
-    if isinstance(ctx, TelegramCallbackContext):
-        sender = TelegramSender.from_callback(ctx._query, processing_msg)
-    else:
-        sender = None  # type: ignore[assignment]
+    sender = ctx.create_sender(processing_msg)
 
     await DownloadFacade.enqueue(
         UserSession(url=session.url, user_id=ctx.user_id, sender=sender),
@@ -209,7 +205,10 @@ async def _cb_refresh_page(ctx: CallbackContext) -> None:
     parts = ctx.data.split("_")
     admin_id = int(parts[2])
     page = int(parts[3])
-    from handlers.admin.tasks import _send_refresh_page
+    from handlers.admin.tasks import _refresh_page_impl
     await ctx.answer()
-    if isinstance(ctx, TelegramCallbackContext):
-        await _send_refresh_page(ctx._query, admin_id, page, ctx.raw_context)
+
+    def _store(uid: int, urls: list) -> None:
+        ctx.raw_context.bot_data[f"refresh_urls_{uid}"] = urls
+
+    await _refresh_page_impl(ctx.platform_ctx, admin_id, page, edit=True, store_urls_fn=_store)

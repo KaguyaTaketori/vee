@@ -120,6 +120,48 @@ class CallbackContext(ABC):
         """删除触发此回调的消息。"""
         ...
 
+    def create_sender(self, processing_msg: Any) -> Any:
+        """Return a platform-specific BotSender anchored to this callback's message.
+
+        The returned object satisfies the ``BotSender`` Protocol and can be
+        passed to ``DownloadFacade.enqueue`` / ``send_cached``.
+
+        Returns ``None`` for non-PTB implementations or when construction is
+        not possible — callers should treat None as "no sender available".
+        """
+        return None
+
+    async def request_text_input(
+        self,
+        prompt: str,
+        state_key: str,
+        *,
+        placeholder: str = "",
+    ) -> None:
+        """Ask the user to type a reply and remember *state_key* for the reply handler.
+
+        Platform-agnostic contract
+        --------------------------
+        Sends a message containing *prompt* that forces the user to reply
+        (i.e. a ForceReply on Telegram, or an equivalent on other platforms).
+        When the user replies, the reply handler can retrieve *state_key*
+        from the session / user_data to know what to do with the input.
+
+        Parameters
+        ----------
+        prompt:
+            Message text shown to the user.
+        state_key:
+            An opaque string stored in per-user session storage so the reply
+            handler knows which workflow to continue.  On Telegram this is
+            written to ``context.user_data["text_input_state"]``.
+        placeholder:
+            Hint text shown inside the reply input box (optional).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement request_text_input()"
+        )
+
 
 # ---------------------------------------------------------------------------
 # PTB (python-telegram-bot) implementation
@@ -172,6 +214,31 @@ class TelegramCallbackContext(CallbackContext):
 
     async def delete_message(self) -> None:
         await self._query.delete_message()
+
+    def create_sender(self, processing_msg: Any) -> Any:
+        """Return a TelegramSender whose reply-target is the callback's message."""
+        from modules.downloader.strategies.sender import TelegramSender
+        return TelegramSender.from_callback(self._query, processing_msg)
+
+    async def request_text_input(
+        self,
+        prompt: str,
+        state_key: str,
+        *,
+        placeholder: str = "",
+    ) -> None:
+        """Send a ForceReply prompt and store *state_key* in PTB user_data."""
+        from telegram import ForceReply
+        self._ptb_context.user_data["text_input_state"] = state_key
+        await self._ptb_context.bot.send_message(
+            chat_id=self._query.from_user.id,
+            text=prompt,
+            parse_mode="Markdown",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder=placeholder,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

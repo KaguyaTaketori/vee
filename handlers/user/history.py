@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import CallbackContext
 
 from core.handler_registry import command_handler

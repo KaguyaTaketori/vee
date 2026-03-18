@@ -1,5 +1,21 @@
+# modules/billing/handlers/bill_handler.py
 """
 modules/billing/handlers/bill_handler.py
+
+Decoupling
+──────────
+``handle_bill_photo`` previously:
+  • called photo.get_file() / download_to_memory() inside the handler body
+  • built an InlineKeyboardMarkup directly and called processing_msg.edit_text()
+
+Now it:
+  • downloads photo bytes in the PTB adapter (handle_bill_photo) and passes
+    image_b64 as a plain string to _bill_photo_impl
+  • calls ctx.edit_keyboard() for the final confirmation message — keyboard
+    is expressed as a platform-agnostic KeyboardLayout
+
+All telegram.* usage is confined to the PTB adapter functions at the bottom
+of this file.
 """
 from __future__ import annotations
 
@@ -58,7 +74,6 @@ async def _bill_command_impl(ctx: PlatformContext) -> None:
             "• 或使用命令：`/bill 午餐 50元`"
         )
         return
-    # Reuse text handler logic with args joined as text
     await _bill_text_impl(ctx, text=" ".join(ctx.args))
 
 
@@ -98,17 +113,12 @@ async def handle_bill_text(update: Update, context: CallbackContext) -> None:
     if not text:
         return
 
-    # Send processing message first, then hand off to _impl via edit()
     processing_msg = await update.message.reply_text("🤖 AI 正在解析账单，请稍候…")
 
-    # Build a context whose edit() targets the processing message
-    from shared.services.platform_context import TelegramContext as _TC
-    import functools
+    async def _edit(txt: str, **kw) -> None:
+        await processing_msg.edit_text(txt, **kw)
 
-    async def _edit(text: str, **kw) -> None:
-        await processing_msg.edit_text(text, **kw)
-
-    ctx = _TC(
+    ctx = TelegramContext(
         user_id=user.id,
         username=user.username or "",
         display_name=f"{user.first_name} {user.last_name or ''}".strip(),
@@ -122,7 +132,29 @@ async def handle_bill_text(update: Update, context: CallbackContext) -> None:
 
 # ── Photo bill ────────────────────────────────────────────────────────────
 
+async def _bill_photo_impl(ctx: PlatformContext, image_b64: str) -> None:
+    """Core photo-bill logic — receives base64 image bytes, no PTB objects.
+
+    The processing message is already sent; ctx.edit() updates it.
+    On success, ctx.edit_keyboard() replaces it with the confirmation card.
+    """
+    try:
+        entry = await _get_parser().parse_image(user_id=ctx.user_id, image_base64=image_b64)
+    except ValueError as exc:
+        await ctx.edit(f"❌ 识别失败：{exc}\n\n请尝试发送更清晰的图片，或直接输入文字。")
+        return
+    except Exception as exc:
+        logger.error("parse_image failed user=%s: %s", ctx.user_id, exc, exc_info=True)
+        await ctx.edit("❌ 服务异常，请稍后重试。")
+        return
+
+    cache_id = await bill_cache.set(entry)
+    await ctx.edit_keyboard(_build_confirmation_text(entry), _confirmation_keyboard(cache_id))
+    logger.info("Bill photo confirmation sent: cache_id=%s user_id=%s", cache_id, ctx.user_id)
+
+
 async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
+    """PTB adapter: download photo bytes, build a processing-ctx, delegate."""
     if not update.message or not update.message.photo:
         return
 
@@ -132,33 +164,29 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
 
     processing_msg = await update.message.reply_text("🤖 AI 正在识别收据图片，请稍候…")
 
+    # Download photo bytes in the adapter layer — _bill_photo_impl never sees PTB
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         buf = BytesIO()
         await tg_file.download_to_memory(buf)
         image_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        entry = await _get_parser().parse_image(user_id=user.id, image_base64=image_b64)
-    except ValueError as exc:
-        await processing_msg.edit_text(f"❌ 识别失败：{exc}\n\n请尝试发送更清晰的图片，或直接输入文字。")
-        return
     except Exception as exc:
-        logger.error("parse_image failed user=%s: %s", user.id, exc, exc_info=True)
-        await processing_msg.edit_text("❌ 服务异常，请稍后重试。")
+        logger.error("Photo download failed user=%s: %s", user.id, exc, exc_info=True)
+        await processing_msg.edit_text("❌ 图片下载失败，请重试。")
         return
 
-    cache_id = await bill_cache.set(entry)
-    # Build keyboard and send as new message (photo handlers don't have a text message to edit into)
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 确认无误", callback_data=f"bill_confirm:{cache_id}"),
-         InlineKeyboardButton("✏️ 修改金额", callback_data=f"bill_edit:{cache_id}")],
-        [InlineKeyboardButton("❌ 取消记账", callback_data=f"bill_cancel:{cache_id}")],
-    ])
-    await processing_msg.edit_text(
-        _build_confirmation_text(entry),
-        parse_mode="Markdown",
-        reply_markup=keyboard,
+    # Build a TelegramContext whose edit() / edit_keyboard() target processing_msg
+    async def _edit(txt: str, **kw) -> None:
+        await processing_msg.edit_text(txt, **kw)
+
+    ctx = TelegramContext(
+        user_id=user.id,
+        username=user.username or "",
+        display_name=f"{user.first_name} {user.last_name or ''}".strip(),
+        args=[],
+        _reply_fn=update.message.reply_text,
+        _edit_fn=_edit,
+        _bot_send_fn=lambda chat_id, t: context.bot.send_message(chat_id=chat_id, text=t),
     )
-    logger.info("Bill photo confirmation sent: cache_id=%s user_id=%s", cache_id, user.id)
+    await _bill_photo_impl(ctx, image_b64)

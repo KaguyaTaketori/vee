@@ -3,54 +3,40 @@ modules/billing/handlers/bill_callbacks.py
 
 Decoupling
 ──────────
-All @register handlers now receive ``CallbackContext`` (core.callback_bus)
-instead of raw PTB objects.  No handler imports telegram.* directly.
+All @register handlers receive ``CallbackContext`` (core.callback_bus).
+No handler touches ``telegram.*`` directly.
 
-• ctx.data            — callback_data string ("bill_confirm:<cache_id>", …)
-• ctx.user_id         — sender's user ID
-• ctx.platform_ctx    — PlatformContext (edit / send / send_keyboard)
-• ctx.answer()        — silent ACK
-• ctx.answer_alert()  — alert popup
-• ctx.raw_context     — PTB CallbackContext (only for user_data in bill_edit)
+``_cb_bill_edit`` previously used:
+    ctx.raw_context.bot.send_message(..., reply_markup=ForceReply(...))
+    ctx.raw_context.user_data["bill_edit_cache_id"] = cache_id
 
-The ForceReply edit handler (handle_bill_edit_reply) is a MessageHandler,
-not a callback — it is unchanged and still uses PTB update/context directly.
+It now uses:
+    await ctx.request_text_input(prompt, state_key=..., placeholder=...)
+
+``request_text_input`` is defined on ``CallbackContext`` ABC and implemented
+by ``TelegramCallbackContext`` as bot.send_message + ForceReply + user_data
+write — no ForceReply import or raw_context access in this file.
 """
 from __future__ import annotations
 
 import logging
 
-from telegram import ForceReply
 from telegram.ext import CallbackContext as PTBCallbackContext
 
 from core.callback_bus import register, CallbackContext
 from modules.billing.database.bills import insert_bill
 from modules.billing.services.bill_cache import bill_cache, BillEntry
 from shared.services.platform_context import TelegramContext
-from utils.i18n import t
 
 logger = logging.getLogger(__name__)
 
+# State key prefix written by request_text_input, read by handle_bill_edit_reply.
+# Encoding cache_id inside the key avoids a second user_data entry.
+_STATE_PREFIX = "bill_edit:"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _parse_cache_id(data: str) -> str:
-    """Extract cache_id from 'bill_confirm:<cache_id>' etc."""
     return data.split(":", 1)[1]
-
-
-def _confirmation_text(entry: BillEntry) -> str:
-    return (
-        f"📋 *账单确认*\n\n"
-        f"💰 金额：`{entry.amount:.2f} {entry.currency}`\n"
-        f"🏷️ 类别：{entry.category}\n"
-        f"🏪 商家：{entry.merchant}\n"
-        f"📝 描述：{entry.description}\n"
-        f"📅 日期：{entry.bill_date}\n\n"
-        f"请确认以上信息是否正确："
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -97,28 +83,13 @@ async def _cb_bill_edit(ctx: CallbackContext) -> None:
         return
 
     await ctx.answer()
-
-    # Store edit state in PTB user_data (PTB-specific, accessed via raw_context)
-    ctx.raw_context.user_data["bill_edit_cache_id"] = cache_id
-    ctx.raw_context.user_data["bill_edit_message_id"] = (
-        ctx.raw_context.effective_message.message_id
-        if hasattr(ctx.raw_context, "effective_message")
-        else None
-    )
-
-    # ForceReply is a PTB-specific UI construct; send it via raw_context.bot
-    # so that PlatformContext doesn't need to expose this niche capability.
-    await ctx.raw_context.bot.send_message(
-        chat_id=ctx.user_id,
-        text=(
+    await ctx.request_text_input(
+        prompt=(
             f"当前金额：`{entry.amount:.2f} {entry.currency}`\n"
             f"请输入新的金额（纯数字，如 `128.5`）："
         ),
-        parse_mode="Markdown",
-        reply_markup=ForceReply(
-            selective=True,
-            input_field_placeholder="请输入新金额",
-        ),
+        state_key=f"{_STATE_PREFIX}{cache_id}",
+        placeholder="请输入新金额",
     )
 
 
@@ -141,26 +112,20 @@ async def _cb_bill_cancel(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ForceReply edit handler
-# — registered as MessageHandler in BillingModule, NOT via callback_bus —
+# ForceReply reply handler — registered as MessageHandler in BillingModule
 # ---------------------------------------------------------------------------
 
 async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
-    """
-    Handles the user's reply to the ForceReply prompt sent by _cb_bill_edit.
-
-    This is a MessageHandler entry point (PTB update/context), not a callback,
-    so it retains direct PTB wiring.  Business logic is kept minimal here.
-    """
+    """Handle the user's reply to the ForceReply prompt from _cb_bill_edit."""
     if not update.message:
         return
 
-    cache_id = context.user_data.get("bill_edit_cache_id")
-    if not cache_id:
+    state = context.user_data.get("text_input_state", "")
+    if not state.startswith(_STATE_PREFIX):
         return
 
-    context.user_data.pop("bill_edit_cache_id", None)
-    context.user_data.pop("bill_edit_message_id", None)
+    cache_id = state[len(_STATE_PREFIX):]
+    context.user_data.pop("text_input_state", None)
 
     ctx = TelegramContext.from_message(update, context)
 
