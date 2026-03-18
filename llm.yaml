@@ -3,7 +3,7 @@
 #
 # active_provider: 默认启用的 provider，可被 /setllm 命令覆盖并持久化
 
-active_provider: openai
+active_provider: groq
 
 providers:
   openai:
@@ -21,7 +21,12 @@ providers:
     base_url: https://generativelanguage.googleapis.com
     keys_env: LLM_GEMINI_KEYS
 
-  # 示例：同 adapter 的代理/备用节点
+
+  groq:
+    model：meta-llama/llama-4-scout-17b-16e-instruct
+    base_url: https://api.groq.com/openai/v1
+    keys_env: LLM_GROQ_KEYS
+
   # openai_backup:
   #   model: gpt-4o-mini
   #   base_url: https://your-proxy.com
