@@ -100,7 +100,6 @@
     "cancel_failed": "❌ Cancel failed. Task may already be completed.",
     "no_active_tasks": "You have no active download tasks.",
     "select_task_to_cancel": "Select a task to cancel:",
-    "processing": "Processing... Please wait.",
     "bot_shutting_down": "⚠️ Bot is shutting down, download aborted.",
     "download_cancelled": "❌ Download cancelled.",
     "queue_empty_cn": "Current queue is empty.",
