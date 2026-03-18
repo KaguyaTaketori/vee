@@ -1,4 +1,3 @@
-# infra/telegram/runner.py
 """
 infra/telegram/runner.py
 ────────────────────────
@@ -14,18 +13,6 @@ Responsibilities
 • Wire ``TelegramAdminNotifier`` and inject it into ``bootstrap.init_services``.
 • Register bot commands (BotCommand menus) after the bot is connected.
 • Launch ``app.run_polling``.
-
-What is NOT here
-────────────────
-• Any business logic
-• DB queries
-• Task management
-• LLM calls
-• Health endpoint (that's in bootstrap.start_health_endpoint)
-• Handler filter objects (those live in PtbHandlerRegistrar)
-
-The single public entry point is ``run(modules)``.  Pass the same MODULES
-list that main.py builds.
 """
 from __future__ import annotations
 
@@ -45,7 +32,7 @@ from config import (
     ADMIN_IDS,
 )
 from core.bot_setup import set_bot_commands
-from core.jobs import cleanup_job, storage_alert_job, daily_report_job
+from core.jobs import cleanup_job, storage_alert_job, daily_report_job, bill_cache_gc_job
 from modules.downloader.integrations.ptb_registrar import PtbHandlerRegistrar
 from shared.services.notifier import TelegramAdminNotifier
 from shared.services.container import services
@@ -108,6 +95,13 @@ def _register_jobs(app: Application) -> None:
         time=dt_time(hour=9, minute=0, tzinfo=tz),
         name="daily_report",
         data=job_data,
+    )
+
+    app.job_queue.run_repeating(
+        bill_cache_gc_job,
+        interval=300,
+        first=300,
+        name="bill_cache_gc",
     )
 
 

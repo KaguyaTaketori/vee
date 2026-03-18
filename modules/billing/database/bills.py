@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 from database.db import get_db
 from modules.billing.services.bill_cache import BillEntry
@@ -12,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 async def init_bills_table() -> None:
     async with get_db() as db:
+        # ── 主表 ──────────────────────────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bills (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,16 +24,37 @@ async def init_bills_table() -> None:
                 bill_date   TEXT,
                 raw_text    TEXT,
                 created_at  REAL    NOT NULL,
+                updated_at  REAL    NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bills_user_id ON bills(user_id)
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bills_created_at ON bills(created_at)
-        """)
+
+        # ── 索引 ──────────────────────────────────────────────────────────
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bills_user_id    ON bills(user_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bills_created_at ON bills(created_at)"
+        )
+        # bill_date 索引：支持按日期范围查询（如"本月账单"）
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bills_bill_date  ON bills(bill_date)"
+        )
+
+        # ── 旧部署 schema 升级：补充 updated_at 列（幂等）────────────────
+        cursor = await db.execute("PRAGMA table_info(bills)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "updated_at" not in columns:
+            await db.execute(
+                "ALTER TABLE bills ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"
+            )
+            await db.execute(
+                "UPDATE bills SET updated_at = created_at WHERE updated_at = 0"
+            )
+            logger.info("bills: migrated — added updated_at column")
+
         await db.commit()
+
     logger.info("Bills table initialized.")
 
 
@@ -42,12 +63,14 @@ async def insert_bill(entry: BillEntry) -> int:
     将账单写入数据库。
     :returns: 新记录的 rowid。
     """
+    now = time.time()
     async with get_db() as db:
         cursor = await db.execute(
             """
             INSERT INTO bills
-                (user_id, amount, currency, category, description, merchant, bill_date, raw_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, amount, currency, category, description,
+                 merchant, bill_date, raw_text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.user_id,
@@ -58,17 +81,53 @@ async def insert_bill(entry: BillEntry) -> int:
                 entry.merchant,
                 entry.bill_date,
                 entry.raw_text,
-                time.time(),
+                now,
+                now,
             ),
         )
         await db.commit()
         rowid = cursor.lastrowid
-    logger.info("Bill inserted: rowid=%s user_id=%s amount=%s", rowid, entry.user_id, entry.amount)
+    logger.info(
+        "Bill inserted: rowid=%s user_id=%s amount=%s", rowid, entry.user_id, entry.amount
+    )
     return rowid
 
 
+async def update_bill_field(bill_id: int, user_id: int, field: str, value: object) -> bool:
+    """
+    更新账单的单个字段，同时刷新 updated_at。
+
+    :param bill_id:  账单主键。
+    :param user_id:  调用方用户 ID（防止越权）。
+    :param field:    字段名，仅允许白名单内的字段。
+    :param value:    新值。
+    :returns:        是否实际更新了行（False 表示 id/user_id 不匹配）。
+    :raises ValueError: field 不在白名单时。
+    """
+    _ALLOWED_FIELDS = {"amount", "currency", "category", "description", "merchant", "bill_date"}
+    if field not in _ALLOWED_FIELDS:
+        raise ValueError(f"不允许更新字段：{field}")
+
+    async with get_db() as db:
+        cursor = await db.execute(
+            f"UPDATE bills SET {field} = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (value, time.time(), bill_id, user_id),
+        )
+        await db.commit()
+        updated = cursor.rowcount > 0
+
+    if updated:
+        logger.info("Bill updated: id=%s user_id=%s field=%s", bill_id, user_id, field)
+    else:
+        logger.warning(
+            "Bill update failed (not found or wrong user): id=%s user_id=%s field=%s",
+            bill_id, user_id, field,
+        )
+    return updated
+
+
 async def get_user_bills(user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
-    """查询用户的账单记录（分页）。"""
+    """查询用户的账单记录（分页，按创建时间倒序）。"""
     async with get_db() as db:
         cursor = await db.execute(
             """

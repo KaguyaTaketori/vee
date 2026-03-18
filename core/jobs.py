@@ -60,3 +60,9 @@ async def daily_report_job(context) -> None:
     stats = await get_daily_stats(days=1)
     msg = format_daily_report(stats, period="昨日")
     await notifier.notify_admins(msg)
+
+
+async def bill_cache_gc_job(context) -> None:
+    """清理 InMemoryBillCache 中已过期的账单条目。"""
+    from modules.billing.services.bill_cache import bill_cache
+    await bill_cache.purge_expired()

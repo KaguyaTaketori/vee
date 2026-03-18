@@ -15,8 +15,6 @@ class BillingModule:
 
     def setup(self, registrar: HandlerRegistrar) -> None:
         # ── Trigger @register side-effects for billing callbacks ───────────
-        # bill_confirm / bill_edit / bill_cancel handlers are registered into
-        # core.callback_bus when this module is imported.
         import modules.billing.handlers.bill_callbacks      # noqa: F401
 
         from modules.billing.handlers.bill_handler import (
@@ -39,7 +37,7 @@ class BillingModule:
         await init_bills_table()
 
     def get_user_commands(self) -> list[str]:
-        return ["bill","jz"]
+        return ["bill", "jz"]
 
     def get_admin_commands(self) -> list[str]:
         return []
