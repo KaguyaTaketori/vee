@@ -86,8 +86,6 @@ async def handle_bill_command(update: Update, context: CallbackContext) -> None:
 # ── Text bill ─────────────────────────────────────────────────────────────
 
 async def _bill_text_impl(ctx: PlatformContext, text: str) -> None:
-    await ctx.edit("🤖 AI 正在解析账单，请稍候…")
-
     try:
         entry = await _get_parser().parse_text(user_id=ctx.user_id, text=text)
     except ValueError as exc:
