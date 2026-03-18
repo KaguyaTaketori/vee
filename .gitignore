@@ -6,6 +6,7 @@ venv/
 *.binlog
 allowed_users.txt
 bot_data/
+bot_data.db
 cookies.txt
 cookies/
 download_history.json
