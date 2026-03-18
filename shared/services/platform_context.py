@@ -1,42 +1,28 @@
+# shared/services/platform_context.py
 """
 shared/services/platform_context.py
 ─────────────────────────────────────
 Platform-agnostic context object that handler logic operates on.
 
-Design
-------
-Instead of handlers importing telegram.Update directly, they receive a
-PlatformContext, which exposes only the actions every platform supports:
-
-    • user_id / username / display_name  — who sent the request
-    • args                               — command arguments (tokenised)
-    • send(text)                         — reply with plain text
-    • send_keyboard(text, buttons)       — reply with an inline keyboard
-    • send_markdown(text)                — reply with Markdown-formatted text
-    • edit(text)                         — edit the originating message in-place
-    • bot_send(chat_id, text)            — proactive message to any chat_id
-                                           (admin broadcasts, etc.)
-
-Everything platform-specific (ParseMode, InlineKeyboardMarkup, file_id
-caching, etc.) lives in the TelegramContext subclass or other adapters —
-never in handler business logic.
-
-Compatibility
--------------
-All existing PTB handlers continue to work unchanged — they still accept
-(Update, CallbackContext) and may still call update.message.reply_text
-directly. The adapter is opt-in: refactor one handler at a time.
+Methods
+-------
+send(text)                  — plain-text reply
+send_markdown(text)         — Markdown reply (Telegram parse_mode=Markdown)
+send_markdown_v2(text)      — MarkdownV2 reply (for escape_markdown content)
+send_keyboard(text, btns)   — reply with an inline keyboard
+edit(text)                  — edit current message, plain text
+edit_keyboard(text, btns)   — edit current message, with new inline keyboard
+bot_send(chat_id, text)     — proactive send to any chat_id
 """
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 
 
 # ---------------------------------------------------------------------------
-# Keyboard building — minimal, platform-neutral representation
+# Keyboard primitives
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -46,96 +32,60 @@ class KeyboardButton:
     callback_data: str
 
 
-# A keyboard is a list of rows; each row is a list of buttons.
 KeyboardLayout = list[list[KeyboardButton]]
 
 
 def btn(label: str, data: str) -> KeyboardButton:
-    """Shorthand constructor used in handlers."""
     return KeyboardButton(label=label, callback_data=data)
 
 
 # ---------------------------------------------------------------------------
-# Platform context — abstract base
+# PlatformContext ABC
 # ---------------------------------------------------------------------------
 
 class PlatformContext(ABC):
-    """
-    Abstract platform context passed into handler business logic.
-
-    Each method corresponds to one user-visible action.  Concrete
-    subclasses implement them for a specific platform.
-
-    Attributes
-    ----------
-    user_id:
-        Numeric identifier of the requesting user.
-    username:
-        Platform handle (e.g. "@alice"), or empty string if not available.
-    display_name:
-        Human-readable full name, or a fallback string.
-    args:
-        Tokenised command arguments (everything after the command word).
-    """
-
     user_id: int
     username: str
     display_name: str
     args: list[str]
 
-    # ------------------------------------------------------------------ output
+    @abstractmethod
+    async def send(self, text: str) -> None: ...
 
     @abstractmethod
-    async def send(self, text: str) -> None:
-        """Send a plain-text reply."""
-        ...
+    async def send_markdown(self, text: str) -> None: ...
 
-    @abstractmethod
-    async def send_markdown(self, text: str) -> None:
-        """Send a Markdown-formatted reply."""
-        ...
-
-    @abstractmethod
-    async def send_keyboard(
-        self,
-        text: str,
-        buttons: KeyboardLayout,
-    ) -> None:
-        """Send a reply with an inline keyboard.
-
-        Parameters
-        ----------
-        text:
-            Message body.
-        buttons:
-            2-D list of ``KeyboardButton`` rows.
+    async def send_markdown_v2(self, text: str) -> None:
+        """MarkdownV2 reply — default falls back to send_markdown.
+        Override in TelegramContext to use parse_mode=MarkdownV2.
         """
-        ...
+        await self.send_markdown(text)
 
     @abstractmethod
-    async def edit(self, text: str) -> None:
-        """Edit the current message in-place (e.g. update a status line)."""
-        ...
+    async def send_keyboard(self, text: str, buttons: KeyboardLayout) -> None: ...
+
+    async def edit_keyboard(self, text: str, buttons: KeyboardLayout) -> None:
+        """Edit the current message replacing it with text + new keyboard.
+
+        Default implementation falls back to send_keyboard (sends a new
+        message).  TelegramContext overrides this with edit_message_text +
+        reply_markup so the existing message is mutated in-place.
+        """
+        await self.send_keyboard(text, buttons)
 
     @abstractmethod
-    async def bot_send(self, chat_id: int, text: str) -> None:
-        """Send a message to an arbitrary chat_id (for admin broadcasts etc.)."""
-        ...
+    async def edit(self, text: str) -> None: ...
+
+    @abstractmethod
+    async def bot_send(self, chat_id: int, text: str) -> None: ...
 
 
 # ---------------------------------------------------------------------------
-# Telegram implementation
+# TelegramContext
 # ---------------------------------------------------------------------------
 
 class TelegramContext(PlatformContext):
-    """
-    PlatformContext built from a PTB (Update, CallbackContext) pair.
-
-    Supports both message commands and callback queries via the two
-    factory classmethods.
-
-    All telegram.* imports are confined to this class.
-    """
+    """PTB implementation.  All telegram.* imports confined here."""
 
     def __init__(
         self,
@@ -155,12 +105,11 @@ class TelegramContext(PlatformContext):
         self._edit = _edit_fn
         self._bot_send = _bot_send_fn
 
-    # ------------------------------------------------------------------ factories
+    # ── factories ──────────────────────────────────────────────────────────
 
     @classmethod
     def from_message(cls, update: Any, context: Any) -> "TelegramContext":
-        """Construct from a PTB Update carrying a Message."""
-        from telegram.constants import ParseMode as _PM  # noqa: F401 — type hint only
+        from telegram.constants import ParseMode as _PM  # noqa: F401
 
         msg = update.message
         user = msg.from_user
@@ -170,8 +119,6 @@ class TelegramContext(PlatformContext):
             await msg.reply_text(text, **kw)
 
         async def _edit(text: str, **kw: Any) -> None:
-            # Message edits are not meaningful for incoming commands;
-            # fall back to a new reply so callers never need to branch.
             await msg.reply_text(text, **kw)
 
         async def _bot_send(chat_id: int, text: str) -> None:
@@ -189,7 +136,6 @@ class TelegramContext(PlatformContext):
 
     @classmethod
     def from_callback_query(cls, query: Any, context: Any) -> "TelegramContext":
-        """Construct from a PTB CallbackQuery."""
         user = query.from_user
 
         async def _reply(text: str, **kw: Any) -> None:
@@ -211,7 +157,7 @@ class TelegramContext(PlatformContext):
             _bot_send_fn=_bot_send,
         )
 
-    # ------------------------------------------------------------------ PlatformContext
+    # ── PlatformContext impl ───────────────────────────────────────────────
 
     async def send(self, text: str) -> None:
         await self._reply(text)
@@ -219,14 +165,25 @@ class TelegramContext(PlatformContext):
     async def send_markdown(self, text: str) -> None:
         await self._reply(text, parse_mode="Markdown")
 
+    async def send_markdown_v2(self, text: str) -> None:
+        await self._reply(text, parse_mode="MarkdownV2")
+
     async def send_keyboard(self, text: str, buttons: KeyboardLayout) -> None:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-        tg_keyboard = [
+        markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(b.label, callback_data=b.callback_data) for b in row]
             for row in buttons
-        ]
-        await self._reply(text, reply_markup=InlineKeyboardMarkup(tg_keyboard))
+        ])
+        await self._reply(text, reply_markup=markup)
+
+    async def edit_keyboard(self, text: str, buttons: KeyboardLayout) -> None:
+        """Edit the current message in-place (callback-query context)."""
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(b.label, callback_data=b.callback_data) for b in row]
+            for row in buttons
+        ])
+        await self._edit(text, reply_markup=markup)
 
     async def edit(self, text: str) -> None:
         await self._edit(text)

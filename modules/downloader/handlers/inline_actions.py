@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 
 from config import ADMIN_IDS
-from core.callback_bus import register, CallbackContext
+from core.callback_bus import register, CallbackContext, TelegramCallbackContext
 from core.callback_bus import handle_callback  # re-export for DownloaderModule.setup()
 from modules.downloader.strategies.sender import TelegramSender
 from modules.downloader.services.facades import DownloadFacade
@@ -78,14 +78,9 @@ async def _cb_history_page(ctx: CallbackContext) -> None:
         await ctx.answer_alert(t("not_your_history", ctx.user_id))
         return
     await ctx.answer()
-    # _send_history_page still expects the raw PTB query for edit_message_text;
-    # pass ctx.platform_ctx._edit once that helper is refactored, for now we
-    # reach into raw_context to get the query object via the existing helper.
-    # This is the last remaining PTB touch-point in this file — tracked as
-    # tech-debt to migrate _send_history_page to PlatformContext.
-    from shared.services.platform_context import TelegramContext as _TC
-    raw_query = _TC._unwrap_query(ctx)  # see note below
-    await _send_history_page(raw_query, target_user_id, page)
+    # _send_history_page now accepts PlatformContext directly — no PTB raw
+    # query needed.  edit=True → edit_keyboard (mutate existing message).
+    await _send_history_page(ctx.platform_ctx, target_user_id, page, edit=True)
 
 
 # ── Close / cancel menu ────────────────────────────────────────────────────
@@ -170,26 +165,12 @@ async def _cb_download_select(ctx: CallbackContext) -> None:
         return
 
     # TelegramSender still requires the raw PTB query to build its reply target.
-    # It is constructed here (the PTB adapter layer) and passed into the
-    # platform-agnostic DownloadFacade.
-    _raw_query = ctx.raw_context  # type: ignore[attr-defined]
-    # raw_context on TelegramCallbackContext exposes the PTB CallbackContext;
-    # the query itself is accessible via the private _query attribute.
-    # We retrieve it through a stable accessor on TelegramCallbackContext.
-    from core.callback_bus import TelegramCallbackContext
-    ptb_query = _raw_query._query if hasattr(_raw_query, "_query") else None
-    if ptb_query is None and hasattr(ctx, "_query"):
-        ptb_query = ctx._query  # type: ignore[attr-defined]
-
+    # Reach through TelegramCallbackContext to get the underlying query.
     processing_msg = await ctx.platform_ctx.send(t("downloading", ctx.user_id))
 
-    # TelegramSender.from_callback expects the raw PTB query and a Message.
-    # Reach through the TelegramCallbackContext to get the underlying query.
-    from core.callback_bus import TelegramCallbackContext as _TCC
-    if isinstance(ctx, _TCC):
+    if isinstance(ctx, TelegramCallbackContext):
         sender = TelegramSender.from_callback(ctx._query, processing_msg)
     else:
-        # Non-PTB path (tests / future platforms): no TelegramSender needed.
         sender = None  # type: ignore[assignment]
 
     await DownloadFacade.enqueue(
@@ -230,8 +211,5 @@ async def _cb_refresh_page(ctx: CallbackContext) -> None:
     page = int(parts[3])
     from handlers.admin.tasks import _send_refresh_page
     await ctx.answer()
-    # _send_refresh_page uses edit_message_text via the PTB query/message API;
-    # pass the raw PTB context until that helper is migrated to PlatformContext.
-    from core.callback_bus import TelegramCallbackContext as _TCC
-    if isinstance(ctx, _TCC):
+    if isinstance(ctx, TelegramCallbackContext):
         await _send_refresh_page(ctx._query, admin_id, page, ctx.raw_context)
