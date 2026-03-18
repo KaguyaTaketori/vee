@@ -1,8 +1,14 @@
+# modules/billing/services/bill_parser.py
 """
 modules/billing/services/bill_parser.py
 
-调用 LLMManager 解析用户发送的收据文本或图片，返回结构化 BillEntry。
-业务层不直接接触 LLM，只调用此模块。
+变更说明（相对原版）：
+1. _SYSTEM_PROMPT：
+   - 明确拒绝非消费凭证（费率表、菜单、说明书等），要求返回 error
+   - category 限定枚举值，包含"水电煤"
+   - description 改为必填
+   - bill_date 禁止填 unknown，无日期则填今天
+2. _build_entry：对 bill_date 加格式校验，非 YYYY-MM-DD 则兜底为今天
 """
 from __future__ import annotations
 
@@ -21,20 +27,33 @@ logger = logging.getLogger(__name__)
 # System Prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """你是一个专业的财务助手，专门从收据/账单文本或图片中提取关键信息。
-请严格以 JSON 格式返回，不要包含任何额外说明或 Markdown 代码块。
+_SYSTEM_PROMPT = """你是一个专业的财务助手，专门从收据/账单中提取消费信息。
 
-JSON 格式如下：
+【重要规则】
+- 只处理实际的消费凭证：收据、发票、账单截图、转账记录等。
+- 如果内容是价目表、费率表、菜单、说明书、广告等，不是实际消费记录，请返回：
+  {"error": "这不是消费凭证，请发送实际的收据或账单"}
+- 如果无法确定实际消费金额，请返回：
+  {"error": "无法识别有效的消费金额"}
+
+【字段说明】
+- amount：实际支付金额（float），必须大于 0
+- currency：货币代码，如 CNY / USD / JPY / HKD / EUR
+- category：从以下选项中选择一个：餐饮 / 交通 / 购物 / 娱乐 / 医疗 / 住房 / 水电煤 / 其他
+- description：本次消费的简短描述，15字以内，必填，不能为空
+- merchant：商家名称，图片/文字中能识别到就填，否则填 unknown
+- bill_date：消费日期，YYYY-MM-DD 格式；图片/文字中没有明确日期则填今天的日期，禁止填 unknown
+
+【返回格式】
+严格返回 JSON，不包含任何额外说明或 Markdown 代码块：
 {
-  "amount": <float，金额，如 128.50>,
-  "currency": "<货币代码，如 CNY/USD/JPY>",
-  "category": "<消费类别，如：餐饮/交通/购物/娱乐/医疗/其他>",
-  "description": "<消费简述，15字以内>",
-  "merchant": "<商家名称，未知则填 unknown>",
-  "bill_date": "<日期 YYYY-MM-DD 格式，无法确定则填今天>"
+  "amount": <float>,
+  "currency": "<货币代码>",
+  "category": "<类别>",
+  "description": "<描述>",
+  "merchant": "<商家名>",
+  "bill_date": "<YYYY-MM-DD>"
 }
-
-如果无法从内容中提取有效账单信息，请返回：{"error": "无法识别账单信息"}
 """
 
 
@@ -101,14 +120,13 @@ class BillParser:
     def _safe_parse_json(text: str) -> dict:
         """容错 JSON 解析：去除 markdown 代码块包裹。"""
         text = text.strip()
-        # 去掉 ```json ... ``` 或 ``` ... ```
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         try:
             return json.loads(text)
         except json.JSONDecodeError as e:
             logger.error("JSON decode failed: %s | raw: %s", e, text[:200])
-            raise ValueError(f"AI 返回格式异常，无法解析账单。") from e
+            raise ValueError("AI 返回格式异常，无法解析账单。") from e
 
     @staticmethod
     def _build_entry(user_id: int, data: dict, raw_text: str) -> BillEntry:
@@ -121,6 +139,12 @@ class BillParser:
         except (TypeError, ValueError) as e:
             raise ValueError(f"金额解析失败：{e}") from e
 
+        # bill_date 格式校验：非 YYYY-MM-DD 则兜底为今天，防止 "unknown" 进数据库
+        bill_date = str(data.get("bill_date", today))
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', bill_date):
+            logger.warning("Invalid bill_date %r, falling back to today", bill_date)
+            bill_date = today
+
         return BillEntry(
             user_id=user_id,
             amount=amount,
@@ -128,6 +152,6 @@ class BillParser:
             category=str(data.get("category", "其他")),
             description=str(data.get("description", ""))[:50],
             merchant=str(data.get("merchant", "unknown")),
-            bill_date=str(data.get("bill_date", today)),
+            bill_date=bill_date,
             raw_text=raw_text,
         )

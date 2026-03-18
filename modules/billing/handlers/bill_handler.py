@@ -2,20 +2,10 @@
 """
 modules/billing/handlers/bill_handler.py
 
-Decoupling
-──────────
-``handle_bill_photo`` previously:
-  • called photo.get_file() / download_to_memory() inside the handler body
-  • built an InlineKeyboardMarkup directly and called processing_msg.edit_text()
-
-Now it:
-  • downloads photo bytes in the PTB adapter (handle_bill_photo) and passes
-    image_b64 as a plain string to _bill_photo_impl
-  • calls ctx.edit_keyboard() for the final confirmation message — keyboard
-    is expressed as a platform-agnostic KeyboardLayout
-
-All telegram.* usage is confined to the PTB adapter functions at the bottom
-of this file.
+变更说明（相对原版）：
+1. _bill_text_impl：删除开头重复的 ctx.edit()，避免 BadRequest: Message is not modified
+2. _build_confirmation_text：对 category/description/merchant/bill_date 做兜底，防止显示空值或 unknown
+3. _confirmation_keyboard：改为支持多字段编辑的按钮布局
 """
 from __future__ import annotations
 
@@ -30,7 +20,6 @@ from modules.billing.services.bill_cache import bill_cache, BillEntry
 from modules.billing.services.bill_parser import BillParser
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, warm_user_lang
-from utils.i18n import t
 from utils.utils import require_message
 
 logger = logging.getLogger(__name__)
@@ -44,22 +33,39 @@ def _get_parser() -> BillParser:
 
 
 def _build_confirmation_text(entry: BillEntry) -> str:
+    # 兜底处理，防止空值或 unknown 直接显示给用户
+    category    = entry.category    or "未分类"
+    description = entry.description or "—"
+    merchant    = entry.merchant if entry.merchant and entry.merchant != "unknown" else "未知"
+    bill_date   = entry.bill_date   or "未知"
+
     return (
         f"📋 *账单确认*\n\n"
         f"💰 金额：`{entry.amount:.2f} {entry.currency}`\n"
-        f"🏷️ 类别：{entry.category}\n"
-        f"🏪 商家：{entry.merchant}\n"
-        f"📝 描述：{entry.description}\n"
-        f"📅 日期：{entry.bill_date}\n\n"
+        f"🏷️ 类别：{category}\n"
+        f"🏪 商家：{merchant}\n"
+        f"📝 描述：{description}\n"
+        f"📅 日期：{bill_date}\n\n"
         f"请确认以上信息是否正确："
     )
 
 
 def _confirmation_keyboard(cache_id: str):
+    """多字段编辑键盘。callback_data 格式：bill_edit:{field}:{cache_id}"""
     return [
-        [btn("✅ 确认无误", f"bill_confirm:{cache_id}"),
-         btn("✏️ 修改金额", f"bill_edit:{cache_id}")],
-        [btn("❌ 取消记账", f"bill_cancel:{cache_id}")],
+        [btn("✅ 确认无误", f"bill_confirm:{cache_id}")],
+        [
+            btn("✏️ 改金额", f"bill_edit:amount:{cache_id}"),
+            btn("🏷️ 改类别", f"bill_edit:category:{cache_id}"),
+        ],
+        [
+            btn("🏪 改商家", f"bill_edit:merchant:{cache_id}"),
+            btn("📝 改描述", f"bill_edit:description:{cache_id}"),
+        ],
+        [
+            btn("📅 改日期", f"bill_edit:bill_date:{cache_id}"),
+            btn("❌ 取消记账", f"bill_cancel:{cache_id}"),
+        ],
     ]
 
 
@@ -86,6 +92,9 @@ async def handle_bill_command(update: Update, context: CallbackContext) -> None:
 # ── Text bill ─────────────────────────────────────────────────────────────
 
 async def _bill_text_impl(ctx: PlatformContext, text: str) -> None:
+    # ⚠️ 不在这里再次 edit "正在解析"——调用方（handle_bill_text / _bill_command_impl）
+    # 已经发出或 edit 了等待消息，重复 edit 相同内容会触发 BadRequest: Message is not modified
+
     try:
         entry = await _get_parser().parse_text(user_id=ctx.user_id, text=text)
     except ValueError as exc:
@@ -97,7 +106,7 @@ async def _bill_text_impl(ctx: PlatformContext, text: str) -> None:
         return
 
     cache_id = await bill_cache.set(entry)
-    await ctx.send_keyboard(_build_confirmation_text(entry), _confirmation_keyboard(cache_id))
+    await ctx.edit_keyboard(_build_confirmation_text(entry), _confirmation_keyboard(cache_id))
     logger.info("Bill confirmation sent: cache_id=%s user_id=%s", cache_id, ctx.user_id)
 
 
@@ -162,7 +171,6 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
 
     processing_msg = await update.message.reply_text("🤖 AI 正在识别收据图片，请稍候…")
 
-    # Download photo bytes in the adapter layer — _bill_photo_impl never sees PTB
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
@@ -174,7 +182,6 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
         await processing_msg.edit_text("❌ 图片下载失败，请重试。")
         return
 
-    # Build a TelegramContext whose edit() / edit_keyboard() target processing_msg
     async def _edit(txt: str, **kw) -> None:
         await processing_msg.edit_text(txt, **kw)
 
@@ -188,6 +195,7 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
         _bot_send_fn=lambda chat_id, t: context.bot.send_message(chat_id=chat_id, text=t),
     )
     await _bill_photo_impl(ctx, image_b64)
+
 
 @require_message
 async def handle_jz_command(update: Update, context: CallbackContext) -> None:
