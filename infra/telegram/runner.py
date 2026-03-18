@@ -1,3 +1,4 @@
+# infra/telegram/runner.py
 """
 infra/telegram/runner.py
 ────────────────────────
@@ -7,7 +8,8 @@ Responsibilities
 ────────────────
 • Build the PTB ``Application`` object (token, HTTPXRequest timeouts,
   LOCAL_MODE / custom bot API server).
-• Register all handlers (delegates to each BotModule.setup()).
+• Construct a ``PtbHandlerRegistrar`` and call ``module.setup(registrar)``
+  for every BotModule — the only place ``Application`` is ever passed down.
 • Register scheduled jobs.
 • Wire ``TelegramAdminNotifier`` and inject it into ``bootstrap.init_services``.
 • Register bot commands (BotCommand menus) after the bot is connected.
@@ -20,11 +22,11 @@ What is NOT here
 • Task management
 • LLM calls
 • Health endpoint (that's in bootstrap.start_health_endpoint)
+• Handler filter objects (those live in PtbHandlerRegistrar)
 
 The single public entry point is ``run(modules)``.  Pass the same MODULES
 list that main.py builds.
 """
-
 from __future__ import annotations
 
 import logging
@@ -33,7 +35,7 @@ from datetime import time as dt_time
 from typing import Sequence
 
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import Application
 from telegram.request import HTTPXRequest
 
 from bootstrap import init_services, shutdown_services, start_health_endpoint
@@ -43,8 +45,8 @@ from config import (
     ADMIN_IDS,
 )
 from core.bot_setup import set_bot_commands
-from core.filters import CookieFilter
 from core.jobs import cleanup_job, storage_alert_job, daily_report_job
+from modules.downloader.integrations.ptb_registrar import PtbHandlerRegistrar
 from shared.services.notifier import TelegramAdminNotifier
 from shared.services.container import services
 
@@ -56,9 +58,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _register_handlers(app: Application, modules: Sequence) -> None:
-    """Call BotModule.setup() for every module in order."""
+    """
+    Construct a single ``PtbHandlerRegistrar`` and call every module's
+    ``setup()`` with it.
+
+    The registrar is the only object that knows about ``app``; modules
+    only ever see the platform-agnostic ``HandlerRegistrar`` interface.
+    """
+    registrar = PtbHandlerRegistrar(app, admin_ids=frozenset(ADMIN_IDS))
     for module in modules:
-        module.setup(app)
+        module.setup(registrar)
+        logger.debug("Module %r set up via PtbHandlerRegistrar", module.name)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +77,7 @@ def _register_handlers(app: Application, modules: Sequence) -> None:
 
 class _NotifierProxy:
     """Deferred proxy so jobs always reach the live notifier in services."""
+
     async def notify_admins(self, message: str, parse_mode: str | None = None) -> None:
         await services.notifier.notify_admins(message, parse_mode)
 
@@ -140,7 +151,6 @@ def run(modules: Sequence) -> None:
     _register_handlers(app, modules)
     _register_jobs(app)
 
-    # post_init runs inside the PTB event loop, after the bot is connected.
     async def _post_init(application: Application) -> None:
         notifier = TelegramAdminNotifier(application.bot, list(ADMIN_IDS))
         await init_services(modules=modules, notifier=notifier)

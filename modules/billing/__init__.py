@@ -1,30 +1,34 @@
 # modules/billing/__init__.py
-from telegram.ext import Application, MessageHandler, CommandHandler, filters
+"""
+BillingModule — zero top-level telegram.* imports.
+
+``setup()`` receives a ``HandlerRegistrar`` and uses only its
+platform-agnostic interface.
+"""
+from __future__ import annotations
+
+from core.registrar import HandlerRegistrar
 
 
 class BillingModule:
     name = "billing"
 
-    def setup(self, app: Application) -> None:
-        # 触发 @register 副作用（bill_confirm / bill_edit / bill_cancel 回调注册到 core.callback_bus）
+    def setup(self, registrar: HandlerRegistrar) -> None:
+        # ── Trigger @register side-effects for billing callbacks ───────────
+        # bill_confirm / bill_edit / bill_cancel handlers are registered into
+        # core.callback_bus when this module is imported.
         import modules.billing.handlers.bill_callbacks      # noqa: F401
 
         from modules.billing.handlers.bill_handler import (
-            handle_bill_text,
-            handle_bill_photo,
             handle_bill_command,
+            handle_bill_photo,
         )
         from modules.billing.handlers.bill_callbacks import handle_bill_edit_reply
 
-        app.add_handler(CommandHandler("bill", handle_bill_command))
-        app.add_handler(MessageHandler(filters.PHOTO, handle_bill_photo))
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT & filters.REPLY & ~filters.COMMAND,
-                handle_bill_edit_reply,
-            ),
-            group=1,
-        )
+        # ── Register handlers via the platform-agnostic interface ──────────
+        registrar.register_command("bill", handle_bill_command)
+        registrar.register_message(handle_bill_photo, "PHOTO")
+        registrar.register_message(handle_bill_edit_reply, "TEXT_REPLY", group=1)
 
     async def init_db(self) -> None:
         from modules.billing.database.bills import init_bills_table
@@ -33,5 +37,5 @@ class BillingModule:
     def get_user_commands(self) -> list[str]:
         return ["bill"]
 
-    def get_admin_commands(self):
+    def get_admin_commands(self) -> list[str]:
         return []

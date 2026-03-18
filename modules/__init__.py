@@ -1,22 +1,38 @@
 # modules/__init__.py
+"""
+BotModule Protocol — the contract every feature module must satisfy.
+
+``setup()`` now accepts a ``HandlerRegistrar`` (platform-agnostic) instead
+of a PTB ``Application`` object.  This means:
+
+  • Module files have zero ``telegram.*`` imports at the module level.
+  • Unit tests can call ``module.setup(FakeRegistrar())`` without
+    constructing a PTB ``Application``.
+  • Swapping to a different bot platform only requires a new
+    ``HandlerRegistrar`` implementation — modules are untouched.
+"""
+from __future__ import annotations
+
 from typing import Protocol
-from telegram.ext import Application
+
+from core.registrar import HandlerRegistrar
+
 
 class BotModule(Protocol):
     name: str
 
-    def setup(self, app: Application) -> None:
-        """注册所有 handler 到 app"""
+    def setup(self, registrar: HandlerRegistrar) -> None:
+        """Register all handlers via the platform-agnostic registrar."""
         ...
 
     def get_user_commands(self) -> list[str]:
-        """该模块提供的用户命令名列表"""
+        """Command names (without /) this module exposes to regular users."""
         return []
 
     def get_admin_commands(self) -> list[str]:
-        """该模块提供的管理员命令名列表"""
+        """Command names (without /) this module exposes to admins only."""
         return []
 
     async def init_db(self) -> None:
-        """初始化本模块相关的数据库表（可选）"""
+        """Create / migrate this module's DB tables (called at startup)."""
         ...
