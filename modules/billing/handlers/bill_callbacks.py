@@ -182,7 +182,7 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
         bill_date=new_val if field == "bill_date" else entry.bill_date,
         raw_text=entry.raw_text,
     )
-    await bill_cache.set_with_id(cache_id, updated)
+    await bill_cache.update(cache_id, updated)
 
     from modules.billing.handlers.bill_handler import _confirmation_keyboard, _build_confirmation_text
     await ctx.send_keyboard(_build_confirmation_text(updated), _confirmation_keyboard(cache_id))
