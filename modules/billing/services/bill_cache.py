@@ -1,15 +1,11 @@
 """
 services/bill_cache.py
 
-账单临时缓存层。
-默认使用带超时的内存字典（单进程）；
-如需多进程/多实例共享，切换为 Redis 后端（见下方 RedisBillCache）。
-
-GC 策略
--------
-- 惰性删除：get() 时检查是否过期。
-- 主动 GC：由 core/jobs.py 的 bill_cache_gc_job 通过 PTB job_queue 定期调用
-  purge_expired()，与项目其他定时任务统一管理，无需自行维护后台协程。
+变更说明（items 支持版本）：
+1. BillEntry 新增 items: list[BillItem] 字段，用于存储收据商品明细
+2. BillItem dataclass：name / name_raw / quantity / unit_price / amount / item_type / sort_order
+3. to_dict / from_dict 完整支持 items 序列化，兼容旧数据（无 items 字段时默认 []）
+4. 缓存逻辑不变，InMemoryBillCache / RedisBillCache 均透明支持
 """
 from __future__ import annotations
 
@@ -23,14 +19,42 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 缓存默认存活时间（秒）。
-# 用户确认流程（解析 → 阅读 → 逐字段编辑）在网络慢或犹豫时容易超时，
-# 15 分钟比原来的 5 分钟更宽松；每次用户编辑字段时会自动续期。
-_DEFAULT_TTL = 900
+_DEFAULT_TTL = 900  # 15 分钟
 
 
 # ---------------------------------------------------------------------------
-# 账单数据模型
+# 商品明细模型
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BillItem:
+    """
+    收据中的单行商品/折扣/税费。
+
+    item_type 枚举：
+        'item'     — 普通商品
+        'discount' — 折扣（amount 为负数）
+        'tax'      — 税费
+        'subtotal' — 小计行（一般不入库，仅供展示）
+    """
+    name: str                          # 商品名（翻译为中文）
+    amount: float                      # 该行金额；折扣为负数
+    name_raw: str = ""                 # 原始文字（日文等）
+    quantity: float = 1.0
+    unit_price: Optional[float] = None
+    item_type: str = "item"            # item | discount | tax | subtotal
+    sort_order: int = 0                # 与收据顺序对应
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BillItem":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# 账单主模型
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -42,8 +66,10 @@ class BillEntry:
     category: str
     description: str
     merchant: str
-    bill_date: str                          # ISO 格式日期字符串
-    raw_text: str = ""                      # 原始用户输入（用于审计）
+    bill_date: str                              # ISO 格式 YYYY-MM-DD
+    raw_text: str = ""                                    # 原始用户输入（审计用）
+    items: list[BillItem] = field(default_factory=list)   # 商品明细
+    receipt_file_id: str = ""                             # Telegram file_id（图片凭证）
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -51,31 +77,24 @@ class BillEntry:
 
     @classmethod
     def from_dict(cls, d: dict) -> "BillEntry":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        items_raw = d.pop("items", []) or []
+        d.setdefault("receipt_file_id", "")               # 兼容旧数据
+        obj = cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        obj.items = [BillItem.from_dict(i) for i in items_raw if isinstance(i, dict)]
+        return obj
 
 
 # ---------------------------------------------------------------------------
-# 内存缓存（默认）
+# 内存缓存（默认，单进程）
 # ---------------------------------------------------------------------------
 
 class InMemoryBillCache:
-    """
-    线程安全的内存缓存，带 TTL 自动过期。
-    适用于单进程部署（PTB 的 asyncio 单线程模型）。
-    """
-
     def __init__(self, default_ttl: int = _DEFAULT_TTL) -> None:
-        """
-        :param default_ttl: 缓存条目的默认存活时间（秒），默认 15 分钟。
-        """
         self._default_ttl = default_ttl
-        self._store: dict[str, tuple[BillEntry, float]] = {}  # cache_id -> (entry, expire_at)
+        self._store: dict[str, tuple[BillEntry, float]] = {}
         self._lock = asyncio.Lock()
 
-    # ── CRUD ──────────────────────────────────────────────────────────────
-
     async def set(self, entry: BillEntry, ttl: Optional[int] = None) -> str:
-        """存入账单，返回 cache_id。"""
         cache_id = str(uuid.uuid4())
         expire_at = time.monotonic() + (ttl or self._default_ttl)
         async with self._lock:
@@ -84,7 +103,6 @@ class InMemoryBillCache:
         return cache_id
 
     async def get(self, cache_id: str) -> Optional[BillEntry]:
-        """取出账单；过期或不存在返回 None。"""
         async with self._lock:
             item = self._store.get(cache_id)
             if not item:
@@ -97,32 +115,21 @@ class InMemoryBillCache:
             return entry
 
     async def update(self, cache_id: str, entry: BillEntry, ttl: Optional[int] = None) -> bool:
-        """
-        更新现有条目（例如用户修改字段后）；返回是否成功。
-
-        每次用户主动编辑都视为一次活跃操作，自动将 TTL 重置为 default_ttl，
-        防止在反复编辑过程中因原始 TTL 耗尽而丢失账单。
-        若调用方传入显式 ttl 则以该值为准。
-        """
         async with self._lock:
             if cache_id not in self._store:
                 return False
-            # 用户有操作 → 续期；调用方可覆盖
             new_expire = time.monotonic() + (ttl if ttl is not None else self._default_ttl)
             self._store[cache_id] = (entry, new_expire)
         logger.debug("BillCache UPDATE cache_id=%s (TTL renewed)", cache_id)
         return True
 
     async def delete(self, cache_id: str) -> bool:
-        """删除条目；返回是否实际删除了内容。"""
         async with self._lock:
             existed = cache_id in self._store
             self._store.pop(cache_id, None)
-        logger.debug("BillCache DELETE cache_id=%s existed=%s", cache_id, existed)
         return existed
 
     async def purge_expired(self) -> int:
-        """清理所有过期条目，返回清理数量（可作为定时任务调用）。"""
         now = time.monotonic()
         async with self._lock:
             expired = [k for k, (_, exp) in self._store.items() if now > exp]
@@ -134,29 +141,16 @@ class InMemoryBillCache:
 
 
 # ---------------------------------------------------------------------------
-# Redis 后端（多进程 / 多实例部署时使用）
+# Redis 后端（多实例部署时使用）
 # ---------------------------------------------------------------------------
 
 class RedisBillCache:
-    """
-    基于 Redis 的账单缓存，支持多进程/多实例共享。
-
-    依赖：pip install redis[asyncio]
-
-    在 config/settings.py 中添加：
-        REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-    然后在 services/container.py 中初始化：
-        from services.bill_cache import RedisBillCache
-        bill_cache = RedisBillCache(redis_url=REDIS_URL)
-    """
-
     _KEY_PREFIX = "bill_cache:"
 
     def __init__(self, redis_url: str, default_ttl: int = _DEFAULT_TTL) -> None:
         self._redis_url = redis_url
         self._default_ttl = default_ttl
-        self._redis = None  # 延迟初始化
+        self._redis = None
 
     async def _get_redis(self):
         if self._redis is None:
@@ -175,7 +169,6 @@ class RedisBillCache:
             ttl or self._default_ttl,
             json.dumps(entry.to_dict()),
         )
-        logger.debug("RedisBillCache SET cache_id=%s", cache_id)
         return cache_id
 
     async def get(self, cache_id: str) -> Optional[BillEntry]:
@@ -193,12 +186,10 @@ class RedisBillCache:
         r = await self._get_redis()
         k = self._key(cache_id)
         existing_ttl = await r.ttl(k)
-        if existing_ttl < 0:   # -2: key 不存在；-1: 无 TTL
+        if existing_ttl < 0:
             return False
-        # 用户有操作 → 续期
         new_ttl = ttl if ttl is not None else self._default_ttl
         await r.setex(k, new_ttl, json.dumps(entry.to_dict()))
-        logger.debug("RedisBillCache UPDATE cache_id=%s (TTL renewed)", cache_id)
         return True
 
     async def delete(self, cache_id: str) -> bool:
@@ -207,13 +198,11 @@ class RedisBillCache:
         return deleted > 0
 
     async def purge_expired(self) -> int:
-        # Redis 原生 TTL，无需手动清理
         return 0
 
 
 # ---------------------------------------------------------------------------
-# 全局单例（在 services/container.py 中初始化并注入）
+# 全局单例
 # ---------------------------------------------------------------------------
 
-# 默认使用内存缓存；多实例部署时替换为 RedisBillCache
 bill_cache: InMemoryBillCache = InMemoryBillCache()
