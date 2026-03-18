@@ -22,6 +22,7 @@ class BillingModule:
         from modules.billing.handlers.bill_handler import (
             handle_bill_command,
             handle_bill_photo,
+            handle_bill_text,
             handle_jz_command,
         )
         from modules.billing.handlers.bill_callbacks import handle_bill_edit_reply

@@ -51,7 +51,7 @@ from database.db import init_db
 from shared.repositories.task_store import mark_stale_tasks_failed
 from modules.downloader.services.facades import _execute_download_task
 import shared.integrations.llm.manager as _llm_mod
-from shared.integrations.llm.manager import build_llm_manager_from_env
+from config.llm_config import build_llm_manager_from_yaml
 from config import init_config
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ async def init_services(
     logger.info("Database ready")
 
     # ── LLM ───────────────────────────────────────────────────────────────────
-    _llm_mod.llm_manager = build_llm_manager_from_env()
+    _llm_mod.llm_manager = build_llm_manager_from_yaml()
     logger.info("LLM manager initialised (provider=%s)", _llm_mod.llm_manager._active_provider_name if _llm_mod.llm_manager else "none")
 
     # ── Event bus ─────────────────────────────────────────────────────────────

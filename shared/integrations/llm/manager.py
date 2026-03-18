@@ -114,6 +114,7 @@ _ADAPTERS: dict[str, _BaseAdapter] = {
     "openai": _OpenAIAdapter(),
     "anthropic": _AnthropicAdapter(),
     "gemini": _GeminiAdapter(),
+    "groq": _OpenAIAdapter(),
 }
 
 

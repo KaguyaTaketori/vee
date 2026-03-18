@@ -162,7 +162,6 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
     ctx = TelegramContext.from_message(update, context)
 
     if not urls:
-        await ctx.send(t("unsupported_url", ctx.user_id))
         return
 
     # Middleware check (auth + rate limit)
