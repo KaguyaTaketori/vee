@@ -8,7 +8,6 @@ from config import COOKIE_FILE, COOKIES_DIR
 
 logger = logging.getLogger(__name__)
 
-# 匹配 "<domain>_cookies.txt"
 _SITE_PATTERN = re.compile(r'^([^_]+)_cookies\.txt$')
 
 
@@ -16,7 +15,7 @@ class CookieSaveResult:
     __slots__ = ("domain", "path")
 
     def __init__(self, domain: str | None, path: str) -> None:
-        self.domain = domain   # None 表示写入了全局 cookies.txt
+        self.domain = domain
         self.path = path
 
 

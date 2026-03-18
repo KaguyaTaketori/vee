@@ -4,7 +4,7 @@ import logging
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from services.cookie_service import save_cookie_bytes
+from modules.downloader.services.cookie_service import save_cookie_bytes
 from core.handler_registry import command_handler
 from utils.i18n import t
 from utils.utils import require_admin, require_message
@@ -35,7 +35,7 @@ async def handle_cookie_file(update: Update, context: CallbackContext) -> None:
 
     filename = document.file_name
 
-    from services.cookie_service import resolve_cookie_path
+    from modules.downloader.services.cookie_service import resolve_cookie_path
     if resolve_cookie_path(filename) is None:
         await update.message.reply_text(t("invalid_cookies_filename", user_id))
         return

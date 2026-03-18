@@ -22,7 +22,7 @@ import logging
 from typing import Callable, Optional
 
 from models.domain_models import DownloadTask, DownloadStatus, TaskContext
-from services.queue import DownloadQueue
+from shared.services._queue import DownloadQueue
 
 logger = logging.getLogger(__name__)
 

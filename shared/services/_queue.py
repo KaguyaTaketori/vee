@@ -1,5 +1,6 @@
-# services/queue.py
 """
+shared/services/_queue.py
+
 Single-channel async priority queue for one resource class of tasks.
 
 Changes from previous version
@@ -221,7 +222,6 @@ class DownloadQueue:
         self._cancel_events.pop(task.task_id, None)
         self._cleanup_completed()
 
-        # ── Decouple: emit event instead of calling persist_task() ──────
         bus.emit("task_completed", task)
 
     def _cleanup_completed(self) -> None:
@@ -328,5 +328,3 @@ class DownloadQueue:
             DownloadStatus.FAILED,
             f"Failed after {task.max_retries} retries: {last_error}",
         )
-
-
