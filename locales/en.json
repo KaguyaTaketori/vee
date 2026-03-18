@@ -77,6 +77,7 @@
     "aria2c_no_url": "Could not extract direct URL from video",
     "spotify_no_output": "spotify produced no output files",
     "spotify_exit_code": "spotdl exited with code {code}",
+    "spotify_youtube": "🎵 Downloading from Spotify via YouTube...",
     "btn_video": "Video",
     "btn_audio": "Audio",
     "btn_thumbnail": "Thumbnail",
