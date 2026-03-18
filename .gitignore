@@ -28,3 +28,5 @@ build/
 .DS_Store
 # Telegram chat attachments (chat_id:token folders)
 [0-9]*:*/
+bot_data.db-shm
+bot_data.db-wal
