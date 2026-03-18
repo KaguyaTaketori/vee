@@ -50,7 +50,7 @@ class PlatformContext(ABC):
     args: list[str]
 
     @abstractmethod
-    async def send(self, text: str) -> None: ...
+    async def send(self, text: str) -> Any: ...
 
     @abstractmethod
     async def send_markdown(self, text: str) -> None: ...
@@ -136,7 +136,7 @@ class TelegramContext(PlatformContext):
         user = msg.from_user
         args: list[str] = list(context.args or [])
 
-        async def _reply(text: str, **kw: Any) -> None:
+        async def _reply(text: str, **kw: Any) -> Any:
             await msg.reply_text(text, **kw)
 
         async def _edit(text: str, **kw: Any) -> None:
@@ -164,7 +164,7 @@ class TelegramContext(PlatformContext):
     def from_callback_query(cls, query: Any, context: Any) -> "TelegramContext":
         user = query.from_user
 
-        async def _reply(text: str, **kw: Any) -> None:
+        async def _reply(text: str, **kw: Any) -> Any:
             await query.message.reply_text(text, **kw)
 
         async def _edit(text: str, **kw: Any) -> None:
@@ -221,7 +221,7 @@ class TelegramContext(PlatformContext):
 
     # ── PlatformContext impl ───────────────────────────────────────────────
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> Any:
         await self._reply(text)
 
     async def send_markdown(self, text: str) -> None:

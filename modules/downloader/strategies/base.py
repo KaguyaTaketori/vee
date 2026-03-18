@@ -156,7 +156,7 @@ class TaskStrategy(ABC):
 
         cached_file = await self._check_cached_file(url, user_id)
         loop = asyncio.get_event_loop()
-        processing_msg = getattr(sender, '_processing_msg', None)
+        processing_msg = getattr(sender, 'processing_msg', None)
         if processing_msg:
             from utils.download_tracker import _make_progress_hook
             progress_hook = _make_progress_hook(processing_msg, loop)
@@ -187,11 +187,13 @@ class TaskStrategy(ABC):
         try:
             logger.info("execute: calling _get_file_id_or_upload for url=%s", url)
             await self._get_file_id_or_upload(sender, url, filename, caption, title)
+            await sender.delete_status()
             logger.info("execute: _get_file_id_or_upload completed")
         except Exception as exc:
             logger.error("Upload failed: %s", exc, exc_info=True)
             await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
             exc._status_already_edited = True
+            await sender.delete_status(delay=5.0)
             raise
         finally:
             self._cleanup_temp_file(filename, cached_file)

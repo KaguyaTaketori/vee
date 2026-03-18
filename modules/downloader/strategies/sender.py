@@ -38,6 +38,8 @@ class BotSender(Protocol):
         """Replace the in-progress status message with new text."""
         ...
 
+    async def delete_status(self, delay: float = 0.0) -> None: ...
+
     async def send_message(self, text: str) -> None:
         """Send a new plain-text message (separate from the status message)."""
         ...
@@ -127,12 +129,29 @@ class TelegramSender:
         )
 
     # ── Status ─────────────────────────────────────────────────────────────
+    @property
+    def processing_msg(self):
+        return self._processing_msg
 
     async def edit_status(self, text: str) -> None:
+        if self._processing_msg is None:
+            return
         await self._processing_msg.edit_text(text)
 
     async def send_message(self, text: str) -> None:
         await self._reply_target.reply_text(text)
+
+    async def delete_status(self, delay: float = 0.0) -> None:
+        """下载完成后删除状态消息，防止聊天记录堆积。"""
+        if self._processing_msg is None:
+            return
+        if delay > 0:
+            import asyncio
+            await asyncio.sleep(delay)
+        try:
+            await self._processing_msg.delete()
+        except Exception as exc:
+            logger.debug("delete_status: could not delete: %s", exc)
 
     # ── Media ──────────────────────────────────────────────────────────────
 
