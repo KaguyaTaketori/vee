@@ -4,7 +4,7 @@ from telegram.ext import CallbackContext
 
 from config import ADMIN_IDS
 from core.handler_registry import command_handler
-from services.user_service import track_user, set_user_language
+from shared.services.user_service import track_user, set_user_language
 from utils.logger import log_user
 from utils.telegram_helpers import user_log_args
 from utils.i18n import t, LANGUAGES

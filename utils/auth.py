@@ -8,7 +8,7 @@ from utils.i18n import t
 logger = logging.getLogger(__name__)
 
 def is_user_allowed(user_id: int) -> bool:
-    from services.user_service import get_allowed_users
+    from shared.services.user_service import get_allowed_users
     allowed = get_allowed_users()
     return not allowed or user_id in allowed
 

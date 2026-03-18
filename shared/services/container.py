@@ -2,10 +2,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from services.task_manager import TaskManager
-    from services.event_bus import EventBus
-    from services.ratelimit import RateLimiter
-    from services.notifier import AdminNotifier
+    from shared.services.task_manager import TaskManager
+    from shared.services.event_bus import EventBus
+    from shared.services.ratelimit import RateLimiter
+    from shared.services.notifier import AdminNotifier
 
 
 class AppContainer:

@@ -12,13 +12,13 @@ from config import (
     CLEANUP_INTERVAL_HOURS, DISK_CHECK_INTERVAL_MINUTES,
     init_config, ADMIN_IDS,
 )
-from services.task_manager import TaskManager, IO_CHANNEL
-from services.event_bus import bus
+from shared.services.task_manager import TaskManager, IO_CHANNEL
+from shared.services.event_bus import bus
 from repositories import TaskRepository
-from services.container import services
-from services.ratelimit import RateLimiter
+from shared.services.container import services
+from shared.services.ratelimit import RateLimiter
 from modules.downloader.services.facades import _execute_download_task
-from services.notifier import TelegramAdminNotifier
+from shared.services.notifier import TelegramAdminNotifier
 from models.domain_models import DownloadStatus
 from utils.logger import setup_logging
 from database.db import init_db
@@ -30,17 +30,10 @@ from core.jobs import cleanup_job, storage_alert_job, daily_report_job
 from core.bot_setup import set_bot_commands
 from core.handler_registry import registry
 from handlers.admin.cookies import handle_cookie_file
-from integrations.ptb_adapter import PtbCommandRegistrar
+from modules.downloader.integrations.ptb_adapter import PtbCommandRegistrar
 
 from shared.integrations.llm.manager import build_llm_manager_from_env
 import shared.integrations.llm.manager as _llm_mod
-from modules.billing.handlers.bill_handler import (
-  handle_bill_text,
-  handle_bill_photo,
-  handle_bill_command,
-)
-from modules.billing.handlers.bill_callbacks import handle_bill_edit_reply
-import modules.billing.handlers  # noqa: 触发回调注册
 
 import handlers.user.basic
 import handlers.user.history
@@ -48,10 +41,6 @@ import handlers.admin.system
 import handlers.admin.users
 import handlers.admin.tasks
 import handlers.admin.cookies
-from modules.billing.handlers.expenses import handle_receipt_photo
-
-from modules.downloader.handlers.message_parser import handle_link
-from modules.downloader.handlers.inline_actions import handle_callback
 
 from modules.downloader import DownloaderModule
 from modules.billing import BillingModule
@@ -130,7 +119,7 @@ def main() -> None:
                 await module.init_db()
         await mark_stale_tasks_failed()
         _llm_mod.llm_manager = build_llm_manager_from_env()
-        from services.event_bus import bus as _bus
+        from shared.services.event_bus import bus as _bus
         services.bus = _bus
 
         services.task_manager = TaskManager(

@@ -6,12 +6,12 @@ from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
 from config import ADMIN_IDS, RATE_TIER_LIMITS
 from core.handler_registry import command_handler
-from services.container import services
-from services.user_service import (
+from shared.services.container import services
+from shared.services.user_service import (
     get_allowed_users, save_allowed_users, get_all_users_info,
     get_user_display_name, get_user_display_names_bulk,
 )
-from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit, set_user_tier
+from shared.services.ratelimit import save_rate_limit, get_user_tier, get_user_limit, set_user_tier
 from database.db import get_db
 from utils.i18n import t
 from utils.utils import require_admin, require_message, format_history_list

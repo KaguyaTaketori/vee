@@ -20,8 +20,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
 from modules.billing.services.bill_cache import bill_cache, BillEntry
-from services.bill_parser import BillParser
-from services.user_service import track_user, warm_user_lang
+from modules.billing.services.bill_parser import BillParser
+from shared.services.user_service import track_user, warm_user_lang
 from utils.i18n import t
 from utils.utils import require_message
 
@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 def _get_parser() -> BillParser:
     """从全局单例获取 BillParser，确保 llm_manager 已初始化。"""
-    from llm.manager import llm_manager
-    if llm_manager is None:
+    import llm.manager as llm_mod
+    if llm_mod.llm_manager is None:
         raise RuntimeError("llm_manager 未初始化，请在 bot 启动时调用 build_llm_manager_from_env()")
-    return BillParser(llm_manager)
+    return BillParser(llm_mod.llm_manager)
 
 
 # ---------------------------------------------------------------------------

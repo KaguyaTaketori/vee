@@ -3,7 +3,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
 from core.handler_registry import command_handler
-from services.container import services
+from shared.services.container import services
 from models.domain_models import STATUS_EMOJI, DownloadStatus
 from utils.i18n import t
 from utils.utils import format_history_list, format_history_item, require_message

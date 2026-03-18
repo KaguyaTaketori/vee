@@ -7,9 +7,9 @@ from telegram.ext import CallbackContext
 from config import get_config, DISK_WARN_THRESHOLD, DISK_CRIT_THRESHOLD, DISK_CHECK_INTERVAL_MINUTES, save_disk_config, reload_disk_config
 from core import jobs as core_jobs
 from core.handler_registry import command_handler
-from services.container import services
-from services.user_service import cleanup_temp_files
-from services.analytics import get_daily_stats, format_daily_report, get_bot_stats
+from shared.services.container import services
+from shared.services.user_service import cleanup_temp_files
+from shared.services.analytics import get_daily_stats, format_daily_report, get_bot_stats
 from utils.i18n import t
 from utils.utils import require_admin, require_message, scan_temp_files, format_bytes
 

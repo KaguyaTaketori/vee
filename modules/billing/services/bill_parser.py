@@ -1,5 +1,5 @@
 """
-services/bill_parser.py
+modules/billing/services/bill_parser.py
 
 调用 LLMManager 解析用户发送的收据文本或图片，返回结构化 BillEntry。
 业务层不直接接触 LLM，只调用此模块。

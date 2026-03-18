@@ -2,9 +2,9 @@
 import logging
 import psutil
 from config import DISK_CRIT_THRESHOLD, DISK_WARN_THRESHOLD, TEMP_FILE_MAX_AGE_HOURS, disk_config
-from services.user_service import cleanup_temp_files
-from services.analytics import get_daily_stats, format_daily_report
-from services.notifier import AdminNotifier
+from shared.services.user_service import cleanup_temp_files
+from shared.services.analytics import get_daily_stats, format_daily_report
+from shared.services.notifier import AdminNotifier
 
 logger = logging.getLogger(__name__)
 

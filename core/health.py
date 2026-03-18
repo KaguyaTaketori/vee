@@ -1,5 +1,5 @@
 from aiohttp import web
-from services.container import services
+from shared.services.container import services
 
 
 async def health_handler(request: web.Request) -> web.Response:

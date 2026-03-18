@@ -4,9 +4,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
 from core.handler_registry import command_handler
-from services.container import services
-from services.ratelimit import save_rate_limit, get_user_tier, get_user_limit
-from services.user_service import get_user_display_name
+from shared.services.container import services
+from shared.services.ratelimit import save_rate_limit, get_user_tier, get_user_limit
+from shared.services.user_service import get_user_display_name
 from database.history import clear_file_id_by_url, get_user_history, get_recent_cached_urls
 from utils.i18n import t
 from utils.utils import require_admin, require_message, format_history_list
