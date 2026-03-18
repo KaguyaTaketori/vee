@@ -1,0 +1,30 @@
+# llm.yaml
+# LLM Provider 配置文件（安全提交 git，key 通过 keys_env 指向 .env）
+#
+# active_provider: 默认启用的 provider，可被 /setllm 命令覆盖并持久化
+
+active_provider: openai
+
+providers:
+  openai:
+    model: gpt-4o
+    base_url: https://api.openai.com
+    keys_env: LLM_OPENAI_KEYS          # .env 中以逗号分隔的多个 key
+
+  anthropic:
+    model: claude-3-5-sonnet-20241022
+    base_url: https://api.anthropic.com
+    keys_env: LLM_ANTHROPIC_KEYS
+
+  gemini:
+    model: gemini-1.5-flash
+    base_url: https://generativelanguage.googleapis.com
+    keys_env: LLM_GEMINI_KEYS
+
+  # 示例：同 adapter 的代理/备用节点
+  # openai_backup:
+  #   model: gpt-4o-mini
+  #   base_url: https://your-proxy.com
+  #   keys_env: LLM_OPENAI_BACKUP_KEYS
+
+blacklist_ttl: 60   # key 被限流后的冷却时间（秒）

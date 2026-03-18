@@ -22,11 +22,13 @@ class BillingModule:
         from modules.billing.handlers.bill_handler import (
             handle_bill_command,
             handle_bill_photo,
+            handle_jz_command,
         )
         from modules.billing.handlers.bill_callbacks import handle_bill_edit_reply
 
         # ── Register handlers via the platform-agnostic interface ──────────
         registrar.register_command("bill", handle_bill_command)
+        registrar.register_command("jz", handle_jz_command)
         registrar.register_message(handle_bill_photo, "PHOTO")
         registrar.register_message(handle_bill_edit_reply, "TEXT_REPLY", group=1)
 
@@ -35,7 +37,7 @@ class BillingModule:
         await init_bills_table()
 
     def get_user_commands(self) -> list[str]:
-        return ["bill"]
+        return ["bill","jz"]
 
     def get_admin_commands(self) -> list[str]:
         return []

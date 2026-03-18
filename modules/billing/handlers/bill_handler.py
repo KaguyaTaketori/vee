@@ -190,3 +190,8 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
         _bot_send_fn=lambda chat_id, t: context.bot.send_message(chat_id=chat_id, text=t),
     )
     await _bill_photo_impl(ctx, image_b64)
+
+@require_message
+async def handle_jz_command(update: Update, context: CallbackContext) -> None:
+    ctx = TelegramContext.from_message(update, context)
+    await _bill_command_impl(ctx)
