@@ -22,9 +22,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import CallbackContext
-from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
 
 from config import ADMIN_IDS, RATE_TIER_LIMITS
@@ -35,7 +34,7 @@ from shared.services.user_service import (
     get_allowed_users, save_allowed_users, get_all_users_info,
     get_user_display_names_bulk,
 )
-from shared.services.ratelimit import save_rate_limit, get_user_tier, get_user_limit, set_user_tier
+from shared.services.ratelimit import save_rate_limit, get_user_tier, set_user_tier
 from database.db import get_db
 from utils.i18n import t
 from utils.utils import require_admin, require_message
@@ -266,27 +265,26 @@ async def settier_command(update: Update, context: CallbackContext) -> None:
 
 async def _setrate_impl(ctx: PlatformContext) -> None:
     if not ctx.args:
-        status = services.limiter.get_status()
-        await ctx.send(
-            t("rateinfo_current", ctx.user_id,
-              max=status["max_downloads_per_hour"],
-              enabled=status["enabled"])
-        )
+        await ctx.send(t("usage_setrate", ctx.user_id))
         return
 
     try:
         max_val = int(ctx.args[0])
+        if max_val < 1 or max_val > 100:
+            await ctx.send(t("value_range", ctx.user_id))
+            return
     except ValueError:
-        await ctx.send(t("setrate_invalid", ctx.user_id))
+        await ctx.send(t("invalid_number", ctx.user_id))
         return
 
     enabled = True
     if len(ctx.args) > 1:
-        enabled = ctx.args[1].lower() != "off"
+        enabled = ctx.args[1].lower() in ("on", "true", "1")
 
-    await save_rate_limit(max_val, enabled)
+    save_rate_limit(max_val, enabled)
     services.limiter.reload()
-    await ctx.send(t("setrate_updated", ctx.user_id, max=max_val, enabled=enabled))
+    status_str = "enabled" if enabled else "disabled"
+    await ctx.send(t("rate_limit_updated_simple", ctx.user_id, max=max_val, status=status_str))
 
 
 @command_handler("setrate", admin_only=True)
@@ -302,14 +300,12 @@ async def setrate_command(update: Update, context: CallbackContext) -> None:
 
 async def _rateinfo_impl(ctx: PlatformContext) -> None:
     status = services.limiter.get_status()
-    tier = await get_user_tier(ctx.user_id)
-    limit = await get_user_limit(ctx.user_id)
+    status_text = "Enabled" if status["enabled"] else "Disabled"
     await ctx.send(
-        t("rateinfo", ctx.user_id,
+        t("rateinfo_status", ctx.user_id,
+          status=status_text,
           max=status["max_downloads_per_hour"],
-          enabled=status["enabled"],
-          tier=tier,
-          limit=limit)
+          users=status.get("active_users", 0))
     )
 
 
