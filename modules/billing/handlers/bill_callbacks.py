@@ -113,29 +113,28 @@ async def handle_bill_edit_reply(update, context: CallbackContext) -> None:
     if not update.message:
         return
 
-    user_id = update.message.from_user.id
     cache_id = context.user_data.get("bill_edit_cache_id")
-    original_message_id = context.user_data.get("bill_edit_message_id")
-
     if not cache_id:
         return
 
     context.user_data.pop("bill_edit_cache_id", None)
     context.user_data.pop("bill_edit_message_id", None)
 
+    ctx = TelegramContext.from_message(update, context)
+
     text = update.message.text.strip()
     try:
         new_amount = float(text.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("❌ 金额格式不正确，请输入数字。")
+        await ctx.send("❌ 金额格式不正确，请输入数字。")
         return
 
     entry = await bill_cache.get(cache_id)
     if entry is None:
-        await update.message.reply_text("⏰ 账单已过期，请重新发送。")
+        await ctx.send("⏰ 账单已过期，请重新发送。")
         return
-    if entry.user_id != user_id:
-        await update.message.reply_text("❌ 这不是你的账单。")
+    if entry.user_id != ctx.user_id:
+        await ctx.send("❌ 这不是你的账单。")
         return
 
     updated = BillEntry(
@@ -149,7 +148,5 @@ async def handle_bill_edit_reply(update, context: CallbackContext) -> None:
     )
     await bill_cache.set_with_id(cache_id, updated)
 
-    # Re-send confirmation card with updated amount
     from modules.billing.handlers.bill_handler import _confirmation_keyboard, _build_confirmation_text
-    ctx = TelegramContext.from_message(update, context)
     await ctx.send_keyboard(_build_confirmation_text(updated), _confirmation_keyboard(cache_id))
