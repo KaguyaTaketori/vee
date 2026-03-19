@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from urllib.parse import urlparse
 
@@ -14,7 +13,7 @@ from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, warm_user_lang
 from shared.services.session import UserSession
-from database.history import check_recent_download
+from database.history import
 from utils.i18n import t
 from utils.utils import require_message
 
@@ -71,25 +70,6 @@ async def _handle_link_impl(ctx: PlatformContext, urls: list[str]) -> None:
 
 
 async def _handle_single_url(ctx: PlatformContext, url: str) -> None:
-#    recent_download = await check_recent_download(url, max_age_hours=24, download_type=None)
-
-#    if recent_download:
-#        file_id = recent_download.get("file_id")
-#        file_path = recent_download.get("file_path")
-#        download_type = recent_download.get("download_type", "video")
-
-        # ✅ 优先用 file_id，本地文件不存在也没关系
-#        has_file_id = bool(file_id)
-#        has_local_file = bool(file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0)
-
-#        if has_file_id or has_local_file:
-#            processing_msg = await ctx.send(t("processing_please_wait", ctx.user_id))
-#            sender = ctx.create_sender(processing_msg)
-#            session = UserSession(url=url, user_id=ctx.user_id, sender=sender)
-#            await DownloadFacade.send_cached(session, file_path or "", download_type)
-#            return
-    
-    # Show download-type selection keyboard
     session_key = UserSession.store(url=url, user_id=ctx.user_id)
 
     if is_spotify_url(url):

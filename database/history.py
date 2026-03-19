@@ -72,24 +72,12 @@ async def get_recent_cached_urls(
     return await _repo.get_recent_cached_urls(limit=limit, offset=offset)
 
 
-async def check_recent_download(
-    url: str,
-    max_age_hours: int = 24,
-    download_type: Optional[str] = None,
-) -> Optional[dict]:
-    return await _repo.find_recent_download(
-        url, max_age_hours=max_age_hours, download_type=download_type
-    )
-
 
 async def get_file_id_by_url(
     url: str,
-    max_age_hours: int = 168,
     download_type: Optional[str] = None,
 ) -> Optional[str]:
-    return await _repo.get_file_id_by_url(
-        url, max_age_hours=max_age_hours, download_type=download_type
-    )
+    return await _repo.get_file_id_by_url(url, download_type=download_type)
 
 
 async def clear_file_id_by_url(
@@ -100,9 +88,6 @@ async def clear_file_id_by_url(
 
 async def get_file_id_and_title_by_url(
     url: str,
-    max_age_hours: int = 168,
     download_type: Optional[str] = None,
 ) -> Optional[tuple[str, str | None]]:
-    return await _repo.get_file_id_and_title_by_url(
-        url, max_age_hours=max_age_hours, download_type=download_type
-    )
+    return await _repo.get_file_id_and_title_by_url(url, download_type=download_type)

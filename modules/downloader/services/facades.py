@@ -126,8 +126,6 @@ class DownloadFacade:
     -------
     enqueue(session, download_type)
         Queue a new download for the given session.
-    send_cached(session, cached_file_path, download_type)
-        Re-send a previously downloaded file without re-queuing.
     """
 
     @staticmethod
@@ -163,48 +161,3 @@ class DownloadFacade:
             "Task %s queued: user=%s type=%s position=%d",
             task.task_id, session.user_id, download_type, position,
         )
-
-    @staticmethod
-    async def send_cached(
-        session: UserSession,
-        cached_file_path: str,
-        download_type: str,
-    ) -> None:
-        """
-        Re-send an already-downloaded file.
-
-        Skips the download step and goes straight to the upload/send
-        step of the appropriate strategy.
-        """
-        from modules.downloader.strategies.factory import StrategyFactory
-        from database.history import check_recent_download
-
-        strategy = StrategyFactory.get(download_type)
-        if strategy is None:
-            logger.warning(
-                "send_cached: no strategy for '%s', falling back to re-download",
-                download_type,
-            )
-            await DownloadFacade.enqueue(session, download_type)
-            return
-
-        recent = await check_recent_download(session.url, download_type=download_type)
-        file_id = recent.get("file_id") if recent else None
-        title   = recent.get("title")   if recent else None
-
-        if file_id:
-            caption = strategy._get_caption(title) if title else None
-            logger.info(
-                "send_cached: file_id hit, user=%s type=%s",
-                session.user_id, download_type,
-            )
-            await strategy._send_from_file_id(session.sender, file_id, caption)
-            await session.sender.delete_status()
-            return
-
-        logger.info(
-            "send_cached: no file_id, uploading from local cache, user=%s type=%s path=%s",
-            session.user_id, download_type, cached_file_path,
-        )
-        
-        await strategy.execute(session.sender, session.url)

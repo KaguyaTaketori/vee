@@ -192,56 +192,18 @@ class HistoryRepository(BaseRepository):
                 rows = [dict(r) for r in await cur.fetchall()]
         return rows, total
 
-    async def find_recent_download(
-        self,
-        url: str,
-        max_age_hours: int = 24,
-        download_type: Optional[str] = None,
-    ) -> Optional[dict]:
-        """Return the most recent successful cached download for *url*, or None."""
-        now = time.time()
-        max_age_seconds = max_age_hours * 3600
-        sql = """
-            SELECT user_id, url, download_type, status, file_size,
-                   title, file_path, file_id, timestamp
-            FROM history
-            WHERE url = ?
-              AND status = 'success'
-              AND timestamp > ?
-              AND (file_path IS NOT NULL OR file_id IS NOT NULL)
-        """
-        params: list = [url, now - max_age_seconds]
-        if download_type:
-            sql += " AND download_type = ?"
-            params.append(download_type)
-        sql += " ORDER BY timestamp DESC LIMIT 1"
-        async with self._db() as db:
-            async with db.execute(sql, params) as cur:
-                row = await cur.fetchone()
-                if row:
-                    entry = dict(row)
-                    if entry.get("file_path") and os.path.exists(entry["file_path"]):
-                        return entry
-                    if entry.get("file_id"):
-                        return entry
-        return None
-
     async def get_file_id_by_url(
         self,
         url: str,
-        max_age_hours: int = 168,
         download_type: Optional[str] = None,
     ) -> Optional[str]:
-        now = time.time()
-        max_age_seconds = max_age_hours * 3600
         sql = """
             SELECT file_id FROM history
             WHERE url = ?
               AND status = 'success'
               AND file_id IS NOT NULL
-              AND timestamp > ?
         """
-        params: list = [url, now - max_age_seconds]
+        params: list = [url]
         if download_type:
             sql += " AND download_type = ?"
             params.append(download_type)
@@ -254,20 +216,15 @@ class HistoryRepository(BaseRepository):
     async def get_file_id_and_title_by_url(
         self,
         url: str,
-        max_age_hours: int = 168,
         download_type: Optional[str] = None,
     ) -> Optional[tuple[str, str | None]]:
-        """Return (file_id, title) or None."""
-        now = time.time()
-        max_age_seconds = max_age_hours * 3600
         sql = """
             SELECT file_id, title FROM history
             WHERE url = ?
               AND status = 'success'
               AND file_id IS NOT NULL
-              AND timestamp > ?
         """
-        params: list = [url, now - max_age_seconds]
+        params: list = [url]
         if download_type:
             sql += " AND download_type = ?"
             params.append(download_type)
@@ -276,5 +233,5 @@ class HistoryRepository(BaseRepository):
             async with db.execute(sql, params) as cur:
                 row = await cur.fetchone()
                 if row and row[0]:
-                    return row[0], row[1]  # (file_id, title)
+                    return row[0], row[1]
         return None

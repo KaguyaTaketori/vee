@@ -5,12 +5,10 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 
-from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
+from config import MAX_FILE_SIZE
 from database.history import (
-    get_file_id_by_url,
     get_file_id_and_title_by_url,
     add_history,
-    check_recent_download,
 )
 from utils.i18n import t
 from .sender import BotSender
@@ -47,24 +45,6 @@ class TaskStrategy(ABC):
     def _get_caption(self, title: str, emoji: str = "🎬") -> str | None:
         return f"{emoji} {title}" if title else None
 
-    async def _check_cached_file(self, url: str, user_id: int) -> str | None:
-        """Return a still-valid local file path from a previous download, or None."""
-        recent = await check_recent_download(
-            url,
-            max_age_hours=24,
-            download_type=self.task_type,
-        )
-        if recent:
-            file_path = recent.get("file_path")
-            if file_path and os.path.exists(file_path):
-                if os.path.getsize(file_path) <= MAX_CACHE_SIZE:
-                    logger.info(
-                        "Using cached file (%s) for %s: %s",
-                        self.task_type, url, file_path,
-                    )
-                    return file_path
-        return None
-
     async def _validate_file_size(
         self, filename: str, sender: BotSender
     ) -> bool:
@@ -82,14 +62,6 @@ class TaskStrategy(ABC):
             return False
         return True
 
-    def _cleanup_temp_file(self, filename: str, cached_file: str | None) -> None:
-        """Delete temp file unless it came from the local cache."""
-        if filename and filename != cached_file and os.path.exists(filename):
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
-
     # ---------------------------------------------------------------- abstract
 
     @abstractmethod
@@ -99,7 +71,6 @@ class TaskStrategy(ABC):
         """Execute the task and return (local_filename, info_dict)."""
         ...
 
-    # ── backward-compat shim ────────────────────────────────────────────────
     async def _do_download(self, url: str, progress_hook) -> tuple[str, dict]:
         """Deprecated alias — delegates to _do_execute."""
         return await self._do_execute(url, progress_hook)
@@ -122,68 +93,34 @@ class TaskStrategy(ABC):
         caption: str | None,
     ) -> str | None: ...
 
-    async def _get_file_id_or_upload(
-        self,
-        sender: BotSender,
-        url: str,
-        filename: str,
-        caption: str | None,
-        title: str | None = None,
-    ) -> str | None:
-        file_id = await get_file_id_by_url(url, download_type=self.task_type)
-        if file_id:
-            await self._send_from_file_id(sender, file_id, caption)
-            return file_id
-        new_id = await self._upload_new_file(sender, filename, caption)
-        if new_id:
-            try:
-                file_size = int(os.path.getsize(filename)) if os.path.exists(filename) else 0
-            except (OSError, TypeError, ValueError):
-                file_size = 0
-            await add_history(
-                sender.user_id, url, self.task_type,
-                file_size,
-                title, 
-                "success", filename, new_id,
-            )
-        return new_id
-
     async def execute(self, sender: BotSender, url: str) -> None:
-        user_id = sender.user_id
-        await sender.edit_status(t("processing", user_id))
+            user_id = sender.user_id
+            await sender.edit_status(t("processing", user_id))
+            logger.info("execute: url=%s, task_type=%s", url, self.task_type)
 
-        logger.info("execute: url=%s, task_type=%s", url, self.task_type)
+            file_id_result = await get_file_id_and_title_by_url(url, download_type=self.task_type)
+            if file_id_result:
+                file_id, title = file_id_result
+                caption = self._get_caption(title) if title else None
+                logger.info("execute: file_id hit, sending directly")
+                await sender.edit_status(t("uploading", user_id))
+                try:
+                    await self._send_from_file_id(sender, file_id, caption)
+                    await sender.delete_status()
+                except Exception as exc:
+                    logger.error("file_id send failed: %s", exc, exc_info=True)
+                    await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+                    await sender.delete_status(delay=5.0)
+                    raise
+                return
 
-        file_id_result = await get_file_id_and_title_by_url(url, download_type=self.task_type)
-        if file_id_result:
-            file_id, title = file_id_result
-            caption = self._get_caption(title) if title else None
-            logger.info("execute: file_id hit, sending directly")
-            await sender.edit_status(t("uploading", user_id))
-            try:
-                await self._send_from_file_id(sender, file_id, caption)
-                await sender.delete_status()
-            except Exception as exc:
-                logger.error("file_id send failed: %s", exc, exc_info=True)
-                await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
-                await sender.delete_status(delay=5.0)
-                raise
-            return
+            loop = asyncio.get_event_loop()
+            processing_msg = getattr(sender, 'processing_msg', None)
+            progress_hook = None
+            if processing_msg:
+                from utils.download_tracker import _make_progress_hook
+                progress_hook = _make_progress_hook(processing_msg, loop)
 
-        cached_file = await self._check_cached_file(url, user_id)
-
-        loop = asyncio.get_event_loop()
-        processing_msg = getattr(sender, 'processing_msg', None)
-        progress_hook = None
-        if processing_msg:
-            from utils.download_tracker import _make_progress_hook
-            progress_hook = _make_progress_hook(processing_msg, loop)
-
-        if cached_file:
-            logger.info("execute: using cached file=%s", cached_file)
-            filename, info = cached_file, {}
-        else:
-            logger.info("execute: starting _do_execute for url=%s", url)
             try:
                 filename, info = await self._do_execute(url, progress_hook)
                 logger.info("execute: _do_execute completed, filename=%s", filename)
@@ -192,35 +129,39 @@ class TaskStrategy(ABC):
                 await sender.edit_status(t("download_failed", user_id, error=str(exc)))
                 raise
 
-        if not await self._validate_file_size(filename, sender):
-            await sender.delete_status(delay=5.0)
-            return
+            if not await self._validate_file_size(filename, sender):
+                await sender.delete_status(delay=5.0)
+                return
 
-        title = info.get("title") if info else None
-        caption = self._get_caption(title) if title else None
+            title = info.get("title") if info else None
+            caption = self._get_caption(title) if title else None
 
-        await sender.edit_status(t("uploading", user_id))
-        try:
-            logger.info("execute: uploading for url=%s", url)
-            new_id = await self._upload_new_file(sender, filename, caption)
-            if new_id:
-                try:
-                    file_size = int(os.path.getsize(filename)) if os.path.exists(filename) else 0
-                except (OSError, TypeError, ValueError):
-                    file_size = 0
-                await add_history(
-                    user_id, url, self.task_type,
-                    file_size, title, "success", filename, new_id,
-                )
-            await sender.delete_status()
-            logger.info("execute: upload completed")
-        except Exception as exc:
-            logger.error("Upload failed: %s", exc, exc_info=True)
-            await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
-            await sender.delete_status(delay=5.0)
-            raise
-        finally:
-            self._cleanup_temp_file(filename, cached_file)
+            await sender.edit_status(t("uploading", user_id))
+            try:
+                new_id = await self._upload_new_file(sender, filename, caption)
+                if new_id:
+                    try:
+                        file_size = int(os.path.getsize(filename)) if os.path.exists(filename) else 0
+                    except (OSError, TypeError, ValueError):
+                        file_size = 0
+                    await add_history(
+                        user_id, url, self.task_type,
+                        file_size, title, "success", filename, new_id,
+                    )
+                await sender.delete_status()
+                logger.info("execute: upload completed")
+            except Exception as exc:
+                logger.error("Upload failed: %s", exc, exc_info=True)
+                await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+                await sender.delete_status(delay=5.0)
+                raise
+            finally:
+                if filename and os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except OSError:
+                        pass
+
 
 DownloadStrategy = TaskStrategy
 

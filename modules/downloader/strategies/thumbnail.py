@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from database.history import add_history, get_file_id_by_url
+from database.history import add_history, get_file_id_and_title_by_url
 from utils.i18n import t
 from .base import TaskStrategy
 from .sender import BotSender
@@ -49,47 +49,42 @@ class ThumbnailStrategy(TaskStrategy):
         if not thumbnail_url:
             raise RuntimeError("No thumbnail available for this URL.")
         return thumbnail_url, info
-
-    # ---- override execute() because there is no local file to validate -----
-
+    
     async def execute(self, sender: BotSender, url: str) -> None:
-        user_id = sender.user_id
+            user_id = sender.user_id
+            await sender.edit_status(t("downloading", user_id))
 
-        await sender.edit_status(t("downloading", user_id))
-        try:
-            thumbnail_url, info = await self._do_execute(url, None)
-        except Exception as exc:
-            logger.error("Thumbnail fetch failed: %s", exc)
-            await sender.edit_status(t("download_failed", user_id))
-            return
+            file_id_result = await get_file_id_and_title_by_url(url, download_type=self.task_type)
+            if file_id_result:
+                file_id, title = file_id_result
+                caption = self._get_caption(title) if title else None
+                await sender.edit_status(t("uploading", user_id))
+                try:
+                    await self._send_from_file_id(sender, file_id, caption)
+                    await sender.delete_status()
+                except Exception as exc:
+                    await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+                    await sender.delete_status(delay=5.0)
+                    raise
+                return
 
-        title = info.get("title") if info else None
-        caption = self._get_caption(title) if title else None
+            try:
+                thumbnail_url, info = await self._do_execute(url, None)
+            except Exception as exc:
+                logger.error("Thumbnail fetch failed: %s", exc)
+                await sender.edit_status(t("download_failed", user_id))
+                await sender.delete_status(delay=5.0)
+                return
 
-        await sender.edit_status(t("uploading", user_id))
-        try:
-            existing_id = await get_file_id_by_url(url, download_type=self.task_type)
-            if existing_id:
-                await self._send_from_file_id(sender, existing_id, caption)
-                file_id = existing_id
-            else:
+            title = info.get("title") if info else None
+            caption = self._get_caption(title) if title else None
+
+            await sender.edit_status(t("uploading", user_id))
+            try:
                 file_id = await self._upload_new_file(sender, thumbnail_url, caption)
-
-            sender.log_download(
-                f"{self.task_type}_downloaded", url, "success", 0
-            )
-            await add_history(
-                user_id, url, self.task_type,
-                0, title, "success", thumbnail_url, file_id,
-            )
-        except Exception as exc:
-            await sender.edit_status(
-                t("upload_failed", user_id, error=str(exc))
-            )
-            sender.log_download(
-                f"{self.task_type}_downloaded", url,
-                f"upload_failed: {exc}",
-            )
-            await add_history(
-                user_id, url, self.task_type, 0, title, "failed"
-            )
+                await add_history(user_id, url, self.task_type, 0, title, "success", thumbnail_url, file_id)
+                await sender.delete_status()
+            except Exception as exc:
+                await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+                await add_history(user_id, url, self.task_type, 0, title, "failed")
+                await sender.delete_status(delay=5.0)
