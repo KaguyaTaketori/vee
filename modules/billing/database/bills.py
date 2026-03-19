@@ -1,17 +1,10 @@
 """
 modules/billing/database/bills.py
 
-变更说明（items 支持版本）：
-1. init_bills_table
-   - 新增 bill_items 表（幂等 CREATE IF NOT EXISTS）
-   - 新增 idx_bill_items_bill_id 索引
-2. insert_bill
-   - 写入 bills 主表后，批量写入 bill_items 明细（同一事务）
-3. get_bill_items
-   - 按 bill_id 查询明细列表（供查看详情使用）
-4. get_recent_bills_with_items
-   - 返回最近账单 + 每笔账单的 items（用于流水页展示）
-5. 其余接口（update_bill_field / get_user_bills / get_monthly_summary 等）不变
+变更说明：
+1. init_bills_table：新增 receipt_url 列的幂等迁移
+2. insert_bill：写入 receipt_url
+3. 其余接口不变
 """
 from __future__ import annotations
 
@@ -39,13 +32,14 @@ async def init_bills_table() -> None:
                 bill_date        TEXT,
                 raw_text         TEXT,
                 receipt_file_id  TEXT    NOT NULL DEFAULT '',
+                receipt_url      TEXT    NOT NULL DEFAULT '',
                 created_at       REAL    NOT NULL,
                 updated_at       REAL    NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
 
-        # ── 商品明细表（新增）────────────────────────────────────────────
+        # ── 商品明细表 ────────────────────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bill_items (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +76,7 @@ async def init_bills_table() -> None:
         # ── 旧部署 schema 升级（幂等）────────────────────────────────────
         cursor = await db.execute("PRAGMA table_info(bills)")
         columns = {row[1] for row in await cursor.fetchall()}
+
         if "updated_at" not in columns:
             await db.execute(
                 "ALTER TABLE bills ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"
@@ -90,11 +85,18 @@ async def init_bills_table() -> None:
                 "UPDATE bills SET updated_at = created_at WHERE updated_at = 0"
             )
             logger.info("bills: migrated — added updated_at column")
+
         if "receipt_file_id" not in columns:
             await db.execute(
                 "ALTER TABLE bills ADD COLUMN receipt_file_id TEXT NOT NULL DEFAULT ''"
             )
             logger.info("bills: migrated — added receipt_file_id column")
+
+        if "receipt_url" not in columns:
+            await db.execute(
+                "ALTER TABLE bills ADD COLUMN receipt_url TEXT NOT NULL DEFAULT ''"
+            )
+            logger.info("bills: migrated — added receipt_url column")
 
         await db.commit()
 
@@ -102,19 +104,15 @@ async def init_bills_table() -> None:
 
 
 async def insert_bill(entry: BillEntry) -> int:
-    """
-    将账单及其明细写入数据库（同一事务）。
-    :returns: 新记录的 bill rowid。
-    """
     now = time.time()
     async with get_db() as db:
-        # 1. 写主表
         cursor = await db.execute(
             """
             INSERT INTO bills
                 (user_id, amount, currency, category, description,
-                 merchant, bill_date, raw_text, receipt_file_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 merchant, bill_date, raw_text, receipt_file_id, receipt_url,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.user_id,
@@ -126,13 +124,13 @@ async def insert_bill(entry: BillEntry) -> int:
                 entry.bill_date,
                 entry.raw_text,
                 entry.receipt_file_id,
+                entry.receipt_url,
                 now,
                 now,
             ),
         )
         bill_id = cursor.lastrowid
 
-        # 2. 批量写明细（有则写，无则跳过）
         if entry.items:
             await db.executemany(
                 """
@@ -160,17 +158,13 @@ async def insert_bill(entry: BillEntry) -> int:
         await db.commit()
 
     logger.info(
-        "Bill inserted: bill_id=%s user_id=%s amount=%s items=%d",
-        bill_id, entry.user_id, entry.amount, len(entry.items),
+        "Bill inserted: bill_id=%s user_id=%s amount=%s items=%d receipt_url=%s",
+        bill_id, entry.user_id, entry.amount, len(entry.items), entry.receipt_url,
     )
     return bill_id
 
 
 async def get_bill_items(bill_id: int, user_id: int) -> list[dict]:
-    """
-    查询指定账单的商品明细，按 sort_order 排序。
-    user_id 用于防止越权访问。
-    """
     async with get_db() as db:
         cursor = await db.execute(
             """
@@ -188,8 +182,10 @@ async def get_bill_items(bill_id: int, user_id: int) -> list[dict]:
 
 
 async def update_bill_field(bill_id: int, user_id: int, field: str, value: object) -> bool:
-    """更新账单单个字段，同时刷新 updated_at。"""
-    _ALLOWED_FIELDS = {"amount", "currency", "category", "description", "merchant", "bill_date"}
+    _ALLOWED_FIELDS = {
+        "amount", "currency", "category", "description",
+        "merchant", "bill_date", "receipt_url",
+    }
     if field not in _ALLOWED_FIELDS:
         raise ValueError(f"不允许更新字段：{field}")
 
@@ -212,7 +208,6 @@ async def update_bill_field(bill_id: int, user_id: int, field: str, value: objec
 
 
 async def get_user_bills(user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
-    """查询用户账单记录（分页，按创建时间倒序）。"""
     async with get_db() as db:
         cursor = await db.execute(
             """
@@ -237,16 +232,6 @@ async def get_user_bill_count(user_id: int) -> int:
 
 
 async def get_monthly_summary(user_id: int, year: int, month: int) -> dict:
-    """
-    返回指定月份消费汇总。
-
-    :returns: {
-        "total": float,
-        "count": int,
-        "by_category": [{"category": str, "total": float, "count": int}, ...],
-        "by_currency": [{"currency": str, "total": float}, ...],
-    }
-    """
     month_str = f"{year:04d}-{month:02d}"
 
     async with get_db() as db:
@@ -307,11 +292,11 @@ async def get_monthly_summary(user_id: int, year: int, month: int) -> dict:
 
 
 async def get_recent_bills(user_id: int, limit: int = 5) -> list[dict]:
-    """返回最近 N 条账单（不含明细），用于 /mybills 流水预览。"""
     async with get_db() as db:
         cursor = await db.execute(
             """
-            SELECT id, amount, currency, category, description, merchant, bill_date
+            SELECT id, amount, currency, category, description,
+                   merchant, bill_date, receipt_url
             FROM bills
             WHERE user_id = ?
             ORDER BY bill_date DESC, created_at DESC
@@ -324,10 +309,6 @@ async def get_recent_bills(user_id: int, limit: int = 5) -> list[dict]:
 
 
 async def get_recent_bills_with_items(user_id: int, limit: int = 5) -> list[dict]:
-    """
-    返回最近 N 条账单，每条附带 items 明细列表。
-    用于 /mybills 或流水详情页展示带明细的记录。
-    """
     bills = await get_recent_bills(user_id, limit)
     for bill in bills:
         bill["items"] = await get_bill_items(bill["id"], user_id)

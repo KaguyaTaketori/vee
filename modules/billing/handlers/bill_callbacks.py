@@ -1,11 +1,9 @@
 # modules/billing/handlers/bill_callbacks.py
 """
 修复说明：
-1. [Bug1] _cb_bill_cat 和 handle_bill_edit_reply 创建新 BillEntry 时补回
-   receipt_file_id 和 items，防止凭证和明细丢失。
-2. [Bug2] 新增 bill_items: / bill_item_edit: / bill_item_del: 回调，
-   让用户可以查看并逐条编辑/删除明细。
-3. 其余逻辑（ForceReply、字段校验、bill_back 等）不变。
+1. _cb_bill_confirm：确认时调用 receipt_storage.confirm()，
+   将临时图片移入正式目录，写入 entry.receipt_url 后入库。
+2. 其余回调逻辑不变。
 """
 from __future__ import annotations
 
@@ -20,14 +18,12 @@ from modules.billing.database.bills import insert_bill
 from modules.billing.services.bill_cache import bill_cache, BillEntry, BillItem
 from modules.billing.services.bill_parser import VALID_CATEGORIES
 from shared.services.platform_context import TelegramContext, btn
-from utils.auto_delete import auto_delete 
+from utils.auto_delete import auto_delete
 
 logger = logging.getLogger(__name__)
 
-# state_key 写入 user_data 的前缀
 _STATE_PREFIX = "bill_edit:"
 
-# 各字段的中文标签和 ForceReply 输入提示（category 不在此列）
 _FIELD_CONFIG: dict[str, tuple[str, str]] = {
     "amount":      ("金额",    "请输入新金额（纯数字，如：128.5）"),
     "merchant":    ("商家",    "请输入商家名称"),
@@ -35,22 +31,15 @@ _FIELD_CONFIG: dict[str, tuple[str, str]] = {
     "bill_date":   ("日期",    "请输入日期（格式：2024-03-18）"),
 }
 
-# 明细字段配置
 _ITEM_FIELD_CONFIG: dict[str, tuple[str, str]] = {
     "name":   ("名称", "请输入新商品名称"),
     "amount": ("金额", "请输入新金额（数字，折扣为负数如 -50）"),
 }
 
-# category 类别选择键盘
 _CATEGORY_EMOJI: dict[str, str] = {
-    "餐饮":  "🍜",
-    "交通":  "🚇",
-    "购物":  "🛍️",
-    "娱乐":  "🎮",
-    "医疗":  "💊",
-    "住房":  "🏠",
-    "水电煤": "💡",
-    "其他":  "📦",
+    "餐饮":  "🍜", "交通":  "🚇", "购物":  "🛍️",
+    "娱乐":  "🎮", "医疗":  "💊", "住房":  "🏠",
+    "水电煤": "💡", "其他":  "📦",
 }
 
 _CATEGORY_ORDER = ["餐饮", "交通", "购物", "娱乐", "医疗", "住房", "水电煤", "其他"]
@@ -69,7 +58,6 @@ def _category_keyboard(cache_id: str):
 
 
 def _items_keyboard(entry: BillEntry, cache_id: str):
-    """明细列表键盘：每条明细一行，可点击编辑名称或金额，可删除。"""
     rows = []
     for idx, item in enumerate(entry.items):
         label = f"{item.name[:12]}  ¥{item.amount:.0f}"
@@ -98,6 +86,19 @@ async def _cb_bill_confirm(ctx: CallbackContext) -> None:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
+    # 将临时图片移入正式目录，获取永久 URL
+    if entry.receipt_tmp_path:
+        from shared.services.container import services
+        try:
+            receipt_url = await services.receipt_storage.confirm(entry.receipt_tmp_path)
+            entry = replace(entry, receipt_url=receipt_url, receipt_tmp_path="")
+        except Exception as e:
+            logger.warning(
+                "_cb_bill_confirm: failed to confirm image for cache_id=%s: %s",
+                cache_id, e,
+            )
+            # 图片移动失败不影响记账流程，仅记录日志
+
     await insert_bill(entry)
     await bill_cache.delete(cache_id)
     await ctx.answer()
@@ -105,12 +106,16 @@ async def _cb_bill_confirm(ctx: CallbackContext) -> None:
         f"✅ 记账成功！\n\n"
         f"💰 {entry.amount:.2f} {entry.currency}  |  {entry.category or '未分类'}\n"
         f"📝 {entry.description or '—'}"
+        + (f"\n📎 凭证已保存" if entry.receipt_url else "")
     )
-    logger.info("Bill confirmed and saved: cache_id=%s user_id=%s", cache_id, ctx.user_id)
+    logger.info(
+        "Bill confirmed: cache_id=%s user_id=%s receipt_url=%s",
+        cache_id, ctx.user_id, entry.receipt_url,
+    )
 
 
 # ---------------------------------------------------------------------------
-# bill_edit  —  callback_data：bill_edit:{field}:{cache_id}
+# bill_edit
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_edit:"))
@@ -168,13 +173,11 @@ async def _cb_bill_edit(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_item_edit  —  callback_data：bill_item_edit:{field}:{idx}:{cache_id}
-# [Bug2] 新增：编辑单条明细的名称或金额
+# bill_item_edit
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_item_edit:"))
 async def _cb_bill_item_edit(ctx: CallbackContext) -> None:
-    # 格式：bill_item_edit:{field}:{idx}:{cache_id}
     parts = ctx.data.split(":", 3)
     if len(parts) != 4:
         await ctx.answer_alert("❌ 数据格式错误。")
@@ -215,8 +218,7 @@ async def _cb_bill_item_edit(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_item_del  —  callback_data：bill_item_del:{idx}:{cache_id}
-# [Bug2] 新增：删除单条明细
+# bill_item_del
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_item_del:"))
@@ -249,7 +251,6 @@ async def _cb_bill_item_del(ctx: CallbackContext) -> None:
     await bill_cache.update(cache_id, updated)
     await ctx.answer("已删除")
 
-    # 刷新明细列表
     if updated.items:
         await ctx.platform_ctx.edit_keyboard(
             "📋 *商品明细*\n点击行内按钮编辑名称/金额，或删除该条目：",
@@ -264,7 +265,7 @@ async def _cb_bill_item_del(ctx: CallbackContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# bill_cat  —  callback_data：bill_cat:{category}:{cache_id}
+# bill_cat
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_cat:"))
@@ -288,10 +289,8 @@ async def _cb_bill_cat(ctx: CallbackContext) -> None:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
-    # [Bug1] 修复：dataclasses.replace 自动保留 receipt_file_id 和 items
     updated = replace(entry, category=category)
     await bill_cache.update(cache_id, updated)
-
     await ctx.answer(f"已选择：{category}")
 
     from modules.billing.handlers.bill_handler import _confirmation_keyboard, _build_confirmation_text
@@ -299,11 +298,10 @@ async def _cb_bill_cat(ctx: CallbackContext) -> None:
         _build_confirmation_text(updated),
         _confirmation_keyboard(cache_id),
     )
-    logger.debug("Bill category updated: cache_id=%s category=%s", cache_id, category)
 
 
 # ---------------------------------------------------------------------------
-# bill_back  —  从各子菜单返回确认卡
+# bill_back
 # ---------------------------------------------------------------------------
 
 @register(lambda d: d.startswith("bill_back:"))
@@ -336,17 +334,18 @@ async def _cb_bill_cancel(ctx: CallbackContext) -> None:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
+    # delete() 内部会自动清理临时文件
     await bill_cache.delete(cache_id)
     await ctx.answer()
     await ctx.platform_ctx.edit("❌ 已取消记账。")
 
 
 # ---------------------------------------------------------------------------
-# ForceReply reply handler — registered as MessageHandler in BillingModule
+# ForceReply reply handler
 # ---------------------------------------------------------------------------
+
 @auto_delete(delay=3.0)
 async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
-    """处理 ForceReply 回复，支持主字段和明细字段。"""
     if not update.message:
         return
 
@@ -360,9 +359,7 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
     ctx = TelegramContext.from_message(update, context)
     text = update.message.text.strip()
 
-    # ── 判断是普通字段还是明细字段 ────────────────────────────────────────
     if remainder.startswith("item:"):
-        # 格式：item:{field}:{idx}:{cache_id}
         parts = remainder[len("item:"):].split(":", 2)
         if len(parts) != 3:
             await ctx.send("❌ 状态数据异常，请重试。")
@@ -370,7 +367,6 @@ async def handle_bill_edit_reply(update, context: PTBCallbackContext) -> None:
         field, idx_str, cache_id = parts
         await _handle_item_reply(ctx, cache_id, field, int(idx_str), text)
     else:
-        # 格式：{field}:{cache_id}
         field, cache_id = remainder.split(":", 1)
         await _handle_main_field_reply(ctx, cache_id, field, text)
 
@@ -381,7 +377,6 @@ async def _handle_main_field_reply(
     field: str,
     text: str,
 ) -> None:
-    """处理主字段（amount / merchant / description / bill_date）的 ForceReply 回复。"""
     new_val: object
 
     if field == "amount":
@@ -410,7 +405,6 @@ async def _handle_main_field_reply(
         await ctx.send("❌ 这不是你的账单。")
         return
 
-    # [Bug1] 修复：dataclasses.replace 自动保留 receipt_file_id 和 items
     updated = replace(entry, **{field: new_val})
     await bill_cache.update(cache_id, updated)
 
@@ -428,7 +422,6 @@ async def _handle_item_reply(
     idx: int,
     text: str,
 ) -> None:
-    """处理明细字段（name / amount）的 ForceReply 回复。"""
     entry = await bill_cache.get(cache_id)
     if entry is None:
         await ctx.send("⏰ 账单已过期，请重新发送。")
@@ -444,12 +437,9 @@ async def _handle_item_reply(
 
     if field == "name":
         new_item = BillItem(
-            name=text[:50],
-            name_raw=old_item.name_raw,
-            quantity=old_item.quantity,
-            unit_price=old_item.unit_price,
-            amount=old_item.amount,
-            item_type=old_item.item_type,
+            name=text[:50], name_raw=old_item.name_raw,
+            quantity=old_item.quantity, unit_price=old_item.unit_price,
+            amount=old_item.amount, item_type=old_item.item_type,
             sort_order=old_item.sort_order,
         )
     elif field == "amount":
@@ -459,12 +449,9 @@ async def _handle_item_reply(
             await ctx.send("❌ 金额格式不正确，请输入数字（折扣为负数，如 -50）。")
             return
         new_item = BillItem(
-            name=old_item.name,
-            name_raw=old_item.name_raw,
-            quantity=old_item.quantity,
-            unit_price=old_item.unit_price,
-            amount=new_amount,
-            item_type=old_item.item_type,
+            name=old_item.name, name_raw=old_item.name_raw,
+            quantity=old_item.quantity, unit_price=old_item.unit_price,
+            amount=new_amount, item_type=old_item.item_type,
             sort_order=old_item.sort_order,
         )
     else:
@@ -476,9 +463,7 @@ async def _handle_item_reply(
     updated = replace(entry, items=new_items)
     await bill_cache.update(cache_id, updated)
 
-    # 回到明细列表
     await ctx.send_keyboard(
         "📋 *商品明细*\n点击行内按钮编辑名称/金额，或删除该条目：",
         _items_keyboard(updated, cache_id),
     )
-

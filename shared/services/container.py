@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from shared.services.event_bus import EventBus
     from shared.services.ratelimit import RateLimiter
     from shared.services.notifier import AdminNotifier
+    from shared.services.receipt_storage import ReceiptStorage
 
 
 class AppContainer:
@@ -13,7 +14,8 @@ class AppContainer:
         self.task_manager: "TaskManager" = None   # type: ignore[assignment]
         self.bus: "EventBus" = None               # type: ignore[assignment]
         self.limiter: "RateLimiter" = None        # type: ignore[assignment]
-        self.notifier: "AdminNotifier" = None     # type: ignore[assignment]  
+        self.notifier: "AdminNotifier" = None     # type: ignore[assignment]
+        self.receipt_storage: "ReceiptStorage" = None  # type: ignore[assignment]
 
     @property
     def queue(self) -> "TaskManager":

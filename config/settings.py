@@ -47,6 +47,13 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
 
+# ── 凭证图片存储 ───────────────────────────────────────────────────────────
+# 上传根目录（内含 pending/ 和 receipts/ 两个子目录）
+UPLOADS_DIR: str = os.getenv("UPLOADS_DIR", os.path.join(BASE_DIR, "uploads"))
+# 对外暴露的静态文件 URL 前缀，末尾不带斜杠
+# 生产环境改为真实域名，如 "https://api.example.com/static"
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000/static")
+
 
 def get_config() -> dict:
     return {
@@ -56,6 +63,8 @@ def get_config() -> dict:
         "temp_dir":                TEMP_DIR,
         "temp_file_max_age_hours": TEMP_FILE_MAX_AGE_HOURS,
         "cleanup_interval_hours":  CLEANUP_INTERVAL_HOURS,
+        "uploads_dir":             UPLOADS_DIR,
+        "public_base_url":         PUBLIC_BASE_URL,
     }
 
 def get_temp_template() -> str:

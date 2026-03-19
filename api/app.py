@@ -2,20 +2,6 @@
 api/app.py
 ──────────
 FastAPI 应用工厂。
-
-启动方式：
-    uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
-
-与 Telegram Bot 共存：
-    - Bot 独立进程（python vee.py）
-    - API 独立进程（uvicorn api.app:app ...）
-    - 共享同一个 SQLite 文件（DB_PATH）
-    - 注意：SQLite WAL 模式下多进程读写安全，默认已开启
-
-环境变量（在现有 .env 追加）：
-    API_JWT_SECRET=<随机长字符串>
-    API_SECRET=<换 token 时的密钥，仅后台使用>
-    API_TOKEN_TTL=2592000   # 30天，单位秒
 """
 from __future__ import annotations
 
@@ -24,10 +10,12 @@ import os
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .auth import create_access_token, _API_SECRET
 from .schemas import TokenRequest, TokenResponse
 from .routes.bills import router as bills_router
+from .routes.uploads import router as uploads_router
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +29,7 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
-    # ── CORS（开发阶段放开，上线前收紧 origins）────────────────────────────
+    # ── CORS ───────────────────────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
         allow_origins=os.getenv("API_CORS_ORIGINS", "*").split(","),
@@ -50,11 +38,33 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ── 静态文件服务（凭证图片）────────────────────────────────────────────
+    # 挂载时确保目录已存在
+    from config.settings import UPLOADS_DIR
+    receipts_dir = os.path.join(UPLOADS_DIR, "receipts")
+    os.makedirs(receipts_dir, exist_ok=True)
+    app.mount(
+        "/static/receipts",
+        StaticFiles(directory=receipts_dir),
+        name="receipts",
+    )
+
     # ── 启动时初始化数据库 ──────────────────────────────────────────────────
     @app.on_event("startup")
     async def _startup():
         from modules.billing.database.bills import init_bills_table
         await init_bills_table()
+
+        # FastAPI 进程独立运行时，需要初始化 receipt_storage
+        # 若与 Bot 同进程则已由 bootstrap.py 完成，此处幂等
+        from shared.services.container import services
+        if services.receipt_storage is None:
+            from shared.services.receipt_storage import LocalReceiptStorage
+            from config.settings import PUBLIC_BASE_URL
+            services.receipt_storage = LocalReceiptStorage(
+                base_dir=UPLOADS_DIR,
+                public_base_url=PUBLIC_BASE_URL,
+            )
         logger.info("Vee Billing API started")
 
     # ── 健康检查 ────────────────────────────────────────────────────────────
@@ -62,13 +72,9 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    # ── Token 换取（简单 secret 方案）──────────────────────────────────────
+    # ── Token 换取 ──────────────────────────────────────────────────────────
     @app.post("/auth/token", response_model=TokenResponse, tags=["auth"])
     async def get_token(body: TokenRequest):
-        """
-        用 user_id + API_SECRET 换取 JWT。
-        生产环境建议改为 Telegram Login Widget 验证。
-        """
         if not _API_SECRET:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -84,9 +90,9 @@ def create_app() -> FastAPI:
 
     # ── 路由注册 ────────────────────────────────────────────────────────────
     app.include_router(bills_router, prefix="/v1")
+    app.include_router(uploads_router, prefix="/v1")
 
     return app
 
 
-# uvicorn api.app:app
 app = create_app()

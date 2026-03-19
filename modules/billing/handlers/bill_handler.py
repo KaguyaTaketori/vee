@@ -1,19 +1,11 @@
 """
 modules/billing/handlers/bill_handler.py
-─────────────────────────────────────────
-Bill command and message handlers.
-
-Fix: handle_bill_text and handle_bill_photo previously each hand-rolled
-their own TelegramContext by manually plumbing _reply_fn, _edit_fn, and
-_bot_send_fn.  This duplicated ~15 lines of boilerplate per handler.
-
-Both handlers now use the new TelegramContext.from_message_with_status()
-factory, which overrides _edit to target the processing message.
 """
 from __future__ import annotations
 
 import base64
 import logging
+import os
 from io import BytesIO
 
 from telegram import Update
@@ -29,10 +21,6 @@ logger = logging.getLogger(__name__)
 
 _MAX_ITEMS_PREVIEW = 8
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _get_parser() -> BillParser:
     import shared.integrations.llm.manager as llm_mod
@@ -67,6 +55,7 @@ def _build_confirmation_text(entry: BillEntry) -> str:
         else "未知"
     )
     bill_date = entry.bill_date or "未知"
+    receipt_hint = "📎 已附图片凭证" if entry.receipt_tmp_path or entry.receipt_url else "📎 无凭证"
 
     text = (
         f"📋 *账单确认*\n\n"
@@ -75,7 +64,7 @@ def _build_confirmation_text(entry: BillEntry) -> str:
         f"🏪 商家：{merchant}\n"
         f"📝 描述：{description}\n"
         f"📅 日期：{bill_date}\n"
-        f"📎 凭证：{'已附图片' if entry.receipt_file_id else '无'}"
+        f"{receipt_hint}"
     )
     items_preview = _format_items_preview(entry)
     if items_preview:
@@ -156,7 +145,6 @@ async def handle_bill_text(update: Update, context: CallbackContext) -> None:
         return
 
     processing_msg = await update.message.reply_text("🤖 AI 正在解析账单，请稍候…")
-    # ↓ Unified factory — no more manual _edit_fn plumbing
     ctx = TelegramContext.from_message_with_status(update, context, processing_msg)
     await _bill_text_impl(ctx, text=text)
 
@@ -165,9 +153,38 @@ async def handle_bill_text(update: Update, context: CallbackContext) -> None:
 # Photo bill
 # ---------------------------------------------------------------------------
 
-async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = "") -> None:
+async def _save_receipt_tmp(image_bytes: bytes, cache_id: str) -> str:
+    """
+    将图片保存到临时目录。
+
+    Returns
+    -------
+    tmp_identifier : "pending/xxx.jpg" 格式的临时标识，失败时返回空字符串
+    """
+    from shared.services.container import services
     try:
-        entry = await _get_parser().parse_image(user_id=ctx.user_id, image_base64=image_b64)
+        tmp_id = await services.receipt_storage.save_tmp(
+            data=image_bytes,
+            ext=".jpg",
+            hint=cache_id,
+        )
+        return tmp_id
+    except Exception as e:
+        logger.warning("Failed to save receipt tmp for cache_id=%s: %s", cache_id, e)
+        return ""
+
+
+async def _bill_photo_impl(
+    ctx: PlatformContext,
+    image_b64: str,
+    image_bytes: bytes,
+    file_id: str = "",
+) -> None:
+    try:
+        entry = await _get_parser().parse_image(
+            user_id=ctx.user_id,
+            image_base64=image_b64,
+        )
     except ValueError as exc:
         await ctx.edit(f"❌ 识别失败：{exc}\n\n请尝试发送更清晰的图片，或直接输入文字。")
         return
@@ -179,11 +196,23 @@ async def _bill_photo_impl(ctx: PlatformContext, image_b64: str, file_id: str = 
     if file_id:
         entry.receipt_file_id = file_id
 
+    # 先 set 到缓存拿到 cache_id，再用 cache_id 作为临时文件名 hint
     cache_id = await bill_cache.set(entry)
-    await ctx.edit_keyboard(_build_confirmation_text(entry), _confirmation_keyboard(cache_id))
+
+    # 保存临时图片，用 cache_id 关联，方便取消时清理
+    tmp_path = await _save_receipt_tmp(image_bytes, cache_id)
+    if tmp_path:
+        entry.receipt_tmp_path = tmp_path
+        # 更新缓存中的 entry（写入 tmp_path）
+        await bill_cache.update(cache_id, entry)
+
+    await ctx.edit_keyboard(
+        _build_confirmation_text(entry),
+        _confirmation_keyboard(cache_id),
+    )
     logger.info(
-        "Bill photo confirmation sent: cache_id=%s user_id=%s items=%d",
-        cache_id, ctx.user_id, len(entry.items),
+        "Bill photo confirmation sent: cache_id=%s user_id=%s items=%d tmp_path=%s",
+        cache_id, ctx.user_id, len(entry.items), tmp_path,
     )
 
 
@@ -203,12 +232,12 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
         tg_file = await photo.get_file()
         buf = BytesIO()
         await tg_file.download_to_memory(buf)
-        image_b64 = base64.b64encode(buf.getvalue()).decode()
+        image_bytes = buf.getvalue()
+        image_b64 = base64.b64encode(image_bytes).decode()
     except Exception as exc:
         logger.error("Photo download failed user=%s: %s", user.id, exc, exc_info=True)
         await processing_msg.edit_text("❌ 图片下载失败，请重试。")
         return
 
-    # ↓ Same unified factory
     ctx = TelegramContext.from_message_with_status(update, context, processing_msg)
-    await _bill_photo_impl(ctx, image_b64, file_id=file_id)
+    await _bill_photo_impl(ctx, image_b64, image_bytes, file_id=file_id)
