@@ -28,7 +28,8 @@ class AudioStrategy(TaskStrategy):
     ) -> None:
         await sender.send_audio(file_id, title=caption)
         await sender.send_message(
-            t("sent_via_file_id_no_reupload", sender.user_id)
+            t("sent_via_file_id_no_reupload", sender.user_id),
+            auto_delete_after=5.0,
         )
 
     async def _upload_new_file(

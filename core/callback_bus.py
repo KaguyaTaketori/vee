@@ -120,7 +120,7 @@ class CallbackContext(ABC):
         """删除触发此回调的消息。"""
         ...
 
-    def create_sender(self, processing_msg: Any) -> Any:
+    def create_sender(self, processing_msg: Any = None) -> Any:
         """Return a platform-specific BotSender anchored to this callback's message.
 
         The returned object satisfies the ``BotSender`` Protocol and can be
@@ -215,10 +215,11 @@ class TelegramCallbackContext(CallbackContext):
     async def delete_message(self) -> None:
         await self._query.delete_message()
 
-    def create_sender(self, processing_msg: Any) -> Any:
+    def create_sender(self, processing_msg: Any = None) -> Any:
         """Return a TelegramSender whose reply-target is the callback's message."""
         from modules.downloader.strategies.sender import TelegramSender
-        return TelegramSender.from_callback(self._query, processing_msg)
+        effective_msg = processing_msg if processing_msg is not None else self._query.message
+        return TelegramSender.from_callback(self._query, effective_msg)
 
     async def request_text_input(
         self,

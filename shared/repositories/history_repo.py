@@ -250,3 +250,31 @@ class HistoryRepository(BaseRepository):
             async with db.execute(sql, params) as cur:
                 row = await cur.fetchone()
                 return row[0] if row and row[0] else None
+
+    async def get_file_id_and_title_by_url(
+        self,
+        url: str,
+        max_age_hours: int = 168,
+        download_type: Optional[str] = None,
+    ) -> Optional[tuple[str, str | None]]:
+        """Return (file_id, title) or None."""
+        now = time.time()
+        max_age_seconds = max_age_hours * 3600
+        sql = """
+            SELECT file_id, title FROM history
+            WHERE url = ?
+              AND status = 'success'
+              AND file_id IS NOT NULL
+              AND timestamp > ?
+        """
+        params: list = [url, now - max_age_seconds]
+        if download_type:
+            sql += " AND download_type = ?"
+            params.append(download_type)
+        sql += " ORDER BY timestamp DESC LIMIT 1"
+        async with self._db() as db:
+            async with db.execute(sql, params) as cur:
+                row = await cur.fetchone()
+                if row and row[0]:
+                    return row[0], row[1]  # (file_id, title)
+        return None

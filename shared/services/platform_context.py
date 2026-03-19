@@ -1,19 +1,3 @@
-# shared/services/platform_context.py
-"""
-shared/services/platform_context.py
-─────────────────────────────────────
-Platform-agnostic context object that handler logic operates on.
-
-Methods
--------
-send(text)                  — plain-text reply
-send_markdown(text)         — Markdown reply (Telegram parse_mode=Markdown)
-send_markdown_v2(text)      — MarkdownV2 reply (for escape_markdown content)
-send_keyboard(text, btns)   — reply with an inline keyboard
-edit(text)                  — edit current message, plain text
-edit_keyboard(text, btns)   — edit current message, with new inline keyboard
-bot_send(chat_id, text)     — proactive send to any chat_id
-"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -258,3 +242,4 @@ class TelegramContext(PlatformContext):
         if self._sender_factory is not None:
             return self._sender_factory(processing_msg)
         return None
+

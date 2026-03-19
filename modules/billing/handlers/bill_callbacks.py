@@ -20,7 +20,7 @@ from modules.billing.database.bills import insert_bill
 from modules.billing.services.bill_cache import bill_cache, BillEntry, BillItem
 from modules.billing.services.bill_parser import VALID_CATEGORIES
 from shared.services.platform_context import TelegramContext, btn
-from utils.decorators import auto_delete 
+from utils.auto_delete import auto_delete 
 
 logger = logging.getLogger(__name__)
 

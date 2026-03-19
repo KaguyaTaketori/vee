@@ -1,21 +1,3 @@
-# modules/downloader/handlers/message_parser.py
-"""
-modules/downloader/handlers/message_parser.py
-
-Decoupling
-──────────
-``_handle_link_impl``, ``_handle_single_url``, ``_handle_batch_urls``
-previously accepted ``update`` and ``context`` only to construct a
-``TelegramSender``.  That construction now goes through
-``ctx.create_sender(processing_msg)``, which is implemented on
-``TelegramContext.from_message`` via a captured closure — the _impl
-functions never see a PTB object.
-
-The PTB entry point ``handle_link`` remains a thin adapter:
-  1. Extracts user, urls, builds RequestContext for middleware.
-  2. Constructs TelegramContext (which captures the PTB Message).
-  3. Delegates to _handle_link_impl(ctx, urls).
-"""
 from __future__ import annotations
 
 import logging
@@ -89,27 +71,24 @@ async def _handle_link_impl(ctx: PlatformContext, urls: list[str]) -> None:
 
 
 async def _handle_single_url(ctx: PlatformContext, url: str) -> None:
-    recent_download = await check_recent_download(url, max_age_hours=24, download_type=None)
-    cached_file_path: str | None = None
+#    recent_download = await check_recent_download(url, max_age_hours=24, download_type=None)
 
-    if recent_download:
-        file_path = recent_download.get("file_path")
-        file_size = (
-            os.path.getsize(file_path)
-            if file_path and os.path.exists(file_path)
-            else 0
-        )
-        if file_size > 0:
-            cached_file_path = file_path
+#    if recent_download:
+#        file_id = recent_download.get("file_id")
+#        file_path = recent_download.get("file_path")
+#        download_type = recent_download.get("download_type", "video")
 
-    if cached_file_path:
-        download_type = recent_download.get("download_type", "video")
-        processing_msg = await ctx.send(t("processing_please_wait", ctx.user_id))
-        sender = ctx.create_sender(processing_msg)
-        session = UserSession(url=url, user_id=ctx.user_id, sender=sender)
-        await DownloadFacade.send_cached(session, cached_file_path, download_type)
-        return
+        # ✅ 优先用 file_id，本地文件不存在也没关系
+#        has_file_id = bool(file_id)
+#        has_local_file = bool(file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0)
 
+#        if has_file_id or has_local_file:
+#            processing_msg = await ctx.send(t("processing_please_wait", ctx.user_id))
+#            sender = ctx.create_sender(processing_msg)
+#            session = UserSession(url=url, user_id=ctx.user_id, sender=sender)
+#            await DownloadFacade.send_cached(session, file_path or "", download_type)
+#            return
+    
     # Show download-type selection keyboard
     session_key = UserSession.store(url=url, user_id=ctx.user_id)
 

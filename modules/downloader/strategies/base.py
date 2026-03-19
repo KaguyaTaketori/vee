@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from config import MAX_FILE_SIZE, MAX_CACHE_SIZE
 from database.history import (
     get_file_id_by_url,
+    get_file_id_and_title_by_url,
     add_history,
     check_recent_download,
 )
@@ -148,20 +149,35 @@ class TaskStrategy(ABC):
         return new_id
 
     async def execute(self, sender: BotSender, url: str) -> None:
-        """Main entry point called by the task runner."""
         user_id = sender.user_id
         await sender.edit_status(t("processing", user_id))
 
         logger.info("execute: url=%s, task_type=%s", url, self.task_type)
 
+        file_id_result = await get_file_id_and_title_by_url(url, download_type=self.task_type)
+        if file_id_result:
+            file_id, title = file_id_result
+            caption = self._get_caption(title) if title else None
+            logger.info("execute: file_id hit, sending directly")
+            await sender.edit_status(t("uploading", user_id))
+            try:
+                await self._send_from_file_id(sender, file_id, caption)
+                await sender.delete_status()
+            except Exception as exc:
+                logger.error("file_id send failed: %s", exc, exc_info=True)
+                await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
+                await sender.delete_status(delay=5.0)
+                raise
+            return
+
         cached_file = await self._check_cached_file(url, user_id)
+
         loop = asyncio.get_event_loop()
         processing_msg = getattr(sender, 'processing_msg', None)
+        progress_hook = None
         if processing_msg:
             from utils.download_tracker import _make_progress_hook
             progress_hook = _make_progress_hook(processing_msg, loop)
-        else:
-            progress_hook = None
 
         if cached_file:
             logger.info("execute: using cached file=%s", cached_file)
@@ -170,14 +186,14 @@ class TaskStrategy(ABC):
             logger.info("execute: starting _do_execute for url=%s", url)
             try:
                 filename, info = await self._do_execute(url, progress_hook)
-                logger.info("execute: _do_execute completed, filename=%s, info keys=%s", filename, list(info.keys()) if info else [])
+                logger.info("execute: _do_execute completed, filename=%s", filename)
             except Exception as exc:
                 logger.error("execute: _do_execute failed: %s", exc, exc_info=True)
                 await sender.edit_status(t("download_failed", user_id, error=str(exc)))
                 raise
 
-        logger.info("execute: validating file size for %s", filename)
         if not await self._validate_file_size(filename, sender):
+            await sender.delete_status(delay=5.0)
             return
 
         title = info.get("title") if info else None
@@ -185,18 +201,26 @@ class TaskStrategy(ABC):
 
         await sender.edit_status(t("uploading", user_id))
         try:
-            logger.info("execute: calling _get_file_id_or_upload for url=%s", url)
-            await self._get_file_id_or_upload(sender, url, filename, caption, title)
+            logger.info("execute: uploading for url=%s", url)
+            new_id = await self._upload_new_file(sender, filename, caption)
+            if new_id:
+                try:
+                    file_size = int(os.path.getsize(filename)) if os.path.exists(filename) else 0
+                except (OSError, TypeError, ValueError):
+                    file_size = 0
+                await add_history(
+                    user_id, url, self.task_type,
+                    file_size, title, "success", filename, new_id,
+                )
             await sender.delete_status()
-            logger.info("execute: _get_file_id_or_upload completed")
+            logger.info("execute: upload completed")
         except Exception as exc:
             logger.error("Upload failed: %s", exc, exc_info=True)
             await sender.edit_status(t("upload_failed", user_id, error=str(exc)))
-            exc._status_already_edited = True
             await sender.delete_status(delay=5.0)
             raise
         finally:
             self._cleanup_temp_file(filename, cached_file)
 
-
 DownloadStrategy = TaskStrategy
+

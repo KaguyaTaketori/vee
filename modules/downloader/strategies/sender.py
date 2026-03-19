@@ -9,6 +9,7 @@ itself is fully platform-agnostic.
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import TYPE_CHECKING, BinaryIO, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -40,7 +41,7 @@ class BotSender(Protocol):
 
     async def delete_status(self, delay: float = 0.0) -> None: ...
 
-    async def send_message(self, text: str) -> None:
+    async def send_message(self, text: str, auto_delete_after: float = 0.0) -> None:
         """Send a new plain-text message (separate from the status message)."""
         ...
 
@@ -138,9 +139,12 @@ class TelegramSender:
             return
         await self._processing_msg.edit_text(text)
 
-    async def send_message(self, text: str) -> None:
-        await self._reply_target.reply_text(text)
-
+    async def send_message(self, text: str, auto_delete_after: float = 0.0) -> None:
+        msg = await self._reply_target.reply_text(text)
+        if auto_delete_after > 0:
+            from utils.auto_delete import _delete_after
+            asyncio.create_task(_delete_after(msg, auto_delete_after))
+    
     async def delete_status(self, delay: float = 0.0) -> None:
         """下载完成后删除状态消息，防止聊天记录堆积。"""
         if self._processing_msg is None:

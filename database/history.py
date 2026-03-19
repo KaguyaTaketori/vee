@@ -96,3 +96,13 @@ async def clear_file_id_by_url(
     url: str, download_type: Optional[str] = None
 ) -> None:
     await _repo.clear_file_id_by_url(url, download_type=download_type)
+
+
+async def get_file_id_and_title_by_url(
+    url: str,
+    max_age_hours: int = 168,
+    download_type: Optional[str] = None,
+) -> Optional[tuple[str, str | None]]:
+    return await _repo.get_file_id_and_title_by_url(
+        url, max_age_hours=max_age_hours, download_type=download_type
+    )
