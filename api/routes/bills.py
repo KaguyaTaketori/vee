@@ -152,30 +152,26 @@ async def list_bills(
     keyword: Optional[str] = Query(None, description="关键字搜索：商家/描述/类别"),
 ):
     offset = (page - 1) * page_size
-    rows = await get_user_bills(user_id, limit=page_size, offset=offset)
-    total = await get_user_bill_count(user_id)
+    kw = keyword.strip() if keyword else None
+
+    # 过滤全部下沉到 SQL，分页语义正确
+    rows = await get_user_bills(
+        user_id,
+        limit=page_size,
+        offset=offset,
+        year=year,
+        month=month,
+        keyword=kw,
+    )
+    total = await get_user_bill_count(
+        user_id,
+        year=year,
+        month=month,
+        keyword=kw,
+    )
 
     for row in rows:
         row["items"] = await get_bill_items(row["id"], user_id)
-
-    # 月份过滤
-    if year or month:
-        prefix = ""
-        if year:
-            prefix += f"{year:04d}"
-        if month:
-            prefix += f"-{month:02d}"
-        rows = [r for r in rows if (r.get("bill_date") or "").startswith(prefix)]
-
-    # 关键字过滤
-    if keyword:
-        kw = keyword.lower()
-        rows = [
-            r for r in rows
-            if kw in (r.get("merchant") or "").lower()
-            or kw in (r.get("description") or "").lower()
-            or kw in (r.get("category") or "").lower()
-        ]
 
     bills = [_row_to_bill_out(r) for r in rows]
     return BillListResponse(

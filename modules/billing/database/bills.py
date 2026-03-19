@@ -207,25 +207,77 @@ async def update_bill_field(bill_id: int, user_id: int, field: str, value: objec
     return updated
 
 
-async def get_user_bills(user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
+async def get_user_bills(
+    user_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    year: int | None = None,
+    month: int | None = None,
+    keyword: str | None = None,
+) -> list[dict]:
+    conditions = ["user_id = ?"]
+    params: list = [user_id]
+
+    if year and month:
+        conditions.append("bill_date LIKE ?")
+        params.append(f"{year:04d}-{month:02d}%")
+    elif year:
+        conditions.append("bill_date LIKE ?")
+        params.append(f"{year:04d}%")
+
+    if keyword:
+        kw = f"%{keyword}%"
+        conditions.append(
+            "(merchant LIKE ? OR description LIKE ? OR category LIKE ?)"
+        )
+        params.extend([kw, kw, kw])
+
+    where = " AND ".join(conditions)
+    params.extend([limit, offset])
+
     async with get_db() as db:
         cursor = await db.execute(
-            """
+            f"""
             SELECT * FROM bills
-            WHERE user_id = ?
-            ORDER BY created_at DESC
+            WHERE {where}
+            ORDER BY bill_date DESC, created_at DESC
             LIMIT ? OFFSET ?
             """,
-            (user_id, limit, offset),
+            params,
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-async def get_user_bill_count(user_id: int) -> int:
+async def get_user_bill_count(
+    user_id: int,
+    year: int | None = None,
+    month: int | None = None,
+    keyword: str | None = None,
+) -> int:
+    conditions = ["user_id = ?"]
+    params: list = [user_id]
+
+    if year and month:
+        conditions.append("bill_date LIKE ?")
+        params.append(f"{year:04d}-{month:02d}%")
+    elif year:
+        conditions.append("bill_date LIKE ?")
+        params.append(f"{year:04d}%")
+
+    if keyword:
+        kw = f"%{keyword}%"
+        conditions.append(
+            "(merchant LIKE ? OR description LIKE ? OR category LIKE ?)"
+        )
+        params.extend([kw, kw, kw])
+
+    where = " AND ".join(conditions)
+
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM bills WHERE user_id = ?", (user_id,)
+            f"SELECT COUNT(*) FROM bills WHERE {where}",
+            params,
         )
         row = await cursor.fetchone()
     return row[0] if row else 0
