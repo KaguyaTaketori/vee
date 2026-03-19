@@ -1,22 +1,30 @@
-# Vee - Telegram Media Downloader Bot
+# Vee - Telegram Bot Platform
 
 [中文版](./README.zh.md) | [日本語](./README.ja.md)
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A powerful Telegram bot for downloading videos, audio, thumbnails, and subtitles from multiple platforms.
+A powerful Telegram bot platform with modular plugin architecture. Currently includes media downloading and billing management.
 
 ## Features
 
+### Media Downloader Module
 - **Multi-platform Support**: YouTube, TikTok, Instagram, Twitter/X, Bilibili, Spotify, and more
 - **Multiple Download Types**: Videos (up to 2GB), Audio (MP3), Thumbnails, Subtitles
 - **High-Speed Downloads**: aria2 multi-connection support for faster downloads
-- **User Management**: Allow/block system with rate limiting
 - **Download History**: SQLite-based history with file ID caching to avoid re-uploads
-- **Multi-language**: English, Chinese, Japanese, Korean support
 - **Cookie Management**: Auto-refresh cookies for authenticated downloads
-- **Template Method Pattern**: Flexible base strategy with common download/upload workflow
+
+### Billing Module
+- **Bill Parsing**: Parse and manage billing information from various sources
+- **User Bill History**: Track and view past billing records
+
+### Core Features
+- **User Management**: Allow/block system with rate limiting
+- **Multi-language**: English, Chinese, Japanese, Korean support
+- **Plugin Architecture**: Modular design for easy feature extension
+- **Task Queue**: Async task queue with concurrency control
 
 ## Installation
 
@@ -70,6 +78,7 @@ Edit `.env` file:
 - `/start` - Start the bot
 - `/help` - Show help
 - `/history` - View download history
+- `/mybills` - View your billing records
 - `/lang` - Change language
 
 ### Admin Commands
@@ -89,19 +98,22 @@ Edit `.env` file:
 
 ```
 vee/
-├── modules/
-│   ├── downloader/           # Download module
+├── modules/                  # Plugin modules
+│   ├── downloader/          # Media downloader
 │   │   ├── strategies/      # Download strategies (video, audio, thumbnail, subtitle, spotify)
-│   │   ├── handlers/         # Message & callback handlers
+│   │   ├── handlers/        # Message & callback handlers
 │   │   ├── services/        # Facades and domain services
-│   │   └── integrations/    # External integrations (yt-dlp, aria2, spotify)
-│   └── billing/             # Billing module
+│   │   └── integrations/   # External integrations (yt-dlp, aria2, spotify)
+│   └── billing/             # Billing management
+│       ├── handlers/         # Bill handlers & callbacks
+│       ├── services/         # Bill parsing & caching
+│       └── database/         # Bill storage
 ├── core/                    # Core bot functionality
 │   ├── callback_bus.py       # Event callback bus
 │   ├── handler_registry.py   # Handler registration
 │   ├── bot_setup.py          # Bot initialization
 │   ├── filters.py            # Update filters
-│   └── ...
+│   └── jobs.py               # Scheduled jobs
 ├── database/                # Database layer
 ├── shared/                  # Shared utilities & repositories
 ├── models/                  # Domain models
@@ -114,9 +126,10 @@ vee/
 - **Strategy Pattern**: Modular download strategies (`VideoStrategy`, `AudioStrategy`, `ThumbnailStrategy`, etc.)
 - **Factory Pattern**: `StrategyFactory` for dynamic strategy selection
 - **Template Method**: `TaskStrategy` base class with common download/upload workflow
-- **Facade Pattern**: `DownloadFacade` as simple API to task queue
+- **Facade Pattern**: `DownloadFacade` and billing facades for clean APIs
+- **Plugin Architecture**: Independent modules that can be extended
 
-## Supported Platforms
+## Supported Platforms (Media Downloader)
 
 | Platform | Video | Audio | Thumbnail | Subtitle |
 |----------|-------|-------|-----------|----------|

@@ -1,22 +1,30 @@
-# Vee - Telegram 媒体下载机器人
+# Vee - Telegram 机器人平台
 
 [English](./README.md) | [日本語](./README.ja.md)
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-一个强大的Telegram机器人，支持从多个平台下载视频、音频、缩略图和字幕。
+一个强大的 Telegram 机器人平台，采用模块化插件架构。目前包含媒体下载和账单管理功能。
 
 ## 功能
 
+### 媒体下载模块
 - **多平台支持**: YouTube、TikTok、Instagram、Twitter/X、Bilibili、Spotify等
 - **多种下载类型**: 视频（最大2GB）、音频（MP3）、缩略图、字幕
 - **高速下载**: aria2多连接支持
-- **用户管理**: 允许/阻止系统，速率限制
 - **下载历史**: SQLite数据库，支持文件ID缓存避免重复上传
-- **多语言**: 英语、中文、日语、韩语支持
 - **Cookie管理**: 认证下载的自动Cookie刷新
-- **模板方法模式**: 灵活的基础策略实现通用下载/上传流程
+
+### 账单模块
+- **账单解析**: 解析和管理来自各种来源的账单信息
+- **用户账单历史**: 跟踪和查看过去的账单记录
+
+### 核心功能
+- **用户管理**: 允许/阻止系统，速率限制
+- **多语言**: 英语、中文、日语、韩语支持
+- **插件架构**: 模块化设计，易于扩展功能
+- **任务队列**: 支持并发控制的异步任务队列
 
 ## 安装
 
@@ -70,6 +78,7 @@ python vee.py
 - `/start` - 启动机器人
 - `/help` - 显示帮助
 - `/history` - 下载历史
+- `/mybills` - 查看账单记录
 - `/lang` - 更改语言
 
 ### 管理员命令
@@ -89,24 +98,27 @@ python vee.py
 
 ```
 vee/
-├── modules/
-│   ├── downloader/           # 下载模块
-│   │   ├── strategies/        # 下载策略（视频、音频、缩略图、字幕、Spotify）
+├── modules/                  # 插件模块
+│   ├── downloader/          # 媒体下载
+│   │   ├── strategies/       # 下载策略（视频、音频、缩略图、字幕、Spotify）
 │   │   ├── handlers/         # 消息和回调处理器
-│   │   ├── services/         # Facade和服务
+│   │   ├── services/        # Facade和服务
 │   │   └── integrations/    # 外部集成（yt-dlp、aria2、spotify）
-│   └── billing/              # 计费模块
-├── core/                     # 核心机器人功能
+│   └── billing/             # 账单管理
+│       ├── handlers/         # 账单处理器和回调
+│       ├── services/        # 账单解析和缓存
+│       └── database/        # 账单存储
+├── core/                    # 核心机器人功能
 │   ├── callback_bus.py       # 事件回调总线
 │   ├── handler_registry.py   # 处理器注册
 │   ├── bot_setup.py          # 机器人初始化
 │   ├── filters.py            # 更新过滤器
-│   └── ...
-├── database/                 # 数据库层
-├── shared/                   # 共享工具和仓库
-├── models/                   # 领域模型
-├── config.py                 # 配置
-└── vee.py                    # 主入口
+│   └── jobs.py               # 定时任务
+├── database/                # 数据库层
+├── shared/                  # 共享工具和仓库
+├── models/                  # 领域模型
+├── config.py                # 配置
+└── vee.py                   # 主入口
 ```
 
 ## 设计模式
@@ -114,9 +126,10 @@ vee/
 - **策略模式**: 模块化下载策略（`VideoStrategy`、`AudioStrategy`、`ThumbnailStrategy`等）
 - **工厂模式**: `StrategyFactory`动态选择策略
 - **模板方法**: `TaskStrategy`基类实现通用下载/上传流程
-- **外观模式**: `DownloadFacade`提供简单的任务队列API
+- **外观模式**: `DownloadFacade`和账单Facade提供清晰的API
+- **插件架构**: 独立的模块，易于扩展
 
-## 支持的平台
+## 支持的平台（媒体下载）
 
 | 平台 | 视频 | 音频 | 缩略图 | 字幕 |
 |----------|-------|-------|-----------|----------|
