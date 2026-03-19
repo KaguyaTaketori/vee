@@ -21,7 +21,6 @@ from typing import Optional
 from .base import TaskStrategy, DownloadStrategy
 from .video import VideoStrategy, VideoFormatStrategy
 from .audio import AudioStrategy
-from .spotify import SpotifyStrategy
 from .thumbnail import ThumbnailStrategy
 from .subtitle import SubtitleStrategy
 
@@ -37,7 +36,6 @@ class StrategyFactory:
         "download_video":     VideoStrategy,
         "download_audio":     AudioStrategy,
         "download_thumbnail": ThumbnailStrategy,
-        "spotify":            SpotifyStrategy,
         "subtitle":           SubtitleStrategy,
     }
 

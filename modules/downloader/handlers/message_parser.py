@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import CallbackContext
 
 from modules.downloader.services.facades import DownloadFacade
-from modules.downloader.services.domain_config import SUPPORTED_DOMAINS, is_spotify_url
+from modules.downloader.services.domain_config import SUPPORTED_DOMAINS
 from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, warm_user_lang
@@ -54,7 +54,7 @@ def is_valid_url(url: str) -> bool:
 
 
 def _infer_download_type(url: str) -> str:
-    return "spotify" if is_spotify_url(url) else "download_audio"
+    return "download_audio"
 
 
 # ---------------------------------------------------------------------------
@@ -72,16 +72,11 @@ async def _handle_link_impl(ctx: PlatformContext, urls: list[str]) -> None:
 async def _handle_single_url(ctx: PlatformContext, url: str) -> None:
     session_key = UserSession.store(url=url, user_id=ctx.user_id)
 
-    if is_spotify_url(url):
-        buttons = [
-            [btn(t("audio", ctx.user_id), f"dl_spotify_{session_key}")],
-        ]
-    else:
-        buttons = [
-            [btn(t("video", ctx.user_id), f"dl_video_{session_key}"),
-             btn(t("audio", ctx.user_id), f"dl_audio_{session_key}")],
-            [btn(t("thumbnail", ctx.user_id), f"dl_thumb_{session_key}")],
-        ]
+    buttons = [
+        [btn(t("video", ctx.user_id), f"dl_video_{session_key}"),
+         btn(t("audio", ctx.user_id), f"dl_audio_{session_key}")],
+        [btn(t("thumbnail", ctx.user_id), f"dl_thumb_{session_key}")],
+    ]
 
     await ctx.send_keyboard(t("what_download", ctx.user_id), buttons)
 

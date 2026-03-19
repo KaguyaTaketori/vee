@@ -180,7 +180,7 @@ async def _cb_admcancel_task(ctx: CallbackContext) -> None:
 # ── Download: video / audio / thumbnail 初始选择 ─────────────────────────
 
 @register(lambda d: d.startswith("dl_video_") or d.startswith("dl_audio_") or
-          d.startswith("dl_thumb_") or d.startswith("dl_spotify_"))
+          d.startswith("dl_thumb_"))
 async def _cb_download_select(ctx: CallbackContext) -> None:
     data = ctx.data
 
@@ -190,12 +190,9 @@ async def _cb_download_select(ctx: CallbackContext) -> None:
     elif data.startswith("dl_audio_"):
         session_key = data[len("dl_audio_"):]
         download_type = "audio"
-    elif data.startswith("dl_thumb_"):
+    else:
         session_key = data[len("dl_thumb_"):]
         download_type = "thumbnail"
-    else:
-        session_key = data[len("dl_spotify_"):]
-        download_type = "spotify"
 
     session = UserSession.load(session_key)
     if session is None:

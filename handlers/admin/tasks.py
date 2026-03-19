@@ -74,7 +74,6 @@ _FORMAT_LABEL: dict[str, str] = {
 def _format_download_type(download_type: str, file_size: int | None = None) -> str:
     size_str = f" {file_size / (1024 * 1024):.0f}MB" if file_size else ""
     if download_type == "audio":     return f"🎵 音频{size_str}"
-    if download_type == "spotify":   return f"🎵 Spotify{size_str}"
     if download_type == "subtitle":  return f"📝 字幕{size_str}"
     if download_type == "thumbnail": return f"🖼️ 封面{size_str}"
     if download_type == "video":     return f"🎬 视频{size_str}"

@@ -7,7 +7,6 @@ SUPPORTED_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
-    "spotify.com",
     "bilibili.com",
     "bilibili.tv",
     "b23.tv",
@@ -24,10 +23,3 @@ SUPPORTED_DOMAINS = (
     "dailymotion.com",
 )
 
-
-def is_spotify_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return "spotify.com" in parsed.netloc.lower()
-    except Exception:
-        return False

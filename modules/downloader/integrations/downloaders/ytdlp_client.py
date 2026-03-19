@@ -300,5 +300,3 @@ async def download_subtitle(url: str, preferred_langs: list[str] | None = None) 
     return await loop.run_in_executor(None, _dl)
 
 
-def is_spotify_url(url: str) -> bool:
-    return "spotify.com" in url.lower()
