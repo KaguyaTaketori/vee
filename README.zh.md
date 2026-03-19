@@ -5,17 +5,18 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-一个强大的Telegram机器人，支持从多个平台下载视频、音频和缩略图。
+一个强大的Telegram机器人，支持从多个平台下载视频、音频、缩略图和字幕。
 
 ## 功能
 
 - **多平台支持**: YouTube、TikTok、Instagram、Twitter/X、Bilibili、Spotify等
-- **多种下载类型**: 视频（最大2GB）、音频（MP3）、缩略图
+- **多种下载类型**: 视频（最大2GB）、音频（MP3）、缩略图、字幕
 - **高速下载**: aria2多连接支持
 - **用户管理**: 允许/阻止系统，速率限制
+- **下载历史**: SQLite数据库，支持文件ID缓存避免重复上传
 - **多语言**: 英语、中文、日语、韩语支持
-- **缓存**: 自动缓存文件ID，避免重复上传
 - **Cookie管理**: 认证下载的自动Cookie刷新
+- **模板方法模式**: 灵活的基础策略实现通用下载/上传流程
 
 ## 安装
 
@@ -30,7 +31,7 @@
 
 1. 克隆仓库:
 ```bash
-git clone https://github.com/yourusername/vee.git
+git clone https://github.com/KaguyaTaketori/vee.git
 cd vee
 ```
 
@@ -88,41 +89,43 @@ python vee.py
 
 ```
 vee/
-├── app/              # Telegram机器人处理器
-│   ├── commands.py   # 命令处理器
-│   ├── callbacks.py  # 回调处理器
-│   └── download.py  # 下载工具
-├── core/             # 核心功能
-│   ├── downloader.py    # 下载逻辑 (yt-dlp)
-│   ├── strategies.py     # 下载策略模式
-│   ├── facades.py       # 服务外观
-│   ├── history.py       # 下载历史 (SQLite)
-│   ├── users.py         # 用户管理
-│   ├── ratelimit.py     # 速率限制
-│   ├── logger.py        # 日志系统
-│   └── i18n.py         # 国际化
-├── locales/          # 翻译文件
-├── config.py         # 配置
-└── vee.py           # 主入口
+├── modules/
+│   ├── downloader/           # 下载模块
+│   │   ├── strategies/        # 下载策略（视频、音频、缩略图、字幕、Spotify）
+│   │   ├── handlers/         # 消息和回调处理器
+│   │   ├── services/         # Facade和服务
+│   │   └── integrations/    # 外部集成（yt-dlp、aria2、spotify）
+│   └── billing/              # 计费模块
+├── core/                     # 核心机器人功能
+│   ├── callback_bus.py       # 事件回调总线
+│   ├── handler_registry.py   # 处理器注册
+│   ├── bot_setup.py          # 机器人初始化
+│   ├── filters.py            # 更新过滤器
+│   └── ...
+├── database/                 # 数据库层
+├── shared/                   # 共享工具和仓库
+├── models/                   # 领域模型
+├── config.py                 # 配置
+└── vee.py                    # 主入口
 ```
 
 ## 设计模式
 
-- **策略模式**: 使用`DownloadStrategy`实现灵活的下载策略
-- **工厂模式**: `StrategyFactory`管理策略
-- **服务层**: `DownloadService`抽象实现解耦
-- **模板方法**: 基础策略实现通用工作流
+- **策略模式**: 模块化下载策略（`VideoStrategy`、`AudioStrategy`、`ThumbnailStrategy`等）
+- **工厂模式**: `StrategyFactory`动态选择策略
+- **模板方法**: `TaskStrategy`基类实现通用下载/上传流程
+- **外观模式**: `DownloadFacade`提供简单的任务队列API
 
 ## 支持的平台
 
-| 平台 | 视频 | 音频 | 缩略图 |
-|----------|-------|-------|-----------|
-| YouTube | ✅ | ✅ | ✅ |
-| TikTok | ✅ | ✅ | ✅ |
-| Instagram | ✅ | ✅ | ✅ |
-| Twitter/X | ✅ | ✅ | ✅ |
-| Bilibili | ✅ | ✅ | ✅ |
-| Spotify | ✅ | ✅ | ❌ |
+| 平台 | 视频 | 音频 | 缩略图 | 字幕 |
+|----------|-------|-------|-----------|----------|
+| YouTube | ✅ | ✅ | ✅ | ✅ |
+| TikTok | ✅ | ✅ | ✅ | ❌ |
+| Instagram | ✅ | ✅ | ✅ | ❌ |
+| Twitter/X | ✅ | ✅ | ✅ | ❌ |
+| Bilibili | ✅ | ✅ | ✅ | ✅ |
+| Spotify | ✅ | ✅ | ❌ | ❌ |
 
 ## 许可证
 

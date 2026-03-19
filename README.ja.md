@@ -5,17 +5,18 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-複数のプラットフォームから動画、音声、サムネイルをダウンロードできる強力なTelegramボットです。
+複数のプラットフォームから動画、音声、サムネイル、字幕をダウンロードできる強力なTelegramボットです。
 
 ## 機能
 
 - **マルチプラットフォーム対応**: YouTube、TikTok、Instagram、Twitter/X、Bilibili、Spotifyなど
-- **多様なダウンロード形式**: 動画（最大2GB）、音声（MP3）、サムネイル
+- **多様なダウンロード形式**: 動画（最大2GB）、音声（MP3）、サムネイル、字幕
 - **高速ダウンロード**: aria2マルチ接続サポート
 - **ユーザー管理**: 許可/ブロックシステム、レート制限
+- **ダウンロード履歴**: SQLiteベースの履歴、ファイルIDキャッシュで再アップロードを回避
 - **多言語**: 英語、中国語、日本語、韓国語対応
-- **キャッシュ**: ファイルIDキャッシュで再アップロードを回避
 - **Cookie管理**: 認証ダウンロード用の自動Cookie更新
+- **テンプレートメソッドパターン**: 柔軟な基底戦略で共通のダウンロード/アップロードワークフロー
 
 ## インストール
 
@@ -30,7 +31,7 @@
 
 1. リポジトリをクローン:
 ```bash
-git clone https://github.com/yourusername/vee.git
+git clone https://github.com/KaguyaTaketori/vee.git
 cd vee
 ```
 
@@ -88,41 +89,43 @@ python vee.py
 
 ```
 vee/
-├── app/              # Telegram botハンドラー
-│   ├── commands.py   # コマンドハンドラー
-│   ├── callbacks.py  # コールバックハンドラー
-│   └── download.py  # ダウンロードユーティリティ
-├── core/             # コア機能
-│   ├── downloader.py    # ダウンロードロジック (yt-dlp)
-│   ├── strategies.py     # ダウンロード戦略パターン
-│   ├── facades.py       # サービスファサード
-│   ├── history.py       # ダウンロード履歴 (SQLite)
-│   ├── users.py         # ユーザー管理
-│   ├── ratelimit.py     # レート制限
-│   ├── logger.py        # ログシステム
-│   └── i18n.py         # 国際化
-├── locales/          # 翻訳ファイル
-├── config.py         # 設定
-└── vee.py           # メインエントリポイント
+├── modules/
+│   ├── downloader/           # ダウンロードモジュール
+│   │   ├── strategies/       # ダウンロード戦略（動画、音声、サムネイル、字幕、Spotify）
+│   │   ├── handlers/         # メッセージ・コールバックハンドラー
+│   │   ├── services/         # Facadeとサービス
+│   │   └── integrations/     # 外部連携（yt-dlp、aria2、spotify）
+│   └── billing/              # 請求モジュール
+├── core/                     # コアボット機能
+│   ├── callback_bus.py       # イベントコールバックバス
+│   ├── handler_registry.py   # ハンドラー登録
+│   ├── bot_setup.py          # ボット初期化
+│   ├── filters.py            # 更新フィルター
+│   └── ...
+├── database/                 # データベースレイヤー
+├── shared/                   # 共有ユーティリティとリポジトリ
+├── models/                   # ドメインモデル
+├── config.py                 # 設定
+└── vee.py                    # メインエントリポイント
 ```
 
 ## 設計パターン
 
-- **ストラテジーパターン**: `DownloadStrategy`で柔軟なダウンロード
-- **ファクトリーパターン**: `StrategyFactory`で戦略管理
-- **サービスレイヤー**: 分離のための`DownloadService`抽象化
-- **テンプレートメソッド**: 共通ワークフローのベース戦略
+- **ストラテジーパターン**: モジュール型ダウンロード戦略（`VideoStrategy`、`AudioStrategy`、`ThumbnailStrategy`など）
+- **ファクトリーパターン**: `StrategyFactory`で動的に戦略を選択
+- **テンプレートメソッド**: `TaskStrategy`基底クラスで共通のダウンロード/アップロードワークフロー
+- **ファサードパターン**: `DownloadFacade`でタスクキューへのシンプルなAPI
 
 ## 対応プラットフォーム
 
-| プラットフォーム | 動画 | 音声 | サムネイル |
-|----------|-------|-------|-----------|
-| YouTube | ✅ | ✅ | ✅ |
-| TikTok | ✅ | ✅ | ✅ |
-| Instagram | ✅ | ✅ | ✅ |
-| Twitter/X | ✅ | ✅ | ✅ |
-| Bilibili | ✅ | ✅ | ✅ |
-| Spotify | ✅ | ✅ | ❌ |
+| プラットフォーム | 動画 | 音声 | サムネイル | 字幕 |
+|----------|-------|-------|-----------|----------|
+| YouTube | ✅ | ✅ | ✅ | ✅ |
+| TikTok | ✅ | ✅ | ✅ | ❌ |
+| Instagram | ✅ | ✅ | ✅ | ❌ |
+| Twitter/X | ✅ | ✅ | ✅ | ❌ |
+| Bilibili | ✅ | ✅ | ✅ | ✅ |
+| Spotify | ✅ | ✅ | ❌ | ❌ |
 
 ## ライセンス
 
