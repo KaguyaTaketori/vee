@@ -18,6 +18,8 @@ from .routes.bills import router as bills_router
 from .routes.uploads import router as uploads_router
 from .routes.auth import router as auth_router
 from .routes.me   import router as me_router
+from .routes.admin import router as admin_router
+from .routes.ws    import router as ws_router
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,12 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup():
         from modules.billing.database.bills import init_bills_table
+        from shared.services.ws_manager import ws_manager as _ws_manager
+        from shared.services.container import services
+        if services.ws_manager is None:
+            services.ws_manager = _ws_manager
+            logger.info("WebSocket Manager 已初始化（standalone API 模式）")
+
         await init_bills_table()
 
         # ── Receipt storage ──────────────────────────────────────────────
@@ -119,6 +127,9 @@ def create_app() -> FastAPI:
     app.include_router(uploads_router, prefix="/v1")
     app.include_router(auth_router, prefix="/v1")
     app.include_router(me_router,   prefix="/v1")
+    app.include_router(admin_router, prefix="/v1")
+    app.include_router(ws_router, prefix="/v1")
+    
     return app
 
 

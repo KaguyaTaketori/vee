@@ -665,11 +665,152 @@ async def _v005_unified_schema(db) -> None:
     logger.info("v5 迁移全部完成")
 
 
-# ── 迁移注册表（按版本号升序，只追加，不修改已有条目）────────────────────
+async def _v006_admin_permissions(db) -> None:
+    """
+    v006 — 管理员权限体系、精细化功能权限、IP 审计、系统配置表
+
+    变更内容
+    --------
+    1. users 表新增四列（全部幂等，用 PRAGMA table_info 先探测）：
+       - role             TEXT  DEFAULT 'user'   —— 'user' | 'admin'
+       - permissions      TEXT  DEFAULT '[]'     —— JSON 数组，功能标识白名单
+       - registration_ip  TEXT  DEFAULT ''       —— 首次注册 / 绑定时记录的 IP
+       - last_login_ip    TEXT  DEFAULT ''       —— 最近一次登录 IP
+
+    2. 新建 system_configs 表（IF NOT EXISTS，幂等）：
+       动态存储全局配置项（AI Prompt、默认权限模板、默认模型等）。
+
+    注意
+    ----
+    - 封禁逻辑沿用 is_active = 0，无需新字段
+    - role 目前仅有两级，如需多级可在未来迁移中扩展
+    - permissions 存储为 JSON 字符串，ORM 层负责 loads/dumps
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # ── 1. 探测 users 表现有列 ───────────────────────────────────────────
+    async with db.execute("PRAGMA table_info(users)") as cur:
+        existing_cols = {row[1] for row in await cur.fetchall()}
+
+    new_columns = [
+        ("role",            "TEXT NOT NULL DEFAULT 'user'"),
+        ("permissions",     "TEXT NOT NULL DEFAULT '[]'"),
+        ("registration_ip", "TEXT NOT NULL DEFAULT ''"),
+        ("last_login_ip",   "TEXT NOT NULL DEFAULT ''"),
+    ]
+
+    for col_name, col_def in new_columns:
+        if col_name not in existing_cols:
+            await db.execute(
+                f"ALTER TABLE users ADD COLUMN {col_name} {col_def}"
+            )
+            logger.info("users: 新增列 %s", col_name)
+        else:
+            logger.info("users: 列 %s 已存在，跳过", col_name)
+
+    # ── 2. 初始化已有管理员的 role（对接 ADMIN_IDS 环境变量）─────────────
+    #
+    # 如果环境变量 ADMIN_IDS 中已配置了管理员的 tg_user_id，
+    # 则自动将这些用户的 role 升级为 'admin'，保证存量数据一致。
+    try:
+        import os
+        raw_admin_ids = os.getenv("ADMIN_IDS", "")
+        tg_admin_ids = [
+            int(x.strip()) for x in raw_admin_ids.split(",")
+            if x.strip().isdigit()
+        ]
+        if tg_admin_ids:
+            placeholders = ",".join("?" * len(tg_admin_ids))
+            await db.execute(
+                f"""
+                UPDATE users SET role = 'admin'
+                WHERE tg_user_id IN ({placeholders})
+                  AND role != 'admin'
+                """,
+                tg_admin_ids,
+            )
+            logger.info(
+                "v006: 自动升级 %d 个 TG 管理员的 role → admin",
+                len(tg_admin_ids),
+            )
+    except Exception as e:
+        logger.warning("v006: 自动升级管理员 role 时出错（非致命）: %s", e)
+
+    # ── 3. system_configs 表 ─────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS system_configs (
+            config_key   TEXT PRIMARY KEY,
+            config_value TEXT NOT NULL DEFAULT '',
+            description  TEXT NOT NULL DEFAULT '',
+            updated_by   INTEGER,           -- users.id，NULL 表示系统默认值
+            updated_at   INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+    logger.info("system_configs 表已就绪")
+
+    # ── 4. 写入默认配置项（INSERT OR IGNORE，不覆盖已有值）───────────────
+    default_configs = [
+        (
+            "default_permissions",
+            '["bot_text","bot_receipt"]',
+            "新用户注册时自动分配的默认功能权限（JSON 数组）",
+        ),
+        (
+            "ai_default_model",
+            "gpt-4o-mini",
+            "全局默认 AI 模型标识，对应 llm.yaml 中的 provider/model",
+        ),
+        (
+            "bill_ocr_system_prompt",
+            "",   # 空字符串表示使用代码内置 prompt，非空时覆盖
+            "账单 OCR 的自定义 System Prompt，空字符串=使用代码默认值",
+        ),
+        (
+            "registration_open",
+            "true",
+            "是否开放 App 端新用户注册，false 时 /register 接口返回 403",
+        ),
+        (
+            "bot_welcome_message",
+            "",
+            "Bot /start 命令的欢迎语，空字符串=使用代码默认值",
+        ),
+        (
+            "max_bills_per_user",
+            "500",
+            "每位用户最多保存的账单条数，超出后最旧记录将被清理",
+        ),
+    ]
+
+    import time as _time
+    now = int(_time.time())
+
+    await db.executemany(
+        """
+        INSERT OR IGNORE INTO system_configs
+            (config_key, config_value, description, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [(k, v, d, now) for k, v, d in default_configs],
+    )
+    logger.info("system_configs 已写入 %d 条默认配置", len(default_configs))
+
+    # ── 5. 索引 ───────────────────────────────────────────────────────────
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)"
+    )
+
+    await db.commit()
+    logger.info("v006 迁移完成：role/permissions/IP 字段 + system_configs 表")
+
+
 ALL_MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "bot_base_tables",  _v001_bot_tables),
     (2, "bills_bot_side",   _v002_bills_bot),
     (3, "app_users",        _v003_app_users),
     (4, "app_bills",        _v004_app_bills),
-    (5, "unified_schema",   _v005_unified_schema),   # ← 新增
+    (5, "unified_schema",   _v005_unified_schema),
+    (6, "admin_permissions_and_configs", _v006_admin_permissions),
 ]

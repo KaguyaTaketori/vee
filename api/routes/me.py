@@ -10,6 +10,7 @@ POST /v1/me/logout-all
 from __future__ import annotations
 
 import logging
+import json as _json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -27,6 +28,7 @@ from api.schemas import (
 from api.security import hash_password, verify_password
 from repositories import UserRepository
 
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/me", tags=["me"])
 
@@ -34,20 +36,29 @@ _REPO = UserRepository()
 
 
 def _to_profile(user: dict) -> UserProfile:
+    raw_perms = user.get("permissions") or "[]"
+    try:
+        perms = _json.loads(raw_perms)
+        if not isinstance(perms, list):
+            perms = []
+    except (ValueError, TypeError):
+        perms = []
+ 
     return UserProfile(
         id=user["id"],
-        username=user.get("app_username") or "",   # ← 字段名变化
+        username=user.get("app_username") or "",
         email=user.get("email") or "",
         display_name=user.get("display_name"),
         avatar_url=user.get("avatar_url"),
         tg_user_id=user.get("tg_user_id"),
-        is_active=bool(user["is_active"]),
-        ai_quota_monthly=user["ai_quota_monthly"],
-        ai_quota_used=user["ai_quota_used"],
-        ai_quota_reset_at=float(user["ai_quota_reset_at"]),
-        created_at=float(user["created_at"]),
+        is_active=bool(user.get("is_active", 1)),
+        role=user.get("role") or "user",
+        permissions=perms,
+        ai_quota_monthly=user.get("ai_quota_monthly") or 100,
+        ai_quota_used=user.get("ai_quota_used") or 0,
+        ai_quota_reset_at=float(user.get("ai_quota_reset_at") or 0),
+        created_at=float(user.get("created_at") or 0),
     )
-
 
 @router.get("", response_model=UserProfile)
 async def get_me(app_user_id: Annotated[int, Depends(require_active_user)]):

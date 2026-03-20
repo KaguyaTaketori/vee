@@ -94,6 +94,7 @@ class UserRepository(BaseRepository):
     ) -> int:
         """
         创建或更新 TG 用户，返回 users.id。
+        首次创建时自动从 system_configs 读取并写入默认功能权限。
         """
         now = int(time.time())
         async with self._db() as db:
@@ -101,8 +102,9 @@ class UserRepository(BaseRepository):
                 "SELECT id FROM users WHERE tg_user_id = ?", (tg_user_id,)
             ) as cur:
                 row = await cur.fetchone()
-
+ 
             if row:
+                # 已存在：仅更新活跃信息
                 await db.execute(
                     """
                     UPDATE users SET
@@ -114,7 +116,9 @@ class UserRepository(BaseRepository):
                 )
                 await db.commit()
                 return row[0]
+ 
             else:
+                # 首次创建：写入基础字段
                 cursor = await db.execute(
                     """
                     INSERT INTO users (
@@ -130,8 +134,38 @@ class UserRepository(BaseRepository):
                     ),
                 )
                 await db.commit()
-                return cursor.lastrowid
-
+                new_id = cursor.lastrowid
+ 
+        # 首次创建后，在锁外读取默认权限并写入
+        # （set_permissions 内部会重新开连接，避免嵌套事务）
+        await self._assign_default_permissions(new_id)
+        return new_id
+ 
+    async def _assign_default_permissions(self, user_id: int) -> None:
+        """
+        从 system_configs 读取 default_permissions 并写入新用户。
+        读取失败时静默使用 fallback，不阻断注册/首次登录流程。
+        """
+        import json as _json
+        fallback = ["bot_text", "bot_receipt"]
+        try:
+            from shared.repositories.system_config_repo import SystemConfigRepository
+            raw = await SystemConfigRepository().get("default_permissions")
+            if raw:
+                parsed = _json.loads(raw)
+                perms  = parsed if isinstance(parsed, list) else fallback
+            else:
+                perms = fallback
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "_assign_default_permissions 读取配置失败，使用默认值: %s", e
+            )
+            perms = fallback
+ 
+        await self.set_permissions(user_id, perms)
+        logging.getLogger(__name__).info(
+            "新用户 id=%s 已分配默认权限: %s", user_id, perms
+        )
     # ── App 用户注册（App 侧入口）────────────────────────────────────────
 
     async def create_app_user(
@@ -526,3 +560,152 @@ class UserRepository(BaseRepository):
             except Exception:
                 await db.execute("ROLLBACK")
                 raise
+
+    async def set_role(self, user_id: int, role: str) -> None:
+        """设置用户角色（'user' | 'admin'）。"""
+        async with self._db() as db:
+            await db.execute(
+                "UPDATE users SET role = ?, updated_at = ? WHERE id = ?",
+                (role, int(time.time()), user_id),
+            )
+            await db.commit()
+
+    async def get_role(self, user_id: int) -> str:
+        """返回用户角色，不存在时返回 'user'。"""
+        async with self._db() as db:
+            async with db.execute(
+                "SELECT role FROM users WHERE id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return (row[0] or "user") if row else "user"
+
+    async def set_permissions(
+        self, user_id: int, permissions: list[str]
+    ) -> None:
+        """
+        覆盖写入用户的功能权限列表（JSON 数组序列化存储）。
+
+        permissions 示例：["bot_text", "bot_receipt", "app_ocr"]
+        """
+        import json as _json
+        value = _json.dumps(permissions, ensure_ascii=False)
+        async with self._db() as db:
+            await db.execute(
+                "UPDATE users SET permissions = ?, updated_at = ? WHERE id = ?",
+                (value, int(time.time()), user_id),
+            )
+            await db.commit()
+
+    async def get_permissions(self, user_id: int) -> list[str]:
+        """返回用户权限列表，解析失败或不存在时返回空列表。"""
+        import json as _json
+        async with self._db() as db:
+            async with db.execute(
+                "SELECT permissions FROM users WHERE id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            result = _json.loads(row[0])
+            return result if isinstance(result, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    async def has_permission(self, user_id: int, perm: str) -> bool:
+        """快速检查用户是否拥有某个权限标识。"""
+        perms = await self.get_permissions(user_id)
+        return perm in perms
+
+    # ── IP 审计 ──────────────────────────────────────────────────────────
+
+    async def set_registration_ip(self, user_id: int, ip: str) -> None:
+        """记录注册 IP（首次注册时调用一次，后续不覆盖）。"""
+        async with self._db() as db:
+            await db.execute(
+                """
+                UPDATE users SET registration_ip = ?, updated_at = ?
+                WHERE id = ? AND (registration_ip IS NULL OR registration_ip = '')
+                """,
+                (ip, int(time.time()), user_id),
+            )
+            await db.commit()
+
+    async def update_last_login_ip(self, user_id: int, ip: str) -> None:
+        """每次登录/鉴权通过后更新最后登录 IP。"""
+        async with self._db() as db:
+            await db.execute(
+                "UPDATE users SET last_login_ip = ?, updated_at = ? WHERE id = ?",
+                (ip, int(time.time()), user_id),
+            )
+            await db.commit()
+
+    # ── 管理员专用：用户列表 ─────────────────────────────────────────────
+
+    async def list_all_for_admin(
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        keyword: Optional[str] = None,
+        role: Optional[str] = None,
+        is_active: Optional[int] = None,
+    ) -> tuple[list[dict], int]:
+        """
+        管理员用户列表，支持关键词搜索、角色过滤、激活状态过滤。
+        返回 (rows, total_count)。
+        """
+        conds = ["1=1"]
+        params: list = []
+
+        if keyword:
+            kw = f"%{keyword}%"
+            conds.append(
+                "(email LIKE ? OR app_username LIKE ? "
+                "OR tg_username LIKE ? OR display_name LIKE ?)"
+            )
+            params.extend([kw, kw, kw, kw])
+
+        if role is not None:
+            conds.append("role = ?")
+            params.append(role)
+
+        if is_active is not None:
+            conds.append("is_active = ?")
+            params.append(is_active)
+
+        where = " AND ".join(conds)
+        offset = (page - 1) * page_size
+
+        async with self._db() as db:
+            async with db.execute(
+                f"SELECT COUNT(*) FROM users WHERE {where}", params
+            ) as cur:
+                total = (await cur.fetchone())[0]
+
+            async with db.execute(
+                f"""
+                SELECT id, app_username, email, display_name, tg_user_id,
+                       tg_username, is_active, role, permissions,
+                       ai_quota_monthly, ai_quota_used, ai_quota_reset_at,
+                       registration_ip, last_login_ip,
+                       created_at, updated_at, last_seen
+                FROM users
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params + [page_size, offset],
+            ) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+
+        return rows, total
+
+    async def set_active(self, user_id: int, is_active: int) -> bool:
+        """封禁 (is_active=0) 或解封 (is_active=1) 用户。"""
+        async with self._db() as db:
+            cursor = await db.execute(
+                "UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?",
+                (is_active, int(time.time()), user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0

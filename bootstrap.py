@@ -87,6 +87,11 @@ async def init_services(
     # ── Notifier ──────────────────────────────────────────────────────────
     services.notifier = notifier
 
+    # ── WebSocket Manager ────────────────────────────────────────────────
+    from shared.services.ws_manager import ws_manager as _ws_manager
+    services.ws_manager = _ws_manager
+    logger.info("WebSocket Manager 已初始化")
+
     # ── Persistence via EventBus ──────────────────────────────────────────
     task_repo = TaskRepository()
     services.bus.on("task_started",   task_repo.save)

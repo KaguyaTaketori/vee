@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from shared.services.ratelimit import RateLimiter
     from shared.services.notifier import AdminNotifier
     from shared.services.receipt_storage import ReceiptStorage
+    from shared.services.ws_manager import ConnectionManager
 
 
 class AppContainer:
@@ -16,6 +17,7 @@ class AppContainer:
         self.limiter: "RateLimiter" = None        # type: ignore[assignment]
         self.notifier: "AdminNotifier" = None     # type: ignore[assignment]
         self.receipt_storage: "ReceiptStorage" = None  # type: ignore[assignment]
+        self.ws_manager: "ConnectionManager" = None
 
     @property
     def queue(self) -> "TaskManager":

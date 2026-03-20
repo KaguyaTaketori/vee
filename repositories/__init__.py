@@ -2,6 +2,7 @@
 from shared.repositories.history_repo import HistoryRepository
 from shared.repositories.user_repo import UserRepository          # 合并后的
 from shared.repositories.bill_repo import BillRepository          # 新增
+from shared.repositories.system_config_repo import SystemConfigRepository
 from .task_repo import TaskRepository
 from .rate_limit_repo import RateLimitRepository
 from .analytics_repo import AnalyticsRepository
@@ -17,4 +18,5 @@ __all__ = [
     "TaskRepository",
     "RateLimitRepository",
     "AnalyticsRepository",
+    "SystemConfigRepository"
 ]

@@ -153,22 +153,24 @@ async def list_bills(
             page=page, page_size=page_size,
         )
         if result is not None:
-            # Meilisearch 返回的 amount 已是 float（原始数据写入时就是 float）
-            # 但我们存的是 INTEGER，所以还需要反序列化
+            valid_rows = []
             for row in result["bills"]:
+                if row.get("id") is None:
+                    logger.warning("Meilisearch hit missing id, skipping: %s", row)
+                    continue
                 currency = row.get("currency", "JPY")
                 if isinstance(row.get("amount"), int):
                     row["amount"] = int_to_amount(row["amount"], currency)
                 row.setdefault("items", [])
                 row.setdefault("updated_at", row.get("created_at", 0))
+                valid_rows.append(row)
             return BillListResponse(
-                bills=[_row_to_bill_out(r) for r in result["bills"]],
+                bills=[_row_to_bill_out(r) for r in valid_rows],
                 total=result["total"],
                 page=page,
                 page_size=page_size,
                 has_next=result["has_next"],
             )
-
     # 降级到 SQLite
     rows, total = await _bill_repo.list_by_user(
         app_user_id,
@@ -326,6 +328,8 @@ async def patch_bill(
         await update_bill_in_index(bill_id, searchable)
 
     row = await _bill_repo.get_by_id(bill_id, app_user_id)
+    from shared.services.bill_push import push_bill_updated
+    await push_bill_updated(app_user_id, bill_id)
     return _row_to_bill_out(row)
 
 
@@ -351,3 +355,5 @@ async def delete_bill(
 
     from shared.services.search_service import delete_bill_from_index
     await delete_bill_from_index(bill_id)
+    from shared.services.bill_push import push_bill_deleted
+    await push_bill_deleted(app_user_id, bill_id)

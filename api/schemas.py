@@ -96,6 +96,8 @@ class UserProfile(BaseModel):
     avatar_url:       Optional[str]
     tg_user_id:       Optional[int]
     is_active:        bool
+    role:             str
+    permissions:      list[str]
     ai_quota_monthly: int
     ai_quota_used:    int
     ai_quota_reset_at: float

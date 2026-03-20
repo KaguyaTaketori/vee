@@ -137,6 +137,9 @@ async def _cb_bill_confirm(ctx: CallbackContext) -> None:
         ],
     )
 
+    from shared.services.bill_push import push_new_bill
+    await push_new_bill(user_id=user_id, bill_id=bill_id)
+
     # Meilisearch 索引
     from shared.services.search_service import index_bill
     import time
