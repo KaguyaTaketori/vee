@@ -41,6 +41,10 @@ RATE_TIER_LIMITS: dict[str, int]   = {
     "power":   int(os.getenv("RATE_LIMIT_POWER",  "60")),
     "blocked": 0,
 }
+
+MEILISEARCH_URL: str     = os.getenv("MEILISEARCH_URL", "http://localhost:7700")
+MEILISEARCH_API_KEY: str = os.getenv("MEILISEARCH_API_KEY", "")
+
 CACHE_TTL: int = int(os.getenv("CACHE_TTL", "60"))
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai_compatible")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")

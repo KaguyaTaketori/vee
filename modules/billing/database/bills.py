@@ -13,6 +13,7 @@ import time
 
 from database.db import get_db
 from modules.billing.services.bill_cache import BillEntry, BillItem
+from shared.services.search_service import index_bill
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,19 @@ async def insert_bill(entry: BillEntry) -> int:
         "Bill inserted: bill_id=%s user_id=%s amount=%s items=%d receipt_url=%s",
         bill_id, entry.user_id, entry.amount, len(entry.items), entry.receipt_url,
     )
+    await index_bill({
+        "id":          bill_id,
+        "user_id":     entry.user_id,
+        "amount":      entry.amount,
+        "currency":    entry.currency,
+        "category":    entry.category,
+        "description": entry.description,
+        "merchant":    entry.merchant,
+        "bill_date":   entry.bill_date,
+        "receipt_url": entry.receipt_url,
+        "created_at":  time.time(),
+    })
+
     return bill_id
 
 

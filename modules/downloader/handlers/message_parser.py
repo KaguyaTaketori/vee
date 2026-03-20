@@ -13,7 +13,7 @@ from shared.services.middleware import RequestContext, default_pipeline
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, warm_user_lang
 from shared.services.session import UserSession
-from database.history import
+# from database.history import
 from utils.i18n import t
 from utils.utils import require_message
 

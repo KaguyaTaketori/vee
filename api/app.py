@@ -12,13 +12,16 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .auth import create_access_token, _API_SECRET
+from .security import create_access_token
 from .schemas import TokenRequest, TokenResponse
 from .routes.bills import router as bills_router
 from .routes.uploads import router as uploads_router
+from .routes.auth import router as auth_router
+from .routes.me   import router as me_router
 
 logger = logging.getLogger(__name__)
 
+_API_SECRET: str = os.getenv("API_SECRET", "")
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -91,7 +94,8 @@ def create_app() -> FastAPI:
     # ── 路由注册 ────────────────────────────────────────────────────────────
     app.include_router(bills_router, prefix="/v1")
     app.include_router(uploads_router, prefix="/v1")
-
+    app.include_router(auth_router, prefix="/v1")
+    app.include_router(me_router,   prefix="/v1")
     return app
 
 

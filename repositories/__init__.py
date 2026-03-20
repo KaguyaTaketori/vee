@@ -11,6 +11,8 @@ from shared.repositories.user_repo import UserRepository
 from .task_repo import TaskRepository
 from .rate_limit_repo import RateLimitRepository
 from .analytics_repo import AnalyticsRepository
+from .app_user_repo import AppUserRepository
+
 
 __all__ = [
     "HistoryRepository",
@@ -18,4 +20,5 @@ __all__ = [
     "TaskRepository",
     "RateLimitRepository",
     "AnalyticsRepository",
+    "AppUserRepository",
 ]

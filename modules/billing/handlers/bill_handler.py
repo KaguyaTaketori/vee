@@ -16,11 +16,35 @@ from modules.billing.services.bill_parser import BillParser
 from shared.services.platform_context import PlatformContext, TelegramContext, btn
 from shared.services.user_service import track_user, warm_user_lang
 from utils.utils import require_message
+from repositories import AppUserRepository as _AppUserRepo
+_app_user_repo = _AppUserRepo()
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITEMS_PREVIEW = 8
 
+async def _check_ai_quota(tg_user_id: int) -> tuple[bool, str]:
+    """
+    检查 TG 用户的 AI 配额。
+    - 已绑定 App 账号 → 走 app_users 统一配额
+    - 未绑定 → 走旧 rate_limit 表（降级兼容）
+    Returns (allowed, reason)
+    """
+    app_user = await _app_user_repo.get_by_tg_user_id(tg_user_id)
+
+    if app_user:
+        allowed, remaining = await _app_user_repo.check_and_deduct_ai_quota(
+            app_user["id"]
+        )
+        if not allowed:
+            return False, (
+                "❌ AI 使用次数已达本月上限。\n"
+                "请在 App 个人中心查看配额详情。"
+            )
+        return True, ""
+
+    # 未绑定：不限制，但提示可以绑定
+    return True, ""
 
 def _get_parser() -> BillParser:
     import shared.integrations.llm.manager as llm_mod
@@ -180,6 +204,12 @@ async def _bill_photo_impl(
     image_bytes: bytes,
     file_id: str = "",
 ) -> None:
+    if tg_user_id:
+        allowed, reason = await _check_ai_quota(tg_user_id)
+        if not allowed:
+            await ctx.edit(reason)
+            return
+
     try:
         entry = await _get_parser().parse_image(
             user_id=ctx.user_id,
@@ -215,7 +245,6 @@ async def _bill_photo_impl(
         cache_id, ctx.user_id, len(entry.items), tmp_path,
     )
 
-
 async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
     if not update.message or not update.message.photo:
         return
@@ -227,17 +256,23 @@ async def handle_bill_photo(update: Update, context: CallbackContext) -> None:
     processing_msg = await update.message.reply_text("🤖 AI 正在识别收据图片，请稍候…")
 
     try:
-        photo = update.message.photo[-1]
-        file_id = photo.file_id
-        tg_file = await photo.get_file()
-        buf = BytesIO()
+        photo    = update.message.photo[-1]
+        file_id  = photo.file_id
+        tg_file  = await photo.get_file()
+        buf      = BytesIO()
         await tg_file.download_to_memory(buf)
         image_bytes = buf.getvalue()
-        image_b64 = base64.b64encode(image_bytes).decode()
+        image_b64   = base64.b64encode(image_bytes).decode()
     except Exception as exc:
         logger.error("Photo download failed user=%s: %s", user.id, exc, exc_info=True)
         await processing_msg.edit_text("❌ 图片下载失败，请重试。")
         return
 
     ctx = TelegramContext.from_message_with_status(update, context, processing_msg)
-    await _bill_photo_impl(ctx, image_b64, image_bytes, file_id=file_id)
+    await _bill_photo_impl(
+        ctx,
+        image_b64,
+        image_bytes,
+        file_id=file_id,
+        tg_user_id=user.id,    # ← 传入
+    )

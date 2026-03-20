@@ -30,3 +30,5 @@ build/
 [0-9]*:*/
 bot_data.db-shm
 bot_data.db-wal
+meilisearch
+meili_data/

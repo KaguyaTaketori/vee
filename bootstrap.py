@@ -1,9 +1,3 @@
-"""
-bootstrap.py
-────────────
-Platform-agnostic application bootstrap.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -16,7 +10,9 @@ from shared.services.ratelimit import RateLimiter
 from shared.services.notifier import AdminNotifier
 from shared.services.receipt_storage import LocalReceiptStorage
 from repositories import TaskRepository
-from database.db import init_db
+from database.db import get_db
+from database.migrator import run_migrations
+from database.migrations import ALL_MIGRATIONS
 from shared.repositories.task_store import mark_stale_tasks_failed
 from modules.downloader.services.facades import _execute_download_task
 import shared.integrations.llm.manager as _llm_mod
@@ -35,36 +31,44 @@ async def init_services(
     cpu_workers: int = 2,
     api_workers: int = 5,
 ) -> None:
-    # ── Config ────────────────────────────────────────────────────────────────
+
+    # ── Config ────────────────────────────────────────────────────────────
     init_config()
     logger.info("Config initialised")
 
-    # ── Database ──────────────────────────────────────────────────────────────
-    await init_db()
+    # ── Database migrations ───────────────────────────────────────────────
+    async with get_db() as db:
+        await run_migrations(db, ALL_MIGRATIONS)
+
+    # 各模块自己的表（billing 等）
     for module in modules:
         if hasattr(module, "init_db"):
             await module.init_db()
+
     await mark_stale_tasks_failed()
     logger.info("Database ready")
 
-    # ── LLM ───────────────────────────────────────────────────────────────────
-    _llm_mod.llm_manager = build_llm_manager_from_yaml()
-    logger.info(
-        "LLM manager initialised (provider=%s)",
-        _llm_mod.llm_manager._active_provider_name if _llm_mod.llm_manager else "none",
-    )
+    # ── LLM ───────────────────────────────────────────────────────────────
+    try:
+        _llm_mod.llm_manager = build_llm_manager_from_yaml()
+        logger.info(
+            "LLM manager initialised (provider=%s)",
+            _llm_mod.llm_manager._active_provider_name,
+        )
+    except Exception as e:
+        logger.warning("LLM manager init failed (non-fatal): %s", e)
 
-    # ── Receipt Storage ───────────────────────────────────────────────────────
+    # ── Receipt Storage ───────────────────────────────────────────────────
     services.receipt_storage = LocalReceiptStorage(
         base_dir=UPLOADS_DIR,
         public_base_url=PUBLIC_BASE_URL,
     )
     logger.info("ReceiptStorage initialised (dir=%s)", UPLOADS_DIR)
 
-    # ── Event bus ─────────────────────────────────────────────────────────────
+    # ── Event bus ─────────────────────────────────────────────────────────
     services.bus = _bus
 
-    # ── Task manager ──────────────────────────────────────────────────────────
+    # ── Task manager ──────────────────────────────────────────────────────
     services.task_manager = TaskManager(
         io_workers=io_workers,
         cpu_workers=cpu_workers,
@@ -77,13 +81,13 @@ async def init_services(
         io_workers, cpu_workers, api_workers,
     )
 
-    # ── Rate limiter ──────────────────────────────────────────────────────────
+    # ── Rate limiter ──────────────────────────────────────────────────────
     services.limiter = RateLimiter()
 
-    # ── Notifier (platform-injected) ──────────────────────────────────────────
+    # ── Notifier ──────────────────────────────────────────────────────────
     services.notifier = notifier
 
-    # ── Persistence via EventBus ─────────────────────────────────────────────
+    # ── Persistence via EventBus ──────────────────────────────────────────
     task_repo = TaskRepository()
     services.bus.on("task_started",   task_repo.save)
     services.bus.on("task_retrying",  task_repo.save)

@@ -22,7 +22,15 @@ class DownloaderModule:
         #   • core.handler_registry.registry  (all @command_handler entries)
         import modules.downloader.handlers.inline_actions   # noqa: F401
         import handlers.admin.tasks                         # noqa: F401
+        # modules/downloader/__init__.py — setup 方法内追加
 
+        from handlers.user.bind import handle_bind_command
+
+        registrar.apply_command_registry()   # 已有这行，在它之后追加：
+
+        # 手动注册 /bind（不走 @command_handler 装饰器）
+        registrar.register_command("bind", handle_bind_command)
+        
         from modules.downloader.handlers.message_parser import handle_link
         from handlers.admin.cookies import handle_cookie_file
 
@@ -41,7 +49,7 @@ class DownloaderModule:
         registrar.register_message(handle_cookie_file, "COOKIE")
 
     def get_user_commands(self) -> list[str]:
-        return ["start", "cancel", "help", "history", "myid", "lang", "tasks"]
+        return ["start", "cancel", "help", "history", "myid", "lang", "tasks", "bind"]
 
     def get_admin_commands(self) -> list[str]:
         return [
