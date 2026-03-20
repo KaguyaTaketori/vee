@@ -197,12 +197,12 @@ async def _save_receipt_tmp(image_bytes: bytes, cache_id: str) -> str:
         logger.warning("Failed to save receipt tmp for cache_id=%s: %s", cache_id, e)
         return ""
 
-
 async def _bill_photo_impl(
     ctx: PlatformContext,
     image_b64: str,
     image_bytes: bytes,
     file_id: str = "",
+    tg_user_id: int | None = None,
 ) -> None:
     if tg_user_id:
         allowed, reason = await _check_ai_quota(tg_user_id)

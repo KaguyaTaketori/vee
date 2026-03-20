@@ -10,7 +10,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from ..auth import require_auth
+from ..auth import require_auth, require_active_user
 from ..schemas import (
     BillCreate, BillListResponse, BillOut, BillItemOut,
     BillPatch, MonthlySummary, CategorySummary, CurrencySummary,
@@ -25,6 +25,7 @@ from modules.billing.services.bill_parser import BillParser
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/bills", tags=["bills"])
+
 
 async def _get_tg_user_id(app_user_id: int) -> Optional[int]:
     """获取已绑定的 tg_user_id，未绑定返回 None。"""
@@ -49,7 +50,6 @@ async def _list_bills_merged(
     """
     from database.db import get_db
 
-    # ── 构建条件 ──────────────────────────────────────────────────────────
     def _conditions(user_col: str, user_id: int):
         conds  = [f"{user_col} = ?"]
         params = [user_id]
@@ -73,7 +73,6 @@ async def _list_bills_merged(
             app_where,  app_params  = _conditions("app_user_id", app_user_id)
             bot_where,  bot_params  = _conditions("user_id",     tg_user_id)
 
-            # 统一列名，app_bills 标记来源为 'app'，bills 标记为 'bot'
             union_sql = f"""
                 SELECT id, amount, currency, category, description,
                        merchant, bill_date, receipt_url, created_at, updated_at,
@@ -130,7 +129,6 @@ async def _list_bills_merged(
         if row["source"] == "app":
             row["items"] = await get_bill_items(row["id"], app_user_id)
         else:
-            # Bot 侧 bill_items 用 user_id 关联
             row["items"] = await _get_bot_bill_items(row["id"], tg_user_id)
 
     return rows, total
@@ -152,12 +150,15 @@ async def _get_bot_bill_items(bill_id: int, tg_user_id: int) -> list[dict]:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+
 def _get_parser() -> BillParser:
     import shared.integrations.llm.manager as llm_mod
     if llm_mod.llm_manager is None:
         raise HTTPException(status_code=503, detail="LLM service not available")
     return BillParser(llm_mod.llm_manager)
 
+
+# ── FIX 1: _row_to_bill_out was truncated, missing closing parenthesis ────
 
 def _row_to_bill_out(row: dict) -> BillOut:
     items = [
@@ -185,13 +186,17 @@ def _row_to_bill_out(row: dict) -> BillOut:
         items=items,
         created_at=row["created_at"],
         updated_at=row.get("updated_at", row["created_at"]),
+    )
+
 
 # ── POST /bills/ocr ───────────────────────────────────────────────────────
+# FIX 2: was Depends(require_auth) + wrong var name `app_user_id` not defined.
+#         Now uses require_active_user and consistent app_user_id param name.
 
 @router.post("/ocr", response_model=OcrResponse, summary="拍照解析账单（不存库）")
 async def ocr_bill(
     body: OcrRequest,
-    user_id: Annotated[int, Depends(require_auth)],
+    app_user_id: Annotated[int, Depends(require_active_user)],
 ):
     from repositories import AppUserRepository
     allowed, remaining = await AppUserRepository().check_and_deduct_ai_quota(app_user_id)
@@ -207,34 +212,30 @@ async def ocr_bill(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    # 保存图片到临时目录
     from shared.services.container import services
     from api.routes.uploads import _MIME_TO_EXT
     import os
     ext = _MIME_TO_EXT.get(body.mime_type, ".jpg")
     receipt_url = ""
     try:
-        # App 的 OCR 图片直接存正式目录（App 侧无 confirm 流程）
         receipt_url = await services.receipt_storage.save_permanent(image_bytes, ext)
     except Exception as e:
-        logger.warning("ocr_bill: failed to save image for user %s: %s", user_id, e)
+        logger.warning("ocr_bill: failed to save image for user %s: %s", app_user_id, e)
 
-    # AI 解析（传 base64 字符串，修复原 Bug）
     parser = _get_parser()
     try:
         entry: BillEntry = await parser.parse_image(
-            user_id=user_id,
-            image_base64=body.image_base64,   # ← 修复：传 base64 而非 bytes
+            user_id=app_user_id,
+            image_base64=body.image_base64,
             mime_type=body.mime_type,
         )
     except Exception as e:
-        # 解析失败时清理已保存的图片
         if receipt_url:
             try:
                 await services.receipt_storage.delete(receipt_url)
             except Exception:
                 pass
-        logger.error("OCR parse failed for user %s: %s", user_id, e)
+        logger.error("OCR parse failed for user %s: %s", app_user_id, e)
         raise HTTPException(status_code=422, detail=f"Parse failed: {e}")
 
     items_out = [
@@ -298,6 +299,8 @@ async def list_bills(
         page_size=page_size,
         has_next=(offset + len(bills)) < total,
     )
+
+
 # ── GET /bills/summary ────────────────────────────────────────────────────
 
 @router.get("/summary", response_model=MonthlySummary, summary="月度消费汇总")
@@ -314,7 +317,6 @@ async def monthly_summary(
     tg_user_id = await _get_tg_user_id(app_user_id)
 
     async with get_db() as db:
-        # 合并两张表的汇总查询
         if tg_user_id:
             union = f"""
                 SELECT amount, currency, category FROM app_bills
@@ -363,26 +365,42 @@ async def monthly_summary(
         by_currency=[CurrencySummary(**i) for i in by_currency],
     )
 
+
 # ── GET /bills/{id} ───────────────────────────────────────────────────────
 
 @router.get("/{bill_id}", response_model=BillOut, summary="单条账单详情")
 async def get_bill(
     bill_id: int,
-    user_id: Annotated[int, Depends(require_auth)],
+    app_user_id: Annotated[int, Depends(require_active_user)],
 ):
     from database.db import get_db
+    tg_user_id = await _get_tg_user_id(app_user_id)
+
     async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT * FROM bills WHERE id = ? AND user_id = ?",
-            (bill_id, user_id),
-        )
-        row = await cursor.fetchone()
+        # Try app_bills first
+        async with db.execute(
+            "SELECT * FROM app_bills WHERE id = ? AND app_user_id = ?",
+            (bill_id, app_user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+        # If not found in app_bills and user has a linked bot account, try bills
+        if row is None and tg_user_id:
+            async with db.execute(
+                "SELECT * FROM bills WHERE id = ? AND user_id = ?",
+                (bill_id, tg_user_id),
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    row_dict = dict(row)
+                    row_dict["items"] = await _get_bot_bill_items(bill_id, tg_user_id)
+                    return _row_to_bill_out(row_dict)
 
     if row is None:
         raise HTTPException(status_code=404, detail="Bill not found")
 
     row_dict = dict(row)
-    row_dict["items"] = await get_bill_items(bill_id, user_id)
+    row_dict["items"] = await get_bill_items(bill_id, app_user_id)
     return _row_to_bill_out(row_dict)
 
 
@@ -392,8 +410,9 @@ async def get_bill(
              summary="新建账单")
 async def create_bill(
     body: BillCreate,
-    user_id: Annotated[int, Depends(require_auth)],
+    app_user_id: Annotated[int, Depends(require_active_user)],
 ):
+    from database.db import get_db
     today = date.today().isoformat()
     items = [
         BillItem(
@@ -405,7 +424,7 @@ async def create_bill(
         for item in body.items
     ]
     entry = BillEntry(
-        user_id=user_id,
+        user_id=app_user_id,
         amount=body.amount,
         currency=body.currency or "JPY",
         category=body.category or "其他",
@@ -415,13 +434,52 @@ async def create_bill(
         receipt_url=body.receipt_url or "",
         items=items,
     )
-    bill_id = await insert_bill(entry)
 
+    # Insert into app_bills (not legacy bills table)
     from database.db import get_db
+    import time
+    now = time.time()
     async with get_db() as db:
-        cursor = await db.execute("SELECT * FROM bills WHERE id = ?", (bill_id,))
-        row = dict(await cursor.fetchone())
-    row["items"] = await get_bill_items(bill_id, user_id)
+        cursor = await db.execute(
+            """
+            INSERT INTO app_bills
+                (app_user_id, amount, currency, category, description,
+                 merchant, bill_date, raw_text, receipt_file_id, receipt_url,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                app_user_id, entry.amount, entry.currency, entry.category,
+                entry.description, entry.merchant, entry.bill_date,
+                entry.raw_text, entry.receipt_file_id, entry.receipt_url,
+                now, now,
+            ),
+        )
+        bill_id = cursor.lastrowid
+
+        if entry.items:
+            await db.executemany(
+                """
+                INSERT INTO app_bill_items
+                    (bill_id, app_user_id, name, name_raw, quantity,
+                     unit_price, amount, item_type, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (bill_id, app_user_id, item.name, item.name_raw,
+                     item.quantity, item.unit_price, item.amount,
+                     item.item_type, item.sort_order)
+                    for item in entry.items
+                ],
+            )
+        await db.commit()
+
+        async with db.execute(
+            "SELECT * FROM app_bills WHERE id = ?", (bill_id,)
+        ) as cur:
+            row = dict(await cur.fetchone())
+
+    row["items"] = await get_bill_items(bill_id, app_user_id)
     return _row_to_bill_out(row)
 
 
@@ -431,27 +489,29 @@ async def create_bill(
 async def patch_bill(
     bill_id: int,
     body: BillPatch,
-    user_id: Annotated[int, Depends(require_auth)],
+    app_user_id: Annotated[int, Depends(require_active_user)],
 ):
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
     for field, value in updates.items():
-        ok = await update_bill_field(bill_id, user_id, field, value)
+        ok = await update_bill_field(bill_id, app_user_id, field, value)
         if not ok:
             raise HTTPException(status_code=404, detail="Bill not found")
 
     from database.db import get_db
     async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT * FROM bills WHERE id = ? AND user_id = ?", (bill_id, user_id)
-        )
-        row = await cursor.fetchone()
+        async with db.execute(
+            "SELECT * FROM app_bills WHERE id = ? AND app_user_id = ?",
+            (bill_id, app_user_id)
+        ) as cur:
+            row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Bill not found")
     row_dict = dict(row)
-    row_dict["items"] = await get_bill_items(bill_id, user_id)
+    row_dict["items"] = await get_bill_items(bill_id, app_user_id)
+
     searchable = {
         k: v for k, v in updates.items()
         if k in {"merchant", "description", "category", "bill_date", "receipt_url"}
@@ -462,38 +522,38 @@ async def patch_bill(
 
     return _row_to_bill_out(row_dict)
 
+
 # ── DELETE /bills/{id} ────────────────────────────────────────────────────
 
 @router.delete("/{bill_id}", status_code=status.HTTP_204_NO_CONTENT,
                summary="删除账单")
 async def delete_bill(
     bill_id: int,
-    user_id: Annotated[int, Depends(require_auth)],
+    app_user_id: Annotated[int, Depends(require_active_user)],
 ):
     from database.db import get_db
     from shared.services.container import services
 
-    # 删除前先取 receipt_url，用于清理图片文件
     async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT receipt_url FROM bills WHERE id = ? AND user_id = ?",
-            (bill_id, user_id),
-        )
-        row = await cursor.fetchone()
+        async with db.execute(
+            "SELECT receipt_url FROM app_bills WHERE id = ? AND app_user_id = ?",
+            (bill_id, app_user_id),
+        ) as cur:
+            row = await cur.fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Bill not found")
         receipt_url = row[0] or ""
 
         await db.execute(
-            "DELETE FROM bills WHERE id = ? AND user_id = ?", (bill_id, user_id)
+            "DELETE FROM app_bills WHERE id = ? AND app_user_id = ?",
+            (bill_id, app_user_id)
         )
         await db.commit()
 
-    # 删除对应图片文件
     if receipt_url:
         try:
             await services.receipt_storage.delete(receipt_url)
-        except Exception as e:     
+        except Exception as e:
             logger.warning("delete_bill: failed to delete image %s: %s", receipt_url, e)
 
     from shared.services.search_service import delete_bill_from_index

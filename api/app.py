@@ -42,7 +42,6 @@ def create_app() -> FastAPI:
     )
 
     # ── 静态文件服务（凭证图片）────────────────────────────────────────────
-    # 挂载时确保目录已存在
     from config.settings import UPLOADS_DIR
     receipts_dir = os.path.join(UPLOADS_DIR, "receipts")
     os.makedirs(receipts_dir, exist_ok=True)
@@ -52,13 +51,13 @@ def create_app() -> FastAPI:
         name="receipts",
     )
 
-    # ── 启动时初始化数据库 ──────────────────────────────────────────────────
+    # ── 启动时初始化 ────────────────────────────────────────────────────────
     @app.on_event("startup")
     async def _startup():
         from modules.billing.database.bills import init_bills_table
         await init_bills_table()
 
-        # FastAPI 进程独立运行时，需要初始化 receipt_storage
+        # ── Receipt storage ──────────────────────────────────────────────
         # 若与 Bot 同进程则已由 bootstrap.py 完成，此处幂等
         from shared.services.container import services
         if services.receipt_storage is None:
@@ -68,12 +67,36 @@ def create_app() -> FastAPI:
                 base_dir=UPLOADS_DIR,
                 public_base_url=PUBLIC_BASE_URL,
             )
+            logger.info("ReceiptStorage initialised (standalone API mode)")
+
+        # ── LLM manager ──────────────────────────────────────────────────
+        # bootstrap.py handles this when running with the Bot.
+        # When the FastAPI server runs standalone (uvicorn api.app:app),
+        # llm_manager is never set — initialize it here.
+        import shared.integrations.llm.manager as _llm_mod
+        if _llm_mod.llm_manager is None:
+            try:
+                from config.llm_config import build_llm_manager_from_yaml
+                _llm_mod.llm_manager = build_llm_manager_from_yaml()
+                logger.info(
+                    "LLM manager initialised (standalone API mode, provider=%s)",
+                    _llm_mod.llm_manager._active_provider_name,
+                )
+            except Exception as e:
+                logger.error(
+                    "LLM manager init failed — /ocr will return 503 until fixed: %s", e
+                )
+
         logger.info("Vee Billing API started")
 
     # ── 健康检查 ────────────────────────────────────────────────────────────
     @app.get("/health", tags=["system"])
     async def health():
-        return {"status": "ok"}
+        import shared.integrations.llm.manager as _llm_mod
+        return {
+            "status": "ok",
+            "llm": _llm_mod.llm_manager is not None,
+        }
 
     # ── Token 换取 ──────────────────────────────────────────────────────────
     @app.post("/auth/token", response_model=TokenResponse, tags=["auth"])
