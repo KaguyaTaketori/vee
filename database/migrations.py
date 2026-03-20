@@ -255,15 +255,421 @@ async def _v004_app_bills(db) -> None:
     await db.commit()
 
 
+async def _v005_unified_schema(db) -> None:
+    """
+    先探测实际 DB 结构，再按实际列名执行迁移。
+    同时兼容：
+      - bills.user_id（TG Bot 原始结构）
+      - bills.app_user_id（001_app_users.py 创建的结构）
+    """
+    import logging
+    logger = logging.getLogger(__name__)
 
+    # ── 0. 探测实际结构 ───────────────────────────────────────────────────
 
+    async def get_columns(table: str) -> list[str]:
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            return [r[1] for r in await cur.fetchall()]
+
+    async def table_exists(table: str) -> bool:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    bills_exists      = await table_exists("bills")
+    app_bills_exists  = await table_exists("app_bills")
+    app_users_exists  = await table_exists("app_users")
+
+    # bills 表的 user 列名
+    bills_user_col = None
+    if bills_exists:
+        bills_cols = await get_columns("bills")
+        if "user_id" in bills_cols:
+            bills_user_col = "user_id"
+        elif "app_user_id" in bills_cols:
+            bills_user_col = "app_user_id"
+        logger.info("bills user 列: %s", bills_user_col)
+
+    # bill_items 表的 user 列名
+    items_exists   = await table_exists("bill_items")
+    items_user_col = None
+    if items_exists:
+        items_cols = await get_columns("bill_items")
+        if "user_id" in items_cols:
+            items_user_col = "user_id"
+        elif "app_user_id" in items_cols:
+            items_user_col = "app_user_id"
+        logger.info("bill_items user 列: %s", items_user_col)
+
+    # users 表的 PK 列名
+    users_cols   = await get_columns("users")
+    users_pk_col = "user_id" if "user_id" in users_cols else "id"
+    logger.info("users PK 列: %s", users_pk_col)
+
+    # ── 1. 新 users 表 ────────────────────────────────────────────────────
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users_new (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            email             TEXT    UNIQUE,
+            password_hash     TEXT,
+            app_username      TEXT    UNIQUE,
+            display_name      TEXT,
+            avatar_url        TEXT,
+            tg_user_id        INTEGER UNIQUE,
+            tg_username       TEXT,
+            tg_first_name     TEXT,
+            tg_last_name      TEXT,
+            lang              TEXT    NOT NULL DEFAULT 'en',
+            is_active         INTEGER NOT NULL DEFAULT 1,
+            ai_quota_monthly  INTEGER NOT NULL DEFAULT 100,
+            ai_quota_used     INTEGER NOT NULL DEFAULT 0,
+            ai_quota_reset_at INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            last_seen         INTEGER
+        )
+    """)
+
+    # 迁移旧 TG 用户（id 沿用 tg_user_id 的值，保证 history/rate_limit 外键不需要改）
+    if users_pk_col == "user_id":
+        await db.execute("""
+            INSERT INTO users_new (
+                id, tg_user_id, tg_username, tg_first_name, tg_last_name,
+                lang, is_active, ai_quota_monthly, ai_quota_used,
+                ai_quota_reset_at, created_at, updated_at, last_seen
+            )
+            SELECT
+                user_id, user_id, username, first_name, last_name,
+                COALESCE(lang, 'en'), 1, 100, 0, 0,
+                CAST(COALESCE(added_at, 0) AS INTEGER),
+                CAST(COALESCE(added_at, 0) AS INTEGER),
+                CAST(COALESCE(last_seen, 0) AS INTEGER)
+            FROM users
+        """)
+    else:
+        # users 表已经是新结构（id 列）
+        await db.execute("""
+            INSERT INTO users_new (
+                id, tg_user_id, tg_username, tg_first_name, tg_last_name,
+                lang, is_active, ai_quota_monthly, ai_quota_used,
+                ai_quota_reset_at, created_at, updated_at, last_seen
+            )
+            SELECT
+                id, tg_user_id, tg_username, tg_first_name, tg_last_name,
+                COALESCE(lang, 'en'), is_active, ai_quota_monthly,
+                ai_quota_used, ai_quota_reset_at, created_at, updated_at, last_seen
+            FROM users
+        """)
+    logger.info("TG 用户迁移完成（users PK列: %s）", users_pk_col)
+
+    # 迁移 App 用户
+    if app_users_exists:
+        # 未绑定 TG 的纯 App 用户
+        await db.execute("""
+            INSERT OR IGNORE INTO users_new (
+                email, password_hash, app_username, display_name, avatar_url,
+                tg_user_id, is_active, ai_quota_monthly, ai_quota_used,
+                ai_quota_reset_at, created_at, updated_at
+            )
+            SELECT
+                email, password_hash, username, display_name, avatar_url,
+                tg_user_id, is_active, ai_quota_monthly, ai_quota_used,
+                CAST(ai_quota_reset_at AS INTEGER),
+                CAST(created_at AS INTEGER),
+                CAST(updated_at AS INTEGER)
+            FROM app_users
+            WHERE tg_user_id IS NULL
+               OR tg_user_id NOT IN (
+                   SELECT tg_user_id FROM users_new WHERE tg_user_id IS NOT NULL
+               )
+        """)
+
+        # 已绑定 TG 的 App 用户：UPDATE 到已有 TG 行
+        await db.execute("""
+            UPDATE users_new
+            SET email             = au.email,
+                password_hash     = au.password_hash,
+                app_username      = au.username,
+                display_name      = au.display_name,
+                avatar_url        = au.avatar_url,
+                is_active         = au.is_active,
+                ai_quota_monthly  = au.ai_quota_monthly,
+                ai_quota_used     = au.ai_quota_used,
+                ai_quota_reset_at = CAST(au.ai_quota_reset_at AS INTEGER),
+                updated_at        = CAST(au.updated_at AS INTEGER)
+            FROM app_users au
+            WHERE users_new.tg_user_id = au.tg_user_id
+              AND au.tg_user_id IS NOT NULL
+        """)
+        logger.info("App 用户迁移完成")
+
+    # ── 2. 新 bills 表（带临时列，用于 bill_items 关联）──────────────────
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bills_new (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            amount          INTEGER NOT NULL,
+            currency        TEXT    NOT NULL DEFAULT 'JPY',
+            category        TEXT,
+            description     TEXT,
+            merchant        TEXT,
+            bill_date       TEXT,
+            raw_text        TEXT,
+            source          TEXT    NOT NULL DEFAULT 'bot',
+            receipt_file_id TEXT    NOT NULL DEFAULT '',
+            receipt_url     TEXT    NOT NULL DEFAULT '',
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            _old_id         INTEGER,
+            _old_source     TEXT,
+            FOREIGN KEY (user_id) REFERENCES users_new(id) ON DELETE CASCADE
+        )
+    """)
+
+    # 迁移旧 bills
+    if bills_exists and bills_user_col:
+        if bills_user_col == "user_id":
+            await db.execute("""
+                INSERT INTO bills_new (
+                    user_id, amount, currency, category, description, merchant,
+                    bill_date, raw_text, source, receipt_file_id, receipt_url,
+                    created_at, updated_at, _old_id, _old_source
+                )
+                SELECT
+                    COALESCE(un_tg.id, un_app.id) AS resolved_user_id,
+                    CASE b.currency
+                        WHEN 'JPY' THEN CAST(ROUND(b.amount) AS INTEGER)
+                        ELSE CAST(ROUND(b.amount * 100) AS INTEGER)
+                    END,
+                    b.currency, b.category, b.description, b.merchant,
+                    b.bill_date, b.raw_text,
+                    CASE
+                        WHEN un_tg.id IS NOT NULL THEN 'bot'
+                        ELSE 'app'
+                    END,
+                    COALESCE(b.receipt_file_id, ''),
+                    COALESCE(b.receipt_url, ''),
+                    CAST(b.created_at AS INTEGER),
+                    CAST(COALESCE(b.updated_at, b.created_at) AS INTEGER),
+                    b.id, 'bot'
+                FROM bills b
+                -- 路径1：bills.user_id 是 tg_user_id
+                LEFT JOIN users_new un_tg
+                    ON un_tg.tg_user_id = b.user_id
+                -- 路径2：bills.user_id 是 app_users.id
+                LEFT JOIN app_users au
+                    ON au.id = b.user_id
+                LEFT JOIN users_new un_app
+                    ON (un_app.email = au.email
+                        OR (un_app.tg_user_id IS NOT NULL
+                            AND un_app.tg_user_id = au.tg_user_id))
+                -- 两条路径都找不到的才真正丢弃
+                WHERE COALESCE(un_tg.id, un_app.id) IS NOT NULL
+            """)
+
+            # 诊断：列出找不到用户的孤立账单
+            async with db.execute("""
+                SELECT b.id, b.user_id, b.amount, b.bill_date
+                FROM bills b
+                LEFT JOIN users_new un_tg
+                    ON un_tg.tg_user_id = b.user_id
+                LEFT JOIN app_users au
+                    ON au.id = b.user_id
+                LEFT JOIN users_new un_app
+                    ON (un_app.email = au.email
+                        OR (un_app.tg_user_id IS NOT NULL
+                            AND un_app.tg_user_id = au.tg_user_id))
+                WHERE COALESCE(un_tg.id, un_app.id) IS NULL
+            """) as cur:
+                orphans = await cur.fetchall()
+            if orphans:
+                logger.warning("以下账单找不到对应用户，已跳过：")
+                for row in orphans:
+                    logger.warning(
+                        "  bill.id=%s user_id=%s amount=%s date=%s",
+                        row[0], row[1], row[2], row[3],
+                    )
+            else:
+                logger.info("bills 全部关联成功，无孤立账单")
+    # 迁移 app_bills
+    if app_bills_exists and app_users_exists:
+        await db.execute("""
+            INSERT INTO bills_new (
+                user_id, amount, currency, category, description, merchant,
+                bill_date, raw_text, source, receipt_file_id, receipt_url,
+                created_at, updated_at, _old_id, _old_source
+            )
+            SELECT
+                un.id,
+                CASE ab.currency
+                    WHEN 'JPY' THEN CAST(ROUND(ab.amount) AS INTEGER)
+                    ELSE CAST(ROUND(ab.amount * 100) AS INTEGER)
+                END,
+                ab.currency, ab.category, ab.description, ab.merchant,
+                ab.bill_date, ab.raw_text, 'app',
+                COALESCE(ab.receipt_file_id, ''),
+                COALESCE(ab.receipt_url, ''),
+                CAST(ab.created_at AS INTEGER),
+                CAST(COALESCE(ab.updated_at, ab.created_at) AS INTEGER),
+                ab.id, 'app'
+            FROM app_bills ab
+            JOIN app_users au ON ab.app_user_id = au.id
+            JOIN users_new un ON (
+                un.email = au.email
+                OR (un.tg_user_id IS NOT NULL
+                    AND un.tg_user_id = au.tg_user_id)
+            )
+        """)
+        logger.info("app_bills 迁移完成")
+
+    # ── 3. 新 bill_items 表 ───────────────────────────────────────────────
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bill_items_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            name        TEXT    NOT NULL,
+            name_raw    TEXT    DEFAULT '',
+            quantity    REAL    NOT NULL DEFAULT 1,
+            unit_price  INTEGER,
+            amount      INTEGER NOT NULL,
+            item_type   TEXT    NOT NULL DEFAULT 'item',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (bill_id)  REFERENCES bills_new(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id)  REFERENCES users_new(id) ON DELETE CASCADE
+        )
+    """)
+
+    # 迁移旧 bill_items
+    if items_exists and items_user_col:
+        # user 列名不影响迁移逻辑，因为 user_id 直接从 bills_new 取
+        await db.execute("""
+            INSERT INTO bill_items_new (
+                bill_id, user_id, name, name_raw, quantity,
+                unit_price, amount, item_type, sort_order
+            )
+            SELECT
+                bn.id,
+                bn.user_id,
+                bi.name, COALESCE(bi.name_raw, ''), bi.quantity,
+                CASE bn.currency
+                    WHEN 'JPY' THEN
+                        CASE WHEN bi.unit_price IS NOT NULL
+                             THEN CAST(ROUND(bi.unit_price) AS INTEGER)
+                             ELSE NULL END
+                    ELSE
+                        CASE WHEN bi.unit_price IS NOT NULL
+                             THEN CAST(ROUND(bi.unit_price * 100) AS INTEGER)
+                             ELSE NULL END
+                END,
+                CASE bn.currency
+                    WHEN 'JPY' THEN CAST(ROUND(bi.amount) AS INTEGER)
+                    ELSE CAST(ROUND(bi.amount * 100) AS INTEGER)
+                END,
+                bi.item_type, bi.sort_order
+            FROM bill_items bi
+            JOIN bills_new bn ON bn._old_id = bi.bill_id
+                AND bn._old_source = 'bot'
+        """)
+        logger.info("bill_items 迁移完成")
+
+    # 迁移 app_bill_items
+    if await table_exists("app_bill_items"):
+        await db.execute("""
+            INSERT INTO bill_items_new (
+                bill_id, user_id, name, name_raw, quantity,
+                unit_price, amount, item_type, sort_order
+            )
+            SELECT
+                bn.id,
+                bn.user_id,
+                abi.name, COALESCE(abi.name_raw, ''), abi.quantity,
+                CASE bn.currency
+                    WHEN 'JPY' THEN
+                        CASE WHEN abi.unit_price IS NOT NULL
+                             THEN CAST(ROUND(abi.unit_price) AS INTEGER)
+                             ELSE NULL END
+                    ELSE
+                        CASE WHEN abi.unit_price IS NOT NULL
+                             THEN CAST(ROUND(abi.unit_price * 100) AS INTEGER)
+                             ELSE NULL END
+                END,
+                CASE bn.currency
+                    WHEN 'JPY' THEN CAST(ROUND(abi.amount) AS INTEGER)
+                    ELSE CAST(ROUND(abi.amount * 100) AS INTEGER)
+                END,
+                abi.item_type, abi.sort_order
+            FROM app_bill_items abi
+            JOIN bills_new bn ON bn._old_id = abi.bill_id
+                AND bn._old_source = 'app'
+        """)
+        logger.info("app_bill_items 迁移完成")
+
+    # ── 4. 去掉临时列（SQLite 3.35 以下不支持 DROP COLUMN，用重建法）────────
+
+    await db.execute("""
+        CREATE TABLE bills_clean AS
+        SELECT id, user_id, amount, currency, category, description,
+               merchant, bill_date, raw_text, source,
+               receipt_file_id, receipt_url, created_at, updated_at
+        FROM bills_new
+    """)
+    await db.execute("DROP TABLE bills_new")
+    await db.execute("ALTER TABLE bills_clean RENAME TO bills_new")
+
+    # ── 5. 旧表改名备份 ───────────────────────────────────────────────────
+
+    for old, backup in [
+        ("users",      "users_v4"),
+        ("bills",      "bills_v4"),
+        ("bill_items", "bill_items_v4"),
+    ]:
+        if not await table_exists(old):
+            logger.info("原表 %s 不存在，跳过", old)
+            continue
+
+        if await table_exists(backup):
+            # 备份表已存在：直接删除原表（数据已迁移到 *_new，备份表已有旧数据）
+            logger.info("备份表 %s 已存在，直接删除原表 %s", backup, old)
+            await db.execute(f"DROP TABLE {old}")
+        else:
+            # 正常情况：改名备份
+            await db.execute(f"ALTER TABLE {old} RENAME TO {backup}")
+            logger.info("原表 %s 已备份为 %s", old, backup)
+
+    # 新表正式命名
+    await db.execute("ALTER TABLE users_new      RENAME TO users")
+    await db.execute("ALTER TABLE bills_new      RENAME TO bills")
+    await db.execute("ALTER TABLE bill_items_new RENAME TO bill_items")
+
+    # ── 6. 创建索引 ───────────────────────────────────────────────────────
+
+    for ddl in [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email        ON users(email)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_app_username ON users(app_username)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg           ON users(tg_user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bills_user                ON bills(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bills_date                ON bills(bill_date)",
+        "CREATE INDEX IF NOT EXISTS idx_bills_source              ON bills(source)",
+        "CREATE INDEX IF NOT EXISTS idx_bill_items_bill           ON bill_items(bill_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bill_items_user           ON bill_items(user_id)",
+    ]:
+        await db.execute(ddl)
+
+    await db.commit()
+    logger.info("v5 迁移全部完成")
 
 
 # ── 迁移注册表（按版本号升序，只追加，不修改已有条目）────────────────────
-
 ALL_MIGRATIONS: list[tuple[int, str, object]] = [
-    (1,  "bot_base_tables",  _v001_bot_tables),
-    (2,  "bills_bot_side",   _v002_bills_bot),
-    (3,  "app_users",        _v003_app_users),
-    (4,  "app_bills",        _v004_app_bills),
+    (1, "bot_base_tables",  _v001_bot_tables),
+    (2, "bills_bot_side",   _v002_bills_bot),
+    (3, "app_users",        _v003_app_users),
+    (4, "app_bills",        _v004_app_bills),
+    (5, "unified_schema",   _v005_unified_schema),   # ← 新增
 ]

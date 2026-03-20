@@ -24,23 +24,27 @@ _allowed_users_cache: TTLCache = TTLCache(ttl=CACHE_TTL)
 _users_db_cache: TTLCache      = TTLCache(ttl=CACHE_TTL)
 
 
+async def track_user_async(user) -> int:
+    """返回 users.id（自增主键），供后续操作使用"""
+    if not user:
+        return 0
+    from shared.repositories.user_repo import UserRepository
+    return await UserRepository().upsert_tg_user(
+        user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+    )
+
+
 def track_user(user):
+    """兼容原有同步调用入口"""
     if user:
         try:
             loop = asyncio.get_running_loop()
-            asyncio.create_task(_update_user(
-                user.id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-            ))
+            asyncio.create_task(track_user_async(user))
         except RuntimeError:
-            asyncio.run(_update_user(
-                user.id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-            ))
+            asyncio.run(track_user_async(user))
 
 
 def get_allowed_users() -> set:

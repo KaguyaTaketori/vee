@@ -25,27 +25,27 @@ from api.schemas import (
     TgBindRequestResponse
 )
 from api.security import hash_password, verify_password
-from repositories import AppUserRepository
+from repositories import UserRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/me", tags=["me"])
 
-_REPO = AppUserRepository()
+_REPO = UserRepository()
 
 
 def _to_profile(user: dict) -> UserProfile:
     return UserProfile(
         id=user["id"],
-        username=user["username"],
-        email=user["email"],
+        username=user.get("app_username") or "",   # ← 字段名变化
+        email=user.get("email") or "",
         display_name=user.get("display_name"),
         avatar_url=user.get("avatar_url"),
         tg_user_id=user.get("tg_user_id"),
         is_active=bool(user["is_active"]),
         ai_quota_monthly=user["ai_quota_monthly"],
         ai_quota_used=user["ai_quota_used"],
-        ai_quota_reset_at=user["ai_quota_reset_at"],
-        created_at=user["created_at"],
+        ai_quota_reset_at=float(user["ai_quota_reset_at"]),
+        created_at=float(user["created_at"]),
     )
 
 
@@ -82,13 +82,11 @@ async def change_password(
     if body.old_password == body.new_password:
         raise HTTPException(status_code=400, detail="新密码不能与原密码相同")
     await _REPO.update_password(app_user_id, hash_password(body.new_password))
-    # 修改密码后吊销所有 refresh token，强制重新登录
     await _REPO.revoke_all_refresh_tokens(app_user_id)
 
 
 @router.post("/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest):
-    """发送重置密码验证码（防枚举：无论邮箱是否存在都返回相同响应）。"""
     user = await _REPO.get_by_email(body.email)
     if user and user["is_active"]:
         code = await _REPO.create_verify_code(user["id"], purpose="reset")
@@ -120,18 +118,12 @@ async def logout_all(app_user_id: Annotated[int, Depends(require_auth)]):
 async def request_tg_bind(
     app_user_id: Annotated[int, Depends(require_active_user)],
 ):
-    """
-    App 调用：申请 TG 绑定码。
-    返回 6 位数字码，用户去 Bot 发 /bind <code> 完成绑定。
-    有效期 10 分钟，重复调用自动刷新。
-    """
     user = await _REPO.get_by_id(app_user_id)
     if user.get("tg_user_id"):
         raise HTTPException(
             status_code=400,
             detail=f"已绑定 Telegram 账号 #{user['tg_user_id']}，请先解绑再重新绑定",
         )
-
     code = await _REPO.create_bind_code(app_user_id)
     return TgBindRequestResponse(code=code, expires_in=600)
 
@@ -140,7 +132,6 @@ async def request_tg_bind(
 async def delete_tg_bind(
     app_user_id: Annotated[int, Depends(require_active_user)],
 ):
-    """解除 TG 绑定。"""
     await _REPO.unbind_tg(app_user_id)
 
 

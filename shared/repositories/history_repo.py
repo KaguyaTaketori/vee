@@ -26,7 +26,7 @@ class HistoryRepository(BaseRepository):
 
     async def add(
         self,
-        user_id: int,
+        user_id: int,  # users.id（自增主键），不是 tg_user_id
         url: str,
         download_type: str,
         file_size: Optional[int] = None,

@@ -27,12 +27,12 @@ from api.security import (
     hash_password,
     verify_password,
 )
-from repositories import AppUserRepository
+from repositories import UserRepository
+
+_REPO = UserRepository()
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-_REPO = AppUserRepository()
 
 
 def _device_hint(request: Request) -> str:
@@ -46,12 +46,12 @@ def _device_hint(request: Request) -> str:
 async def register(body: RegisterRequest):
     if await _REPO.get_by_email(body.email):
         raise HTTPException(status_code=409, detail="该邮箱已被注册")
-    if await _REPO.get_by_username(body.username):
+    if await _REPO.get_by_app_username(body.username):   # ← 方法名变化
         raise HTTPException(status_code=409, detail="该用户名已被使用")
 
     pw_hash = hash_password(body.password)
-    user_id = await _REPO.create(
-        username=body.username,
+    user_id = await _REPO.create_app_user(               # ← 方法名变化
+        app_username=body.username,
         email=body.email,
         password_hash=pw_hash,
         display_name=body.display_name or body.username,
@@ -60,30 +60,22 @@ async def register(body: RegisterRequest):
     code = await _REPO.create_verify_code(user_id, purpose="activation")
     await send_activation_code(body.email, code)
 
-    logger.info("New user registered: id=%d username=%s", user_id, body.username)
     response: dict = {
         "message": "注册成功，验证码已发送到您的邮箱，请在 10 分钟内完成验证。",
         "email": body.email,
     }
-
     import os
     if os.getenv("APP_ENV", "production") == "development":
         response["debug_code"] = code
-
     return response
-
 
 # ── 验证邮箱 ──────────────────────────────────────────────────────────────
 
 @router.post("/verify-email")
 async def verify_email(body: VerifyEmailRequest, request: Request):
-    """
-    提交邮箱验证码，激活账号并直接返回 Token（免二次登录）。
-    """
     user = await _REPO.get_by_email(body.email)
     if not user:
         raise HTTPException(status_code=404, detail="邮箱不存在")
-
     if user["is_active"]:
         raise HTTPException(status_code=400, detail="账号已激活，请直接登录")
 
@@ -93,18 +85,11 @@ async def verify_email(body: VerifyEmailRequest, request: Request):
 
     await _REPO.activate(user["id"])
 
-    # 激活成功后直接登录，减少用户跳转
     access_token  = create_access_token(user["id"])
     refresh_token = await _REPO.create_refresh_token(
         user["id"], device_hint=_device_hint(request)
     )
-
-    logger.info("User activated: id=%d", user["id"])
-    return LoginResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-    )
-
+    return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
 # ── 重发验证码 ────────────────────────────────────────────────────────────
 
@@ -130,31 +115,16 @@ async def resend_code(body: ResendCodeRequest):
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request):
     user = await _REPO.get_by_identifier(body.identifier)
-
-    # 用户不存在 / 密码错误 → 统一报错，防止用户枚举
     if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户名/邮箱或密码错误",
-        )
-
+        raise HTTPException(status_code=401, detail="用户名/邮箱或密码错误")
     if not user["is_active"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="账号未激活，请先验证邮箱",
-        )
+        raise HTTPException(status_code=403, detail="账号未激活，请先验证邮箱")
 
     access_token  = create_access_token(user["id"])
     refresh_token = await _REPO.create_refresh_token(
         user["id"], device_hint=_device_hint(request)
     )
-
-    logger.info("User logged in: id=%d", user["id"])
-    return LoginResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-    )
-
+    return LoginResponse(access_token=access_token, refresh_token=refresh_token)
 
 # ── 刷新 Token ────────────────────────────────────────────────────────────
 
@@ -164,18 +134,13 @@ async def refresh_token(body: RefreshRequest, request: Request):
         body.refresh_token, device_hint=_device_hint(request)
     )
     if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token 无效或已过期，请重新登录",
-        )
-
+        raise HTTPException(status_code=401, detail="Refresh token 无效或已过期")
     user_id, new_refresh = result
-    access_token = create_access_token(user_id)
-
     return LoginResponse(
-        access_token=access_token,
+        access_token=create_access_token(user_id),
         refresh_token=new_refresh,
     )
+
 
 
 # ── 登出 ──────────────────────────────────────────────────────────────────
@@ -183,4 +148,3 @@ async def refresh_token(body: RefreshRequest, request: Request):
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(body: LogoutRequest):
     await _REPO.revoke_refresh_token(body.refresh_token)
-    # 无论 token 是否存在都返回 204，防止信息泄露

@@ -19,6 +19,10 @@ from modules.billing.services.bill_cache import bill_cache, BillEntry, BillItem
 from modules.billing.services.bill_parser import VALID_CATEGORIES
 from shared.services.platform_context import TelegramContext, btn
 from utils.auto_delete import auto_delete
+from modules.billing.utils import resolve_user_id
+from shared.repositories.bill_repo import BillRepository
+
+_bill_repo = BillRepository()
 
 logger = logging.getLogger(__name__)
 
@@ -82,37 +86,85 @@ async def _cb_bill_confirm(ctx: CallbackContext) -> None:
     if entry is None:
         await ctx.answer_alert("⏰ 账单已过期，请重新发送。")
         return
+
+    # entry.user_id 此时存的是 tg_user_id（BillParser 传入的是 ctx.user_id）
+    # 需要解析成 users.id
+    tg_user_id = entry.user_id
     if entry.user_id != ctx.user_id:
         await ctx.answer_alert("❌ 这不是你的账单。")
         return
 
-    # 将临时图片移入正式目录，获取永久 URL
+    user_id = await resolve_user_id(tg_user_id)
+
+    # 确认临时图片
+    receipt_url = entry.receipt_url
     if entry.receipt_tmp_path:
         from shared.services.container import services
         try:
-            receipt_url = await services.receipt_storage.confirm(entry.receipt_tmp_path)
-            entry = replace(entry, receipt_url=receipt_url, receipt_tmp_path="")
+            receipt_url = await services.receipt_storage.confirm(
+                entry.receipt_tmp_path
+            )
         except Exception as e:
             logger.warning(
-                "_cb_bill_confirm: failed to confirm image for cache_id=%s: %s",
+                "_cb_bill_confirm: image confirm failed cache_id=%s: %s",
                 cache_id, e,
             )
-            # 图片移动失败不影响记账流程，仅记录日志
 
-    await insert_bill(entry)
+    # 统一写入 bills 表，source='bot'
+    bill_id = await _bill_repo.create(
+        user_id=user_id,
+        amount=entry.amount,
+        currency=entry.currency,
+        category=entry.category,
+        description=entry.description,
+        merchant=entry.merchant,
+        bill_date=entry.bill_date,
+        raw_text=entry.raw_text,
+        source="bot",
+        receipt_file_id=entry.receipt_file_id,
+        receipt_url=receipt_url,
+        items=[
+            {
+                "name":       item.name,
+                "name_raw":   item.name_raw,
+                "quantity":   item.quantity,
+                "unit_price": item.unit_price,
+                "amount":     item.amount,
+                "item_type":  item.item_type,
+                "sort_order": item.sort_order,
+            }
+            for item in entry.items
+        ],
+    )
+
+    # Meilisearch 索引
+    from shared.services.search_service import index_bill
+    import time
+    await index_bill({
+        "id":          bill_id,
+        "user_id":     user_id,
+        "amount":      entry.amount,
+        "currency":    entry.currency,
+        "category":    entry.category,
+        "description": entry.description,
+        "merchant":    entry.merchant,
+        "bill_date":   entry.bill_date,
+        "receipt_url": receipt_url,
+        "created_at":  int(time.time()),
+    })
+
     await bill_cache.delete(cache_id)
     await ctx.answer()
     await ctx.platform_ctx.edit(
         f"✅ 记账成功！\n\n"
         f"💰 {entry.amount:.2f} {entry.currency}  |  {entry.category or '未分类'}\n"
         f"📝 {entry.description or '—'}"
-        + (f"\n📎 凭证已保存" if entry.receipt_url else "")
+        + (f"\n📎 凭证已保存" if receipt_url else "")
     )
     logger.info(
-        "Bill confirmed: cache_id=%s user_id=%s receipt_url=%s",
-        cache_id, ctx.user_id, entry.receipt_url,
+        "Bill confirmed: bill_id=%s cache_id=%s user_id=%s",
+        bill_id, cache_id, user_id,
     )
-
 
 # ---------------------------------------------------------------------------
 # bill_edit

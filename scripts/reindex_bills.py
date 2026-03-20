@@ -40,15 +40,21 @@ async def main() -> None:
 
     logger.info("Loading bills from SQLite...")
     async with get_db() as db:
+        # 原来只查 bills 表，现在统一查合并后的 bills
         cursor = await db.execute(
             """
             SELECT id, user_id, amount, currency, category,
-                   description, merchant, bill_date, receipt_url, created_at
+                   description, merchant, bill_date,
+                   receipt_url, source, created_at
             FROM bills
             ORDER BY id ASC
             """
         )
         rows = [dict(r) for r in await cursor.fetchall()]
+    
+    from utils.currency import int_to_amount
+    for row in rows:
+        row["amount"] = int_to_amount(row["amount"], row.get("currency", "JPY"))
 
     total = len(rows)
     if total == 0:

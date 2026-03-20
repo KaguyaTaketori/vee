@@ -1,3 +1,4 @@
+# modules/billing/handlers/mybills_handler.py
 from __future__ import annotations
 
 import logging
@@ -8,169 +9,23 @@ from typing import Optional
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from database.db import get_db
-from modules.billing.database.bills import (
-    get_monthly_summary,
-    get_recent_bills_with_items,
-)
+from modules.billing.utils import resolve_user_id
+from shared.repositories.bill_repo import BillRepository
 from shared.services.platform_context import PlatformContext, TelegramContext
+from utils.currency import int_to_amount
 from utils.utils import require_message
 
 logger = logging.getLogger(__name__)
 
+_bill_repo = BillRepository()
+
 _CATEGORY_EMOJI: dict[str, str] = {
-    "餐饮":  "🍜", "交通":  "🚇", "购物":  "🛍️",
-    "娱乐":  "🎮", "医疗":  "💊", "住房":  "🏠",
-    "水电煤": "💡", "其他":  "📦",
+    "餐饮": "🍜", "交通": "🚇", "购物": "🛍️",
+    "娱乐": "🎮", "医疗": "💊", "住房": "🏠",
+    "水电煤": "💡", "其他": "📦",
 }
 _MAX_ITEMS_IN_RECENT = 5
 
-
-# ── 合并查询工具函数 ───────────────────────────────────────────────────────
-
-async def _get_bound_app_user_id(tg_user_id: int) -> Optional[int]:
-    """通过 tg_user_id 查找绑定的 app_user_id，未绑定返回 None。"""
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT id FROM app_users WHERE tg_user_id = ? AND is_active = 1",
-            (tg_user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else None
-
-
-async def _get_merged_monthly_summary(
-    tg_user_id: int,
-    app_user_id: Optional[int],
-    year: int,
-    month: int,
-) -> dict:
-    """
-    合并 bills（Bot）和 app_bills（App）的月度汇总。
-    未绑定只查 bills。
-    """
-    month_str = f"{year:04d}-{month:02d}%"
-
-    async with get_db() as db:
-        if app_user_id:
-            union = """
-                SELECT amount, currency, category FROM bills
-                WHERE user_id = ? AND bill_date LIKE ?
-                UNION ALL
-                SELECT amount, currency, category FROM app_bills
-                WHERE app_user_id = ? AND bill_date LIKE ?
-            """
-            params = [tg_user_id, month_str, app_user_id, month_str]
-        else:
-            union  = "SELECT amount, currency, category FROM bills WHERE user_id = ? AND bill_date LIKE ?"
-            params = [tg_user_id, month_str]
-
-        async with db.execute(
-            f"""
-            SELECT COALESCE(category,'其他'), SUM(amount), COUNT(*)
-            FROM ({union}) GROUP BY category ORDER BY SUM(amount) DESC
-            """,
-            params,
-        ) as cur:
-            by_category = [
-                {"category": r[0], "total": r[1], "count": r[2]}
-                for r in await cur.fetchall()
-            ]
-
-        async with db.execute(
-            f"SELECT currency, SUM(amount) FROM ({union}) GROUP BY currency",
-            params,
-        ) as cur:
-            by_currency = [
-                {"currency": r[0], "total": r[1]}
-                for r in await cur.fetchall()
-            ]
-
-        async with db.execute(
-            f"SELECT SUM(amount), COUNT(*) FROM ({union})", params
-        ) as cur:
-            row   = await cur.fetchone()
-            total = row[0] or 0.0
-            count = row[1] or 0
-
-    return {
-        "total": total,
-        "count": count,
-        "by_category": by_category,
-        "by_currency": by_currency,
-    }
-
-
-async def _get_merged_recent_bills(
-    tg_user_id: int,
-    app_user_id: Optional[int],
-    limit: int = 5,
-) -> list[dict]:
-    """
-    合并两张表的最近账单，按日期降序取 limit 条。
-    """
-    async with get_db() as db:
-        if app_user_id:
-            union = """
-                SELECT id, amount, currency, category, description,
-                       merchant, bill_date, receipt_url, created_at,
-                       'bot' AS source
-                FROM bills WHERE user_id = ?
-
-                UNION ALL
-
-                SELECT id, amount, currency, category, description,
-                       merchant, bill_date, receipt_url, created_at,
-                       'app' AS source
-                FROM app_bills WHERE app_user_id = ?
-            """
-            params = [tg_user_id, app_user_id]
-        else:
-            union = """
-                SELECT id, amount, currency, category, description,
-                       merchant, bill_date, receipt_url, created_at,
-                       'bot' AS source
-                FROM bills WHERE user_id = ?
-            """
-            params = [tg_user_id]
-
-        async with db.execute(
-            f"""
-            SELECT * FROM ({union})
-            ORDER BY bill_date DESC, created_at DESC
-            LIMIT ?
-            """,
-            params + [limit],
-        ) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
-
-    # 拼装 items
-    for row in rows:
-        if row["source"] == "bot":
-            async with get_db() as db:
-                async with db.execute(
-                    """
-                    SELECT * FROM bill_items
-                    WHERE bill_id = ? ORDER BY sort_order ASC
-                    """,
-                    (row["id"],),
-                ) as cur:
-                    row["items"] = [dict(r) for r in await cur.fetchall()]
-        else:
-            async with get_db() as db:
-                async with db.execute(
-                    """
-                    SELECT * FROM app_bill_items
-                    WHERE bill_id = ? ORDER BY sort_order ASC
-                    """,
-                    (row["id"],),
-                ) as cur:
-                    row["items"] = [dict(r) for r in await cur.fetchall()]
-
-    return rows
-
-
-# ── 格式化函数（不变）────────────────────────────────────────────────────────
 
 def _parse_month_arg(arg: str) -> tuple[int, int] | None:
     m = re.fullmatch(r"(\d{4})-(\d{2})", arg.strip())
@@ -182,9 +37,9 @@ def _parse_month_arg(arg: str) -> tuple[int, int] | None:
     return year, month
 
 
-def _format_item_line(item: dict) -> str:
+def _format_item_line(item: dict, currency: str) -> str:
     name      = item.get("name", "未知商品")
-    amount    = item.get("amount", 0)
+    amount    = int_to_amount(item.get("amount", 0), currency)
     qty       = item.get("quantity", 1)
     item_type = item.get("item_type", "item")
     if item_type == "discount":
@@ -196,45 +51,44 @@ def _format_item_line(item: dict) -> str:
         return f"    • {name}{qty_str}　`{amount:.0f}`"
 
 
-def _format_summary(
-    year: int,
-    month: int,
-    summary: dict,
-    is_merged: bool = False,
-) -> str:
+def _format_summary(year: int, month: int, summary: dict) -> str:
     count       = summary["count"]
-    total       = summary["total"]
+    total_int   = summary["total"]
     by_category = summary["by_category"]
     by_currency = summary["by_currency"]
 
     if count == 0:
         return f"📭 *{year} 年 {month} 月*\n\n该月暂无记账记录。"
 
-    # 绑定后加一个小标识
-    source_hint = "（Bot + App 合并）" if is_merged else ""
-    lines: list[str] = [f"📊 *{year} 年 {month} 月消费汇总*{source_hint}\n"]
+    lines: list[str] = [f"📊 *{year} 年 {month} 月消费汇总*\n"]
 
     if len(by_currency) == 1:
         currency = by_currency[0]["currency"]
+        total    = int_to_amount(total_int, currency)
         lines.append(f"💴 总支出：`{total:,.2f} {currency}`　共 {count} 笔\n")
     else:
         lines.append(f"💴 总支出（{count} 笔）：")
         for c in by_currency:
-            lines.append(f"　`{c['total']:,.2f} {c['currency']}`")
+            amt = int_to_amount(c["total"], c["currency"])
+            lines.append(f"　`{amt:,.2f} {c['currency']}`")
         lines.append("")
 
     lines.append("━━━━━━━━ 分类明细 ━━━━━━━━")
     for item in by_category:
         cat   = item["category"]
         emoji = _CATEGORY_EMOJI.get(cat, "📦")
-        pct   = (item["total"] / total * 100) if total else 0
+        # 汇总金额用主货币展示（取第一个货币）
+        main_currency = by_currency[0]["currency"] if by_currency else "JPY"
+        cat_amt = int_to_amount(item["total"], main_currency)
+        total_f = int_to_amount(total_int, main_currency)
+        pct   = (cat_amt / total_f * 100) if total_f else 0
         lines.append(
-            f"{emoji} {cat}　`{item['total']:,.2f}`　{item['count']} 笔　{pct:.0f}%"
+            f"{emoji} {cat}　`{cat_amt:,.2f}`　{item['count']} 笔　{pct:.0f}%"
         )
     return "\n".join(lines)
 
 
-def _format_recent(bills: list[dict], is_merged: bool = False) -> str:
+def _format_recent(bills: list[dict]) -> str:
     if not bills:
         return ""
 
@@ -246,23 +100,22 @@ def _format_recent(bills: list[dict], is_merged: bool = False) -> str:
         if merchant in ("unknown", "未知商家", ""):
             merchant = ""
         merchant_str = f" @ {merchant}" if merchant else ""
-        amount   = b.get("amount", 0)
-        currency = b.get("currency", "")
-        bill_date = b.get("bill_date", "")
 
-        # 合并模式下显示来源标识
-        source_tag = ""
-        if is_merged:
-            source_tag = " `[App]`" if b.get("source") == "app" else " `[Bot]`"
+        currency  = b.get("currency", "JPY")
+        amount    = int_to_amount(b.get("amount", 0), currency)
+        bill_date = b.get("bill_date", "")
+        source    = b.get("source", "bot")
+        source_tag = " `[App]`" if source == "app" else ""
 
         lines.append(
-            f"\n{emoji} `{amount:,.0f} {currency}`{merchant_str}　{bill_date}{source_tag}"
+            f"\n{emoji} `{amount:,.0f} {currency}`{merchant_str}　"
+            f"{bill_date}{source_tag}"
         )
 
         items: list[dict] = b.get("items", [])
         if items:
             for item in items[:_MAX_ITEMS_IN_RECENT]:
-                lines.append(_format_item_line(item))
+                lines.append(_format_item_line(item, currency))
             if len(items) > _MAX_ITEMS_IN_RECENT:
                 lines.append(f"    _…另有 {len(items) - _MAX_ITEMS_IN_RECENT} 项_")
         else:
@@ -272,8 +125,6 @@ def _format_recent(bills: list[dict], is_merged: bool = False) -> str:
 
     return "\n".join(lines)
 
-
-# ── 核心实现 ──────────────────────────────────────────────────────────────
 
 async def _mybills_impl(
     ctx: PlatformContext,
@@ -291,30 +142,22 @@ async def _mybills_impl(
     else:
         year, month = today.year, today.month
 
-    # 查是否绑定了 App 账号
-    app_user_id = await _get_bound_app_user_id(tg_user_id)
-    is_merged   = app_user_id is not None
+    # 合并后直接用 users.id 查，无需区分来源
+    user_id = await resolve_user_id(tg_user_id)
 
-    summary = await _get_merged_monthly_summary(tg_user_id, app_user_id, year, month)
-    recent  = await _get_merged_recent_bills(tg_user_id, app_user_id, limit=5)
+    summary = await _bill_repo.monthly_summary(user_id, year, month)
+    bills, _ = await _bill_repo.list_by_user(
+        user_id, year=year, month=month, page_size=5
+    )
 
-    text = _format_summary(year, month, summary, is_merged=is_merged)
-    recent_text = _format_recent(recent, is_merged=is_merged)
+    # 拼装 items（list_by_user 已附带）
+    text = _format_summary(year, month, summary)
+    recent_text = _format_recent(bills)
     if recent_text:
         text += recent_text
 
-    # 未绑定时在底部加提示
-    if not is_merged:
-        text += (
-            "\n\n─────────────────────\n"
-            "💡 在 App 绑定 Telegram 后，Bot 和 App 的账单将合并显示。\n"
-            "发送 /bind <验证码> 完成绑定。"
-        )
-
     await ctx.send_markdown(text)
 
-
-# ── PTB 入口 ──────────────────────────────────────────────────────────────
 
 @require_message
 async def handle_mybills_command(update: Update, context: CallbackContext) -> None:

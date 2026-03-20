@@ -1,24 +1,20 @@
 # repositories/__init__.py
-"""
-Repository layer – the single source of truth for all SQL statements.
-
-Import convention inside services / handlers:
-    from repositories import HistoryRepository, UserRepository, ...
-"""
-
 from shared.repositories.history_repo import HistoryRepository
-from shared.repositories.user_repo import UserRepository
+from shared.repositories.user_repo import UserRepository          # 合并后的
+from shared.repositories.bill_repo import BillRepository          # 新增
 from .task_repo import TaskRepository
 from .rate_limit_repo import RateLimitRepository
 from .analytics_repo import AnalyticsRepository
-from .app_user_repo import AppUserRepository
 
+# 向后兼容别名
+AppUserRepository = UserRepository
 
 __all__ = [
     "HistoryRepository",
     "UserRepository",
+    "AppUserRepository",
+    "BillRepository",
     "TaskRepository",
     "RateLimitRepository",
     "AnalyticsRepository",
-    "AppUserRepository",
 ]
