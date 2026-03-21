@@ -31,4 +31,5 @@ build/
 bot_data.db-shm
 bot_data.db-wal
 meilisearch
+uploads/
 meili_data/
