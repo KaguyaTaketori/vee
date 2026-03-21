@@ -611,16 +611,34 @@ async def _v005_unified_schema(db) -> None:
         logger.info("app_bill_items 迁移完成")
 
     # ── 4. 去掉临时列（SQLite 3.35 以下不支持 DROP COLUMN，用重建法）────────
-
     await db.execute("""
-        CREATE TABLE bills_clean AS
+        CREATE TABLE bills_final (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            amount          INTEGER NOT NULL,
+            currency        TEXT    NOT NULL DEFAULT 'JPY',
+            category        TEXT,
+            description     TEXT,
+            merchant        TEXT,
+            bill_date       TEXT,
+            raw_text        TEXT,
+            source          TEXT    NOT NULL DEFAULT 'bot',
+            receipt_file_id TEXT    NOT NULL DEFAULT '',
+            receipt_url     TEXT    NOT NULL DEFAULT '',
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    await db.execute("""
+        INSERT INTO bills_final
         SELECT id, user_id, amount, currency, category, description,
                merchant, bill_date, raw_text, source,
                receipt_file_id, receipt_url, created_at, updated_at
         FROM bills_new
     """)
     await db.execute("DROP TABLE bills_new")
-    await db.execute("ALTER TABLE bills_clean RENAME TO bills_new")
+    await db.execute("ALTER TABLE bills_final RENAME TO bills_new")
 
     # ── 5. 旧表改名备份 ───────────────────────────────────────────────────
 
@@ -805,6 +823,195 @@ async def _v006_admin_permissions(db) -> None:
     await db.commit()
     logger.info("v006 迁移完成：role/permissions/IP 字段 + system_configs 表")
 
+async def _v007_new_accounting_schema(db) -> None:
+    import logging, time
+    logger = logging.getLogger(__name__)
+
+    # ── 1. users 表新增字段 ──────────────────────────────────────────
+    async with db.execute("PRAGMA table_info(users)") as cur:
+        existing = {r[1] for r in await cur.fetchall()}
+
+    for col, definition in [
+        ("tier",     "TEXT NOT NULL DEFAULT 'free'"),
+        ("group_id", "INTEGER REFERENCES groups(id) ON DELETE SET NULL"),
+    ]:
+        if col not in existing:
+            await db.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+            logger.info("users: 新增列 %s", col)
+
+    # ── 2. groups 表 ────────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT    NOT NULL DEFAULT '我的账本',
+            owner_id      INTEGER NOT NULL REFERENCES users(id),
+            invite_code   TEXT    NOT NULL UNIQUE,
+            base_currency TEXT    NOT NULL DEFAULT 'JPY',
+            is_active     BOOLEAN NOT NULL DEFAULT 1,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        )
+    """)
+
+    # ── 3. categories 表 ────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL,
+            icon       TEXT,
+            color      TEXT,
+            type       TEXT    NOT NULL DEFAULT 'expense',
+            is_system  BOOLEAN NOT NULL DEFAULT 0,
+            group_id   INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    # 写入系统预设分类
+    now = int(time.time())
+    system_categories = [
+        ("餐饮", "🍜", "#E85D30", "expense", 1),
+        ("交通", "🚇", "#3B8BD4", "expense", 2),
+        ("购物", "🛍️", "#1D9E75", "expense", 3),
+        ("娱乐", "🎮", "#EF9F27", "expense", 4),
+        ("医疗", "💊", "#9B59B6", "expense", 5),
+        ("住房", "🏠", "#E74C3C", "expense", 6),
+        ("水电煤", "💡", "#2ECC71", "expense", 7),
+        ("工资", "💰", "#1ABC9C", "income",  8),
+        ("其他", "📦", "#95A5A6", "expense", 99),
+    ]
+    await db.executemany("""
+        INSERT OR IGNORE INTO categories
+            (name, icon, color, type, is_system, group_id, sort_order)
+        VALUES (?, ?, ?, ?, 1, NULL, ?)
+    """, [(name, icon, color, type_, order)
+          for name, icon, color, type_, order in system_categories])
+
+    # ── 4. accounts 表 ──────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            name              TEXT    NOT NULL,
+            type              TEXT    NOT NULL DEFAULT 'cash',
+            currency_code     TEXT    NOT NULL DEFAULT 'JPY',
+            group_id          INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            balance_cache     INTEGER NOT NULL DEFAULT 0,
+            balance_updated_at INTEGER,
+            is_active         BOOLEAN NOT NULL DEFAULT 1,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
+        )
+    """)
+
+    # ── 5. transactions 表 ──────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            type             TEXT    NOT NULL DEFAULT 'expense',
+            amount           INTEGER NOT NULL DEFAULT 0,
+            currency_code    TEXT    NOT NULL DEFAULT 'JPY',
+            base_amount      INTEGER NOT NULL DEFAULT 0,
+            exchange_rate    INTEGER NOT NULL DEFAULT 1000000,
+            account_id       INTEGER NOT NULL REFERENCES accounts(id),
+            to_account_id    INTEGER REFERENCES accounts(id),
+            transfer_peer_id INTEGER REFERENCES transactions(id),
+            category_id      INTEGER NOT NULL REFERENCES categories(id),
+            user_id          INTEGER NOT NULL REFERENCES users(id),
+            group_id         INTEGER NOT NULL REFERENCES groups(id),
+            is_private       BOOLEAN NOT NULL DEFAULT 0,
+            note             TEXT,
+            transaction_date INTEGER NOT NULL,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL,
+            is_deleted       BOOLEAN NOT NULL DEFAULT 0,
+            -- 迁移期间保留 bills.id 用于追溯
+            legacy_bill_id   INTEGER
+        )
+    """)
+
+    # ── 6. transaction_items 表 ─────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS transaction_items (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+            name           TEXT    NOT NULL,
+            name_raw       TEXT    NOT NULL DEFAULT '',
+            quantity       REAL    NOT NULL DEFAULT 1,
+            unit_price     INTEGER,
+            amount         INTEGER NOT NULL,
+            item_type      TEXT    NOT NULL DEFAULT 'item',
+            sort_order     INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    # ── 7. receipts 表 ──────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS receipts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+            image_url      TEXT    NOT NULL,
+            extracted_text TEXT,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL,
+            is_deleted     BOOLEAN NOT NULL DEFAULT 0
+        )
+    """)
+
+    # ── 8. statements 表 ────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS statements (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id      INTEGER NOT NULL REFERENCES accounts(id),
+            period_start    TEXT    NOT NULL,
+            period_end      TEXT    NOT NULL,
+            total_amount    INTEGER NOT NULL DEFAULT 0,
+            is_amount_confirmed BOOLEAN NOT NULL DEFAULT 0,
+            closing_date    TEXT    NOT NULL,
+            due_date        TEXT    NOT NULL,
+            is_settled      BOOLEAN NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
+        )
+    """)
+
+    # ── 9. scheduled_bills 表 ───────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_bills (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            title           TEXT    NOT NULL DEFAULT '未命名订阅',
+            amount          INTEGER NOT NULL,
+            currency_code   TEXT    NOT NULL DEFAULT 'JPY',
+            account_id      INTEGER NOT NULL REFERENCES accounts(id),
+            category_id     INTEGER NOT NULL REFERENCES categories(id),
+            user_id         INTEGER NOT NULL REFERENCES users(id),
+            group_id        INTEGER NOT NULL REFERENCES groups(id),
+            frequency       TEXT    NOT NULL DEFAULT 'monthly',
+            next_due_date   TEXT    NOT NULL,
+            auto_record     BOOLEAN NOT NULL DEFAULT 1,
+            is_active       BOOLEAN NOT NULL DEFAULT 1,
+            last_executed_at INTEGER,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
+        )
+    """)
+
+    # ── 10. 索引 ────────────────────────────────────────────────────
+    for ddl in [
+        "CREATE INDEX IF NOT EXISTS idx_transactions_group    ON transactions(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_user     ON transactions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_date     ON transactions(transaction_date)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_deleted  ON transactions(is_deleted)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_updated  ON transactions(updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_trans_items_txn       ON transaction_items(transaction_id)",
+        "CREATE INDEX IF NOT EXISTS idx_receipts_txn          ON receipts(transaction_id)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_group        ON accounts(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_group       ON scheduled_bills(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_statements_account    ON statements(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_group ON transactions(group_id)",
+    ]:
+        await db.execute(ddl)
+
+    await db.commit()
+    logger.info("v007 迁移完成")
 
 ALL_MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "bot_base_tables",  _v001_bot_tables),
@@ -813,4 +1020,5 @@ ALL_MIGRATIONS: list[tuple[int, str, object]] = [
     (4, "app_bills",        _v004_app_bills),
     (5, "unified_schema",   _v005_unified_schema),
     (6, "admin_permissions_and_configs", _v006_admin_permissions),
+    (7, "new_accounting_schema", _v007_new_accounting_schema),
 ]

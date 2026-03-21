@@ -20,6 +20,8 @@ from .routes.auth import router as auth_router
 from .routes.me   import router as me_router
 from .routes.admin import router as admin_router
 from .routes.ws    import router as ws_router
+from .routes.groups       import router as groups_router
+from .routes.transactions import router as transactions_router
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,8 @@ def create_app() -> FastAPI:
     app.include_router(me_router,   prefix="/v1")
     app.include_router(admin_router, prefix="/v1")
     app.include_router(ws_router, prefix="/v1")
+    app.include_router(groups_router,       prefix="/v1")
+    app.include_router(transactions_router, prefix="/v1")
     
     return app
 
